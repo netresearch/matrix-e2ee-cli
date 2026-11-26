@@ -764,8 +764,15 @@ pub mod unix {
         subjects: HashMap<String, SubjectIndex>,
         logged: HashMap<String, LoggedEvents>,
         /// Rooms where a record did not reach the log: their next record
-        /// gets a gap record before it.
+        /// gets a gap record before it. Also kept on disk as a marker file
+        /// beside the log ([`lost_marker`]), so a restart keeps the flag.
         lost: HashSet<String>,
+    }
+
+    /// The marker file of a room whose last record did not reach the log at
+    /// `log`: `<stem>.lost` beside `<stem>.jsonl`.
+    fn lost_marker(log: &Path) -> PathBuf {
+        log.with_extension("lost")
     }
 
     /// What one write appends to a room's log.
@@ -840,6 +847,14 @@ pub mod unix {
                 if state.logged.get(room_id).is_some_and(|l| l.contains(&event.event_id)));
             if !correction {
                 state.lost.insert(room_id.to_owned());
+                if let Ok(path) = log_path(&self.rooms_dir, room_id)
+                    && let Err(err) = fs::File::create(lost_marker(&path))
+                {
+                    eprintln!(
+                        "cannot keep the loss in {room_id} across a restart: {err}; \
+                         a restart before its next record leaves no gap record"
+                    );
+                }
             }
         }
 
@@ -849,6 +864,10 @@ pub mod unix {
                 .log
                 .lock()
                 .map_err(|_| anyhow::anyhow!("the log state is poisoned"))?;
+            if !state.next_seq.contains_key(room_id) && lost_marker(&path).exists() {
+                // A loss flagged before the last restart.
+                state.lost.insert(room_id.to_owned());
+            }
             let mut seq = *state
                 .next_seq
                 .entry(room_id.to_owned())
@@ -876,6 +895,13 @@ pub mod unix {
                 seq += 1;
                 state.next_seq.insert(room_id.to_owned(), seq);
                 state.lost.remove(room_id);
+                match fs::remove_file(lost_marker(&path)) {
+                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => eprintln!(
+                        "cannot remove the loss marker of {room_id}: {err}; \
+                         a restart repeats its gap record"
+                    ),
+                    _ => {}
+                }
             }
             let event = match entry {
                 Entry::Gap(gap) => {
@@ -2756,6 +2782,41 @@ pub mod unix {
             assert_eq!(records[1]["before_event_id"], "$e3");
             assert_eq!(records[1]["cause"], "write_failed");
             // The loss is recorded once.
+            assert!(recorder.record_entry("!r:e", &text_event(4).into()));
+            assert_eq!(crate::roomlog::read_records(&log).len(), 4);
+        }
+
+        #[test]
+        fn a_loss_before_a_restart_still_leaves_a_gap() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = log_path(dir.path(), "!r:e").unwrap();
+            let recorder = Recorder::new(dir.path().to_path_buf(), "@me:e".into(), None, None);
+            assert!(recorder.record_entry("!r:e", &text_event(1).into()));
+            let repair = break_log(&log);
+            assert!(!recorder.record_entry("!r:e", &text_event(2).into()));
+            repair();
+            drop(recorder);
+            // The daemon restarts: a new recorder, nothing in memory.
+            let recorder = Recorder::new(dir.path().to_path_buf(), "@me:e".into(), None, None);
+            assert!(recorder.record_entry("!r:e", &text_event(3).into()));
+            let records = crate::roomlog::read_records(&log);
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|r| (r["type"].clone(), r["event_id"].clone()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (json!("m.text"), json!("$e1")),
+                    (json!("gap"), json!(null)),
+                    (json!("m.text"), json!("$e3")),
+                ],
+                "the loss before the restart left no gap record"
+            );
+            assert_eq!(records[1]["cause"], "write_failed");
+            assert!(!lost_marker(&log).exists(), "the marker outlived its gap");
+            // A second restart repeats nothing.
+            drop(recorder);
+            let recorder = Recorder::new(dir.path().to_path_buf(), "@me:e".into(), None, None);
             assert!(recorder.record_entry("!r:e", &text_event(4).into()));
             assert_eq!(crate::roomlog::read_records(&log).len(), 4);
         }
