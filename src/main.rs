@@ -61,6 +61,22 @@ enum Command {
         #[arg(long)]
         local_only: bool,
     },
+    /// Take over the matrix-skill (matrix-nio) E2EE device: convert its store
+    /// into this tool's session and store, keeping identity and room keys.
+    ///
+    /// The nio store is only read. Refuses while this tool has a session.
+    MigrateNio {
+        /// The matrix-skill store directory (default:
+        /// $XDG_DATA_HOME/matrix-skill/store, ~/.local/share/matrix-skill/store).
+        #[arg(long, value_name = "PATH")]
+        store: Option<std::path::PathBuf>,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// After the migration, sync once to check the access token.
+        #[arg(long)]
+        check_online: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -122,6 +138,23 @@ async fn main() {
         Command::Read(args) => commands::read::run(args).await,
         Command::BackupRestore => commands::backup::run().await,
         Command::Logout { yes, local_only } => commands::logout::run(yes, local_only).await,
+        Command::MigrateNio {
+            store,
+            yes,
+            check_online,
+        } => {
+            #[cfg(unix)]
+            {
+                commands::migrate_nio::run(store, yes, check_online).await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (store, yes, check_online);
+                Err(anyhow::anyhow!(
+                    "migrate-nio is only available on Linux and macOS, where the matrix-skill keeps its nio store"
+                ))
+            }
+        }
     };
     let code = match result {
         Ok(()) => 0,

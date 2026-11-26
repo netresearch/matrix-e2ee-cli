@@ -1,0 +1,33 @@
+{
+  "user_id": "@test:example.org",
+  "device_id": "TESTDEVICE",
+  "curve25519": "yRov+ARS0i0h4o9x5G6ZILjBpGXGpZlAekHVubNKemk",
+  "ed25519": "gU+FYKPWzh40PXIEydrvXkhowtuDNIMq3CZZc7Y3ERY",
+  "olm_sessions": [
+    {
+      "session_id": "jw/Z9LbZbgn3gicyC6QZD1zHNX9JYHghZQNO8sBgPyY",
+      "sender_key": "UEre9IlsWlIDeXLJcWgXj5SI4TMnFmf2gQIMdCbGIkc"
+    }
+  ],
+  "megolm_sessions": [
+    {
+      "session_id": "j/SlnEXCeBwyaZXNFk2L6RMR94Sh0jySQM8WfBvrA/w",
+      "room_id": "!room:example.org",
+      "imported": false,
+      "ciphertext": "AwgAEiC+h/XJxo9IHjv+TbL+6enCW8ia8VLYokWyg0pciqR321V0CzdYMa9ZVXwaBKWSEztG/zzXBhAkpBVuXVXPhgaFUhJR6t97oH8PZ9sVBhLYFURx947ctE+myQGwkFfCjXu4ZcQnRV9SCg",
+      "plaintext": "megolm fixture plaintext"
+    },
+    {
+      "session_id": "7xdmLAEXhL58GD1hEQDDeju7rmrmLeny4LUtre6zcJA",
+      "room_id": "!imported:example.org",
+      "imported": true,
+      "ciphertext": "AwgAEjCJqwywOCqVulExnyebdb5Iyb1/JhOJhYtu9t+PFsnUjUwu7wnly5993sYlYSluQqkU602H6ny1bKPNVLKZfukPA0SyZRuRocTxYkFf1U8O7e5L4VRTEMFrb8uCs95RhF0kre2kbJT9/IctVNIV+3j+Ve1JS2J2hQY",
+      "plaintext": "imported megolm fixture plaintext"
+    }
+  ],
+  "olm_message": {
+    "message_type": 1,
+    "ciphertext": "AwogM5+//vY4sPnKKIZqW9s7enwWQZVa6p9clCN1MrCx8HYQACIgpZ9yXdrZZEQzo0cnz7OTEFPruYd1GmB4FwN05eTRVIiPyuuzoZRZsQ",
+    "plaintext": "olm fixture plaintext"
+  }
+}

@@ -3,6 +3,10 @@
 pub mod backup;
 pub mod login;
 pub mod logout;
+// Unix only: the matrix-skill's nio store and its flock exist on Linux and
+// macOS, and the command uses flock and O_NOFOLLOW.
+#[cfg(unix)]
+pub mod migrate_nio;
 pub mod read;
 pub mod send;
 pub mod status;
