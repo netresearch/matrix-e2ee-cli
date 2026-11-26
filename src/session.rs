@@ -248,18 +248,26 @@ pub fn write_session(path: &Path, session: &SessionFile) -> Result<()> {
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options
+    let file = options
         .open(&tmp)
         .with_context(|| format!("cannot create {}", tmp.display()))?;
-    // create_new + mode is subject to the umask; 0600 minus a umask is never
-    // wider than 0600, but set it explicitly so it is exactly 0600.
-    #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(serde_json::to_string_pretty(session)?.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))?;
-    Ok(())
+    let written = (|| -> Result<()> {
+        let mut file = file;
+        // create_new + mode is subject to the umask; 0600 minus a umask is never
+        // wider than 0600, but set it explicitly so it is exactly 0600.
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(serde_json::to_string_pretty(session)?.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(())
+    })();
+    // The temporary file holds the access token: never leave it behind.
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Read the session file; `None` when there is none. Refuses a file that
@@ -688,6 +696,24 @@ mod tests {
             p.store_dir(),
             PathBuf::from("/home/u/.local/share/matrix-e2ee-cli/store")
         );
+    }
+
+    #[test]
+    fn failed_write_removes_the_temporary_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The rename fails: the target is a directory that is not empty.
+        let path = tmp.path().join(SESSION_FILE);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), "x").unwrap();
+        let err = write_session(&path, &sample()).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot write"), "{err:#}");
+        let left = tmp.path().join(format!(".{SESSION_FILE}.tmp"));
+        assert!(
+            !left.exists(),
+            "{} holds the token after the failure",
+            left.display()
+        );
+        assert!(path.join("keep").exists());
     }
 
     #[cfg(unix)]

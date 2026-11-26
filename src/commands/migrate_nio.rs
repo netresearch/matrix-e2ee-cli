@@ -162,30 +162,40 @@ pub struct NioStore {
     megolm_sessions: Vec<NioMegolmSession>,
     devices: Vec<NioDevice>,
     trust: NioTrust,
+    /// The names of the device's files in the store directory (database,
+    /// trust files), the ones the skill's logout deletes.
+    device_files: Vec<String>,
 }
 
 /// A shared flock on `<store>/.daemon.lock`, held from before the store is read
-/// until the new state is written or rolled back, so the matrix-skill cannot
-/// take the store (and move its Olm state on) in between. Taken on a read-only
-/// descriptor; a missing lock file is not created, and then nothing is held.
+/// until the migration is over (after the online check, if any), so the
+/// matrix-skill cannot take the store (and move its Olm state on) in between.
+/// A missing lock file is created the way the skill's `store_lock()` creates
+/// it (`open(path, "a+")`: create, never truncate), mode 0600, so that the
+/// lock is held in every case.
 struct DaemonLockCheck {
-    _file: Option<File>,
+    _file: File,
 }
 
 fn check_daemon_lock(store: &Path) -> Result<DaemonLockCheck> {
+    // Create no lock file in a directory that is not a matrix-skill store.
+    let creds_path = store.join(CREDENTIALS);
+    if !creds_path.is_file() {
+        bail!(
+            "no matrix-skill store at {}: {} does not exist",
+            store.display(),
+            creds_path.display()
+        );
+    }
     let path = store.join(DAEMON_LOCK);
-    let file = match OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
+        .append(true)
+        .create(true)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)
-    {
-        Ok(file) => file,
-        // Nobody ever took the lock, so nobody holds it.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DaemonLockCheck { _file: None });
-        }
-        Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),
-    };
+        .with_context(|| format!("cannot open or create {}", path.display()))?;
     // SAFETY: flock takes a valid descriptor and constant flags; failure is
     // reported through the return value.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
@@ -206,7 +216,7 @@ fn check_daemon_lock(store: &Path) -> Result<DaemonLockCheck> {
         }
         return Err(err).with_context(|| format!("cannot check the lock {}", path.display()));
     }
-    Ok(DaemonLockCheck { _file: Some(file) })
+    Ok(DaemonLockCheck { _file: file })
 }
 
 fn blob_text(bytes: Vec<u8>, what: &str) -> Result<String> {
@@ -285,12 +295,23 @@ pub fn read_nio_store(store: &Path, configured_user: &str) -> Result<NioStore> {
         .with_context(|| format!("cannot list {}", store.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.file_name()))
         .collect();
-    let Some((store_user, db_path)) = spellings.iter().find_map(|user| {
+    let mut found = spellings.iter().filter_map(|user| {
         let name = format!("{user}_{}.db", creds.device_id);
         let path = store.join(&name);
         (names.contains(std::ffi::OsStr::new(&name)) && path.is_file())
             .then(|| (user.to_string(), path))
-    }) else {
+    });
+    let first = found.next();
+    // Both spellings: one of them is an older store of the same device, and
+    // nothing here tells which one the skill uses now.
+    if let (Some((_, first_path)), Some((_, second_path))) = (&first, found.next()) {
+        bail!(
+            "{} and {} both exist; it is unclear which one holds the device's current state. Remove the stale one, or pass --store a directory that holds only one of them",
+            first_path.display(),
+            second_path.display()
+        );
+    }
+    let Some((store_user, db_path)) = first else {
         bail!(
             "no nio database for the device in credentials.json: none of {} in {}",
             spellings
@@ -302,6 +323,14 @@ pub fn read_nio_store(store: &Path, configured_user: &str) -> Result<NioStore> {
         );
     };
     let prefix = format!("{store_user}_{}", creds.device_id);
+    // The device's files as `store_files_for()` of the skill selects them.
+    let mut device_files: Vec<String> = names
+        .iter()
+        .filter_map(|name| name.to_str())
+        .filter(|name| name.starts_with(&format!("{prefix}.")))
+        .map(str::to_owned)
+        .collect();
+    device_files.sort();
     let trust = NioTrust {
         verified: read_trust_file(&store.join(format!("{prefix}.trusted_devices")))?,
         blacklisted: read_trust_file(&store.join(format!("{prefix}.blacklisted_devices")))?,
@@ -317,7 +346,9 @@ pub fn read_nio_store(store: &Path, configured_user: &str) -> Result<NioStore> {
     let read = read_tables(&tx, creds, &store_user, trust)
         .with_context(|| format!("in {}", db_path.display()));
     tx.finish()?;
-    read
+    let mut read = read?;
+    read.device_files = device_files;
+    Ok(read)
 }
 
 /// `store_user`: the spelling of the user id the store was created with.
@@ -449,6 +480,7 @@ fn read_tables(
         megolm_sessions,
         devices,
         trust,
+        device_files: Vec::new(),
     })
 }
 
@@ -824,13 +856,16 @@ pub struct Options {
     /// user_id from config.json.
     pub configured_user: String,
     pub check_online: bool,
+    /// The store `matrix-e2ee-setup.py --logout` acts on (`nio_store_path()`);
+    /// None when it cannot be computed.
+    pub skill_default_store: Option<PathBuf>,
 }
 
 /// Refuse to run over existing local state of this tool.
 fn refuse_existing_state(paths: &Paths) -> Result<()> {
     if paths.session_file().exists() {
         bail!(
-            "this tool already has a session ({}); `matrix-e2ee-cli logout` must remove the current device first",
+            "this tool already has a session ({}). If an earlier migrate-nio created it, the device is already migrated: run `matrix-e2ee-cli status` to check it. `matrix-e2ee-cli logout` removes the session but also logs its device out on the server, which for a migrated device ends the matrix-skill's copy of it too; use it only to replace a session of another device",
             paths.session_file().display()
         );
     }
@@ -855,9 +890,11 @@ pub async fn migrate(
     out: &mut dyn Write,
 ) -> Result<()> {
     refuse_existing_state(paths)?;
-    // Held until write_or_roll_back returns: a matrix-skill process that took
-    // the store between the read and the write could advance the Olm state
-    // this copies.
+    // Held until the end, the online check included: a matrix-skill process
+    // that took the store between the read and the write could advance the
+    // Olm state this copies, and one that took it during the online sync
+    // would run the same device next to the migrated client. A missing lock
+    // file is created, so the lock is held also then.
     let lock = check_daemon_lock(&opts.nio_store)?;
     let nio = read_nio_store(&opts.nio_store, &opts.configured_user)?;
 
@@ -907,7 +944,7 @@ pub async fn migrate(
         access_token: nio.access_token.clone(),
         store_passphrase: generate_passphrase(),
     };
-    let client = write_or_roll_back(paths, &session, converted, &expected, lock).await?;
+    let client = write_or_roll_back(paths, &session, converted, &expected).await?;
 
     writeln!(
         out,
@@ -920,7 +957,7 @@ pub async fn migrate(
     writeln!(out, "Session: {}", paths.session_file().display())?;
     writeln!(
         out,
-        "Do not use the matrix-skill E2EE scripts or matrix-watchd with this device any more: both copies would advance the same Olm sessions and one-time keys and break each other's decryption. The nio store was not changed."
+        "Do not use the matrix-skill E2EE scripts or matrix-watchd with this device any more: both copies would advance the same Olm sessions and one-time keys and break each other's decryption. The nio store's files were not changed; at most its missing .daemon.lock was created."
     )?;
     writeln!(
         out,
@@ -944,10 +981,35 @@ pub async fn migrate(
         out,
         "  1. Run `matrix-e2ee-cli backup-restore`: it imports the cross-signing keys, which makes your own cross-signed devices trusted, and the room keys of the key backup."
     )?;
-    writeln!(
-        out,
-        "  2. Retire the matrix-skill's copy of this device, {retire_when}: stop the daemon (`matrix-watchd.py --stop`), then run `matrix-e2ee-setup.py --logout`. It deletes credentials.json and the nio store files named after credentials.json's spelling of the user id (files named after another spelling stay); it does not log the device out on the server, which would end the migrated device too."
-    )?;
+    let is_default_store = |default: &PathBuf| match (
+        std::fs::canonicalize(&opts.nio_store),
+        std::fs::canonicalize(default),
+    ) {
+        (Ok(source), Ok(default)) => source == default,
+        _ => false,
+    };
+    if opts
+        .skill_default_store
+        .as_ref()
+        .is_some_and(is_default_store)
+    {
+        writeln!(
+            out,
+            "  2. Retire the matrix-skill's copy of this device, {retire_when}: stop the daemon (`matrix-watchd.py --stop`), then run `matrix-e2ee-setup.py --logout`. It deletes credentials.json and the nio store files named after credentials.json's spelling of the user id (files named after another spelling stay); it does not log the device out on the server, which would end the migrated device too."
+        )?;
+    } else {
+        let mut files = vec![CREDENTIALS.to_owned()];
+        files.extend(nio.device_files.iter().map(|name| term(name).into_owned()));
+        writeln!(
+            out,
+            "  2. Retire the matrix-skill's copy of this device, {retire_when}: stop the daemon if it uses this store (`matrix-watchd.py --stop`). The migrated store is {}, not the matrix-skill's default store, and `matrix-e2ee-setup.py --logout` acts on the default store only; remove these files in {} yourself: {}. Do not log the device out on the server, which would end the migrated device too.",
+            opts.nio_store.display(),
+            opts.nio_store.display(),
+            files.join(", ")
+        )?;
+    }
+    // Released only now: the online check ran as the same device.
+    drop(lock);
     Ok(())
 }
 
@@ -958,8 +1020,6 @@ async fn write_or_roll_back(
     session: &SessionFile,
     converted: Converted,
     expected: &Expected,
-    // Held to the end of the write or the rollback; see migrate().
-    _lock: DaemonLockCheck,
 ) -> Result<matrix_sdk::Client> {
     ensure_private_dir(&paths.data_dir)?;
     ensure_private_dir(&paths.store_dir())?;
@@ -995,7 +1055,7 @@ async fn write_and_verify(
 /// Delete what this run created (it refused to start over existing state).
 fn rollback(paths: &Paths, err: anyhow::Error) -> anyhow::Error {
     match delete_local_state(paths) {
-        Ok(()) => err.context("migration failed; the new session and store were deleted, the nio store is unchanged"),
+        Ok(()) => err.context("migration failed; the new session and store were deleted, the nio store's files are unchanged"),
         Err(cleanup) => err.context(format!(
             "migration failed and deleting the new state failed too ({cleanup:#}); remove {} and {}",
             paths.session_file().display(),
@@ -1009,8 +1069,8 @@ pub async fn run(store: Option<PathBuf>, yes: bool, check_online: bool) -> Resul
     // Like every command that writes this tool's store: one process at a
     // time, held until this command returns (after the online check, if any).
     let _lock = paths.lock().await?;
-    // Before config.json: the way out of an existing session is logout,
-    // whatever state config.json is in.
+    // Before config.json: an existing session is refused whatever state
+    // config.json is in.
     refuse_existing_state(&paths)?;
     let config = load_config()?;
     let opts = Options {
@@ -1021,6 +1081,7 @@ pub async fn run(store: Option<PathBuf>, yes: bool, check_online: bool) -> Resul
         homeserver: config.homeserver,
         configured_user: config.user_id,
         check_online,
+        skill_default_store: nio_store_path().ok(),
     };
     let mut confirm = |question: &str| -> Result<bool> {
         if yes {
@@ -1041,6 +1102,7 @@ mod tests {
     use super::*;
     use crate::session::read_session;
     use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
 
     const USER: &str = "@test:example.org";
     const TOKEN: &str = "fixture-access-token-not-a-secret";
@@ -1129,10 +1191,11 @@ mod tests {
                 data_dir: tmp.path().join("app"),
             },
             opts: Options {
-                nio_store: nio,
+                nio_store: nio.clone(),
                 homeserver: "https://matrix.invalid".into(),
                 configured_user: USER.into(),
                 check_online: false,
+                skill_default_store: Some(nio.clone()),
             },
             _tmp: tmp,
         }
@@ -1151,6 +1214,30 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// The nio store is input only: the same files with the same bytes, except
+    /// for the one file migrate-nio may add. When `.daemon.lock` was missing,
+    /// it is created the way the skill creates it (empty, mode 0600) so that
+    /// the store lock can be held; nothing else is added or changed.
+    fn assert_nio_store_unchanged(dir: &Path, before: &BTreeMap<String, String>) {
+        let mut after = snapshot(dir);
+        if !before.contains_key(DAEMON_LOCK) {
+            let lock = after
+                .remove(DAEMON_LOCK)
+                .expect(".daemon.lock was not created");
+            assert_eq!(
+                lock,
+                format!("{:x}", Sha256::digest(b"")),
+                ".daemon.lock not empty"
+            );
+            let mode = std::fs::metadata(dir.join(DAEMON_LOCK))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(&after, before);
     }
 
     async fn run(setup: &Setup) -> (Result<()>, String) {
@@ -1177,8 +1264,8 @@ mod tests {
         let (result, out) = run(&setup).await;
         result.unwrap();
 
-        // The nio store is input only: same files, same bytes.
-        assert_eq!(snapshot(&setup.opts.nio_store), before);
+        // The nio store is input only, apart from the lock file.
+        assert_nio_store_unchanged(&setup.opts.nio_store, &before);
 
         let session = read_session(&setup.paths.session_file()).unwrap().unwrap();
         assert_eq!(
@@ -1269,7 +1356,24 @@ mod tests {
         let before = snapshot(&setup.opts.nio_store);
 
         let err = run(&setup).await.0.unwrap_err().to_string();
-        assert!(err.contains("matrix-e2ee-cli logout"), "{err}");
+        // After a migration whose online check failed, logout would end the
+        // migrated device on the server: the refusal points to status and
+        // says what logout does instead of prescribing it.
+        assert!(err.contains("already has a session"), "{err}");
+        assert!(
+            err.contains("If an earlier migrate-nio created it, the device is already migrated")
+                && err.contains("`matrix-e2ee-cli status`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("`matrix-e2ee-cli logout` removes the session but also logs its device out on the server")
+                && err.contains("ends the matrix-skill's copy of it too"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("must remove the current device first"),
+            "{err}"
+        );
         assert_eq!(
             read_session(&setup.paths.session_file()).unwrap(),
             Some(existing)
@@ -1303,7 +1407,9 @@ mod tests {
         // Released, the same lock file no longer stands in the way.
         drop(holder);
         run(&setup).await.0.unwrap();
-        assert_eq!(snapshot(&setup.opts.nio_store), before);
+        // An existing lock file is neither truncated nor otherwise changed.
+        assert_nio_store_unchanged(&setup.opts.nio_store, &before);
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), "4242");
     }
 
     #[tokio::test]
@@ -1326,15 +1432,9 @@ mod tests {
 
         let err = format!(
             "{:#}",
-            write_or_roll_back(
-                &setup.paths,
-                &session,
-                converted,
-                &want,
-                check_daemon_lock(&setup.opts.nio_store).unwrap()
-            )
-            .await
-            .expect_err("a mismatch must fail")
+            write_or_roll_back(&setup.paths, &session, converted, &want)
+                .await
+                .expect_err("a mismatch must fail")
         );
         assert!(
             err.contains("curve25519 identity key") && err.contains("were deleted"),
@@ -1354,8 +1454,15 @@ mod tests {
             .timestamp();
         let got = nio_timestamp("2026-11-26 12:27:48.611810");
         assert_eq!(i64::from(got.0), want);
-        // Unparseable: now, not the epoch.
-        assert!(i64::from(nio_timestamp("yesterday").0) >= want);
+        // Unparseable: now, not the epoch. Compared with the clock around the
+        // call, so the result does not depend on today's date.
+        let before = Local::now().timestamp();
+        let fallback = i64::from(nio_timestamp("yesterday").0);
+        let after = Local::now().timestamp();
+        assert!(
+            (before..=after).contains(&fallback),
+            "{fallback} not in {before}..={after}"
+        );
     }
 
     #[tokio::test]
@@ -1366,6 +1473,75 @@ mod tests {
         let err = format!("{:#}", run(&setup).await.0.unwrap_err());
         assert!(err.contains("online check"), "{err}");
         assert!(read_session(&setup.paths.session_file()).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn holds_the_store_lock_during_the_online_check() {
+        use std::io::ErrorKind;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let mut setup = setup();
+        let lock_path = setup.opts.nio_store.join(DAEMON_LOCK);
+        // A local "homeserver" that answers every request with an error, and
+        // records for each one whether the skill could take the store lock.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        setup.opts.homeserver = format!("http://{}", listener.local_addr().unwrap());
+        setup.opts.check_online = true;
+        let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let (seen, stop, lock_path) = (seen.clone(), stop.clone(), lock_path.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(e) => panic!("{e}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let mut request = [0u8; 8192];
+                    let _ = stream.read(&mut request);
+                    let file = File::open(&lock_path).unwrap();
+                    // SAFETY: flock on a valid descriptor; closing it releases the lock.
+                    let free = unsafe {
+                        libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+                    };
+                    drop(file);
+                    seen.lock().unwrap().push(free);
+                    let body = r#"{"errcode":"M_UNKNOWN","error":"test server"}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            })
+        };
+
+        let err = format!("{:#}", run(&setup).await.0.unwrap_err());
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert!(err.contains("online check"), "{err}");
+        assert!(read_session(&setup.paths.session_file()).unwrap().is_some());
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "the online check sent no request");
+        assert!(
+            seen.iter().all(|free| !free),
+            "the matrix-skill could take the store during the online check: {seen:?}"
+        );
+        // Released once migrate-nio returns.
+        let file = File::open(&lock_path).unwrap();
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
     }
 
     #[tokio::test]
@@ -1489,6 +1665,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_a_missing_lock_file_and_holds_the_lock() {
+        let setup = setup();
+        let lock_path = setup.opts.nio_store.join(DAEMON_LOCK);
+        assert!(!lock_path.exists());
+        let before = snapshot(&setup.opts.nio_store);
+        // What the skill's store_lock() does: create the file if needed, LOCK_EX.
+        let exclusive_possible = || match File::open(&lock_path) {
+            // SAFETY: flock on a valid descriptor; closing it releases the lock.
+            Ok(file) => unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+            },
+            // The skill would create it and take the lock.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => panic!("{e}"),
+        };
+        let mut at_question = None;
+        let mut out = Vec::new();
+        migrate(
+            &setup.paths,
+            &setup.opts,
+            &mut |_| {
+                at_question = Some(exclusive_possible());
+                Ok(true)
+            },
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            at_question,
+            Some(false),
+            "without a lock file the matrix-skill could take the store between read and write"
+        );
+        assert!(exclusive_possible(), "the lock outlived the migration");
+        assert_nio_store_unchanged(&setup.opts.nio_store, &before);
+    }
+
+    #[tokio::test]
+    async fn refuses_when_both_spellings_have_a_database() {
+        let fx = fixture();
+        let setup = setup();
+        const SERVER_SPELLING: &str = "@Test:example.org";
+        let nio = &setup.opts.nio_store;
+        let configured = format!("{}_{}.db", fx.user_id, fx.device_id);
+        let other = format!("{SERVER_SPELLING}_{}.db", fx.device_id);
+        if nio.join(&other).exists() {
+            eprintln!(
+                "skipped: {} is case-insensitive, two spellings cannot both exist",
+                nio.display()
+            );
+            return;
+        }
+        std::fs::copy(nio.join(&configured), nio.join(&other)).unwrap();
+        let creds_path = nio.join(CREDENTIALS);
+        let mut creds: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+        creds["user_id"] = SERVER_SPELLING.into();
+        std::fs::write(&creds_path, creds.to_string()).unwrap();
+
+        let err = run(&setup).await.0.unwrap_err().to_string();
+        assert!(
+            err.contains(&nio.join(&configured).display().to_string())
+                && err.contains(&nio.join(&other).display().to_string())
+                && err.contains("Remove the stale one")
+                && err.contains("--store"),
+            "{err}"
+        );
+        assert_nothing_created(&setup);
+
+        // Only one of them left: the existing fallback finds it.
+        std::fs::remove_file(nio.join(&other)).unwrap();
+        run(&setup).await.0.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retirement_outside_the_default_store_names_the_files() {
+        let fx = fixture();
+        let mut setup = setup();
+        let default = setup._tmp.path().join("default-store");
+        std::fs::create_dir(&default).unwrap();
+        setup.opts.skill_default_store = Some(default);
+        let (result, out) = run(&setup).await;
+        result.unwrap();
+        let store = setup.opts.nio_store.display().to_string();
+        assert!(
+            !out.contains("then run `matrix-e2ee-setup.py --logout`"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "The migrated store is {store}, not the matrix-skill's default store"
+            )) && out.contains("`matrix-e2ee-setup.py --logout` acts on the default store only"),
+            "{out}"
+        );
+        let prefix = format!("{}_{}", fx.user_id, fx.device_id);
+        assert!(
+            out.contains(&format!(
+                "remove these files in {store} yourself: credentials.json, {prefix}.blacklisted_devices, {prefix}.db, {prefix}.ignored_devices, {prefix}.trusted_devices."
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("Do not log the device out on the server"),
+            "{out}"
+        );
+
+        // Without a computable default store, the same.
+        let mut setup = self::setup();
+        setup.opts.skill_default_store = None;
+        let (result, out) = run(&setup).await;
+        result.unwrap();
+        assert!(out.contains("remove these files in"), "{out}");
+    }
+
+    #[tokio::test]
     async fn migrated_account_has_no_fallback_key_yet() {
         let setup = setup();
         run(&setup).await.0.unwrap();
@@ -1536,7 +1827,10 @@ mod tests {
 
     #[tokio::test]
     async fn success_output_names_the_next_steps() {
-        let setup = setup();
+        let mut setup = setup();
+        // The skill's default store, through a path that canonicalizes to the
+        // migrated one.
+        setup.opts.skill_default_store = Some(setup.opts.nio_store.join("..").join("nio-store"));
         let (result, out) = run(&setup).await;
         result.unwrap();
         assert!(out.contains("`matrix-e2ee-cli backup-restore`"), "{out}");

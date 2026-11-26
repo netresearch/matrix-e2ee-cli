@@ -92,7 +92,10 @@ async def main(out_dir: str) -> None:
     prekey = session.encrypt("hello peer")
     machine.save_session(peer_curve, session)  # the ratchet moved
     peer_session = olm.InboundSession(peer, prekey, ours["curve25519"])
-    assert peer_session.decrypt(prekey) == "hello peer"
+    # Calls with side effects stay outside assert: python -O drops asserts.
+    decrypted = peer_session.decrypt(prekey)
+    if decrypted != "hello peer":
+        sys.exit(f"PEER decrypted {decrypted!r}, expected 'hello peer'")
     reply = peer_session.encrypt(OLM_PLAINTEXT)
 
     # An imported key, as matrix-key-backup.py stores one from the backup.
@@ -106,7 +109,8 @@ async def main(out_dir: str) -> None:
         IMPORTED_ROOM_ID,
         [],
     )
-    assert machine.inbound_group_store.add(imported)
+    if not machine.inbound_group_store.add(imported):
+        sys.exit("the imported Megolm session was not added to the inbound group store")
     machine.store.save_inbound_group_session(imported)
     imported_ciphertext = remote.encrypt(IMPORTED_PLAINTEXT)
 
@@ -132,9 +136,13 @@ async def main(out_dir: str) -> None:
     )
     for device, trust in devices:
         if trust == "verified":
-            assert machine.store.verify_device(device)
+            changed = machine.store.verify_device(device)
         elif trust == "blacklisted":
-            assert machine.store.blacklist_device(device)
+            changed = machine.store.blacklist_device(device)
+        else:
+            continue
+        if not changed:
+            sys.exit(f"nio did not record {trust} for {device.device_id}")
 
     await client.close()
 
