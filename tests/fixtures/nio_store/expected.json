@@ -1,0 +1,56 @@
+{
+  "user_id": "@test:example.org",
+  "device_id": "TESTDEVICE",
+  "curve25519": "K6Np8qSSyBNrqYzuAS0h//tmimoD+xQGwGB5yHXaGE8",
+  "ed25519": "L7tlHu+J9oFE1fKpJHrRkv+7UCn04M8YMr5ZzVv0/Uc",
+  "olm_sessions": [
+    {
+      "session_id": "/xNf+4aS+d2tflDiwBdg/xWf/tPOMWQLIUECmQQ2XsE",
+      "sender_key": "Yhu5x/skVn+HtoUZWDkP4u+pY6VJNBHeTOQm2WGEM3U"
+    }
+  ],
+  "megolm_sessions": [
+    {
+      "session_id": "QR/jH0Mz88pYlcP8YF/AiPdD6XLuFNti1wjj7FOOmEc",
+      "room_id": "!room:example.org",
+      "imported": false,
+      "ciphertext": "AwgAEiDOzNTB6TRmQnk6FBlzqdtvTsVCDWO5X9qX1jdDS8FiEgvdOkVAJ/Q1zZ/ppoM/zNqkqV9wHPRSD3zEU9AELK4lDq5WGj7ZvEdiTC26N4GnKmkElB2mVpdqDu+5aDdp2RutjI+PALXSAQ",
+      "plaintext": "megolm fixture plaintext"
+    },
+    {
+      "session_id": "2CL/1MExH0aIL8CkNI+bE2Hswr3TGZy5fyndw7/ug1A",
+      "room_id": "!imported:example.org",
+      "imported": true,
+      "ciphertext": "AwgAEjDqWVvJzrroT3U/nb6IxTaj1knEgw3LhcHa1n37wf5JtBoHBMvpkhICz3VCFbCRbeGTf0DXkNvFzLIX+0FaYWaNX83iruDOT99npuKVCRXQ3IZoW8ecIpHry8tqGoJKTSV08Me59z2rcfnt4J52FchZo0/7IVtPXQQ",
+      "plaintext": "imported megolm fixture plaintext"
+    }
+  ],
+  "devices": [
+    {
+      "user_id": "@test:example.org",
+      "device_id": "TRUSTEDDEV",
+      "ed25519": "SLp5y023sJvy7th7nGAMsrRqFAqyTO7yV5flZ6sl4Bw",
+      "curve25519": "ZhGp10/zxkkTIKFM6lbo0WwLovGD6SDEJg47PnTk0zQ",
+      "trust": "verified"
+    },
+    {
+      "user_id": "@other:example.org",
+      "device_id": "BLOCKEDDEV",
+      "ed25519": "ReTN/e6Kf7hgXZuaD1VwoIza4R36TH4uInitfwJUn9U",
+      "curve25519": "nfFDVkKa0uhbX49lgjSU433JZT7p+nY5NLGEko+vCg8",
+      "trust": "blacklisted"
+    },
+    {
+      "user_id": "@other:example.org",
+      "device_id": "UNSETDEV",
+      "ed25519": "e4eRPFiPc3VfI4dyekrGo1bj2J9YPud10xIPjfO0j5c",
+      "curve25519": "RMV/SxzHeWY9xoCRnI+LFS+IDVpUTsmiuPmWJxRkVSE",
+      "trust": "unset"
+    }
+  ],
+  "olm_message": {
+    "message_type": 1,
+    "ciphertext": "AwogVleaHE2Qn0Vo9HVGrvKxLN2MmgcCD2sGqzNHHiWcPBsQACIgvUqtMG2QGnocYgYNrMJxtXdokH4ouTql8RAAf0uPIp7Xr4FxsVUeaA",
+    "plaintext": "olm fixture plaintext"
+  }
+}
