@@ -991,18 +991,19 @@ pub async fn migrate(
         out,
         "  1. Run `matrix-e2ee-cli backup-restore`: it imports the cross-signing keys, which makes your own cross-signed devices trusted, and the room keys of the key backup."
     )?;
-    let is_default_store = |default: &PathBuf| match (
-        std::fs::canonicalize(&opts.nio_store),
-        std::fs::canonicalize(default),
-    ) {
-        (Ok(source), Ok(default)) => source == default,
-        _ => false,
-    };
-    if opts
-        .skill_default_store
-        .as_ref()
-        .is_some_and(is_default_store)
-    {
+    // canonicalize is blocking file I/O: off the async worker threads.
+    let (source, default) = (opts.nio_store.clone(), opts.skill_default_store.clone());
+    let is_default_store = tokio::task::spawn_blocking(move || {
+        default.is_some_and(|default| {
+            matches!(
+                (std::fs::canonicalize(&source), std::fs::canonicalize(&default)),
+                (Ok(source), Ok(default)) if source == default
+            )
+        })
+    })
+    .await
+    .unwrap_or(false);
+    if is_default_store {
         writeln!(
             out,
             "  2. Retire the matrix-skill's copy of this device, {retire_when}: stop the daemon (`matrix-watchd.py --stop`), then run `matrix-e2ee-setup.py --logout`. It deletes credentials.json and the nio store files named after credentials.json's spelling of the user id (files named after another spelling stay); it does not log the device out on the server, which would end the migrated device too."
