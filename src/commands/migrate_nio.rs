@@ -278,9 +278,18 @@ pub fn read_nio_store(store: &Path, configured_user: &str) -> Result<NioStore> {
     if configured_user != creds.user_id {
         spellings.push(configured_user);
     }
+    // Compare against the names the directory really holds: on a
+    // case-insensitive file system (macOS by default) every spelling "exists",
+    // and the first one would be taken even when nio wrote the other.
+    let names: std::collections::HashSet<std::ffi::OsString> = std::fs::read_dir(store)
+        .with_context(|| format!("cannot list {}", store.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.file_name()))
+        .collect();
     let Some((store_user, db_path)) = spellings.iter().find_map(|user| {
-        let path = store.join(format!("{user}_{}.db", creds.device_id));
-        path.is_file().then(|| (user.to_string(), path))
+        let name = format!("{user}_{}.db", creds.device_id);
+        let path = store.join(&name);
+        (names.contains(std::ffi::OsStr::new(&name)) && path.is_file())
+            .then(|| (user.to_string(), path))
     }) else {
         bail!(
             "no nio database for the device in credentials.json: none of {} in {}",
