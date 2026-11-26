@@ -6,9 +6,9 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomArg {
     /// Anything ruma parses as a room id: `!opaque:server`, or `!hash`
-    /// without a server part (room version 12). It may still be a room name
-    /// that starts with `!`; the caller falls back to name matching when no
-    /// joined room has this id.
+    /// without a server part (room version 12). A room name that starts with
+    /// `!` is never matched from here: a room named like an id must not
+    /// receive what was meant for the room with that id.
     Id(OwnedRoomId),
     /// `#alias:server`
     Alias(String),
@@ -69,8 +69,7 @@ mod tests {
     #[test]
     fn room_id_without_server_is_an_id() {
         // Room version 12 ids have no server part: "!" plus a hash. A name
-        // starting with "!" also lands here; resolve_room falls back to name
-        // matching when no joined room has that id.
+        // starting with "!" also lands here and is not matched as a name.
         let v12 = "!31hneApxJ_1o-63DmFrpeqnkFfWppnzWso1JvH3ogLM";
         assert_eq!(classify(v12), RoomArg::Id(RoomId::parse(v12).unwrap()));
         assert_eq!(

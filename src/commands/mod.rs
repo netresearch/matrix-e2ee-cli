@@ -37,12 +37,13 @@ pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
     let joined = |room: &Room| room.state() == matrix_sdk::RoomState::Joined;
     let room_id = match classify(arg) {
         RoomArg::Id(id) => {
-            if let Some(room) = client.get_room(&id).filter(joined) {
-                return Ok(room);
-            }
-            match find_by_name(client, arg.trim()).await? {
-                Some(room_id) => room_id,
-                None => bail!("not joined to room {id}, and no joined room is named {arg:?}"),
+            // No fallback to room names: a room someone named "!<id>" must
+            // not receive a message meant for the room with that id.
+            match client.get_room(&id).filter(joined) {
+                Some(room) => return Ok(room),
+                None => bail!(
+                    "not joined to room {id}; to address a room whose name starts with \"!\", use its alias or id"
+                ),
             }
         }
         RoomArg::Alias(alias) => {
