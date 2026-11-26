@@ -864,8 +864,10 @@ pub mod unix {
                 .log
                 .lock()
                 .map_err(|_| anyhow::anyhow!("the log state is poisoned"))?;
-            if !state.next_seq.contains_key(room_id) && lost_marker(&path).exists() {
-                // A loss flagged before the last restart.
+            // A loss flagged before the last restart. A failed lookup fails
+            // this record, so the caller flags the room and the next record
+            // still gets its gap record.
+            if !state.next_seq.contains_key(room_id) && lost_marker(&path).try_exists()? {
                 state.lost.insert(room_id.to_owned());
             }
             let mut seq = *state
