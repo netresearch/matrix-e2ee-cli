@@ -50,9 +50,11 @@ impl FakeDaemon {
                 return;
             };
             if reset {
-                // Close before reading: the unread request makes the kernel
-                // reset the connection instead of a clean end of stream.
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Wait until the whole request line has arrived, but leave it
+                // unread: closing with unread input makes the kernel reset
+                // the connection instead of a clean end of stream.
+                let line = peek_line(&conn);
+                tx.send(serde_json::from_slice(&line).unwrap()).ok();
                 drop(conn);
                 return;
             }
@@ -74,5 +76,30 @@ impl FakeDaemon {
         self.received
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap()
+    }
+}
+
+/// The first line on `conn` (with its newline), read with `MSG_PEEK`: it
+/// stays in the receive queue. Waits until the newline has arrived.
+fn peek_line(conn: &std::os::unix::net::UnixStream) -> Vec<u8> {
+    use std::os::fd::AsRawFd;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        // SAFETY: buf is valid for buf.len() bytes; MSG_PEEK leaves the data.
+        let n = unsafe {
+            libc::recv(
+                conn.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        let n = usize::try_from(n).expect("recv failed");
+        assert!(n > 0, "the client closed before sending its request");
+        if let Some(end) = buf[..n].iter().position(|&b| b == b'\n') {
+            buf.truncate(end + 1);
+            return buf;
+        }
+        thread::sleep(std::time::Duration::from_millis(5));
     }
 }

@@ -8,7 +8,7 @@
 // The writing half serves the watch daemon, which exists on Unix only.
 #![cfg_attr(not(unix), allow(dead_code))]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -481,7 +481,10 @@ pub fn write_cursor(path: &Path, seq: i64) -> Result<()> {
 /// What arrived after a cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
+    /// Distinct events: a correction record (the same `event_id` again,
+    /// e.g. an undecryptable event decrypted later) does not count twice.
     pub total: u64,
+    /// Distinct events that mention the user in any of their records.
     pub mentions: u64,
     pub last_seq: i64,
     /// The oldest record left is newer than the cursor: the counts are a
@@ -497,13 +500,20 @@ pub fn summarize_since(log: &Path, seq: i64) -> Summary {
         truncated: false,
     };
     let mut oldest_seen = None;
+    let mut counted: HashSet<String> = HashSet::new();
+    let mut mentioned: HashSet<String> = HashSet::new();
     for record in read_records(log) {
         let record_seq = seq_of(&record);
         oldest_seen.get_or_insert(record_seq);
         summary.last_seq = summary.last_seq.max(record_seq);
         if record_seq > seq {
-            summary.total += 1;
-            if record.get("mentions_me").and_then(Value::as_bool) == Some(true) {
+            let mentions_me = record.get("mentions_me").and_then(Value::as_bool) == Some(true);
+            // A record without an event id counts on its own.
+            let id = record.get("event_id").and_then(Value::as_str);
+            if id.is_none_or(|id| counted.insert(id.to_owned())) {
+                summary.total += 1;
+            }
+            if mentions_me && id.is_none_or(|id| mentioned.insert(id.to_owned())) {
                 summary.mentions += 1;
             }
         }
@@ -1153,6 +1163,42 @@ mod tests {
                 truncated: false
             }
         );
+    }
+
+    #[test]
+    fn a_correction_record_does_not_count_twice() {
+        let l = cursor_log();
+        // $e2 again (decrypted later), then a daemon line without an id.
+        for (seq, id) in [(6, "$e2"), (7, "$e4"), (8, "")] {
+            let rec = build_record_with(
+                seq,
+                &Event {
+                    event_id: id.into(),
+                    body: Some("hallo sebastian".into()),
+                    ..base_event()
+                },
+                &own("@sebastian:example.org", None),
+                None,
+                &utc,
+            );
+            let mut value = serde_json::to_value(&rec).unwrap();
+            if id.is_empty() {
+                value.as_object_mut().unwrap().remove("event_id");
+            }
+            let mut line = serde_json::to_string(&value).unwrap();
+            line.push('\n');
+            OpenOptions::new()
+                .append(true)
+                .open(&l.path)
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+        }
+        let s = summarize_since(&l.path, 0);
+        assert_eq!((s.total, s.mentions, s.last_seq), (6, 3, 8));
+        // After the cursor, a correction is new once.
+        let s = summarize_since(&l.path, 5);
+        assert_eq!((s.total, s.mentions), (3, 3));
     }
 
     #[test]

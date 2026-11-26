@@ -238,10 +238,14 @@ mod tests {
         fn a_reset_connection_is_an_error_not_a_fallback() {
             let fake = FakeDaemon::start_raw(Some(Vec::new()), true);
             let err = request(&fake.path, &json!({"op": "send"}), REQUEST_TIMEOUT).unwrap_err();
+            // The fake had the whole request before it reset the connection.
+            assert_eq!(fake.received(), json!({"op": "send"}));
             assert!(
                 err.to_string().contains("may have been carried out"),
                 "{err}"
             );
+            #[cfg(target_os = "linux")]
+            assert!(err.to_string().contains("reset"), "not a reset: {err}");
         }
 
         #[test]
