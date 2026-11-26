@@ -82,15 +82,22 @@ impl Paths {
     }
 
     async fn lock_within(&self, wait: Duration) -> Result<DataDirLock> {
-        ensure_private_dir(&self.data_dir)?;
         let path = self.data_dir.join(LOCK_FILE);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
+        // Directory creation and open are blocking file I/O: keep them off the
+        // async worker threads. try_lock below does not block.
+        let (dir, lock_path) = (self.data_dir.clone(), path.clone());
+        let file = tokio::task::spawn_blocking(move || -> Result<fs::File> {
+            ensure_private_dir(&dir)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| format!("cannot open {}", lock_path.display()))
+        })
+        .await
+        .context("the lock-file task failed")??;
         let deadline = tokio::time::Instant::now() + wait;
         let mut told = false;
         loop {
