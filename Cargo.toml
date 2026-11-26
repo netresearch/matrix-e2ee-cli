@@ -1,0 +1,10 @@
+[package]
+name = "matrix-e2ee-cli"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+description = "End-to-end encrypted Matrix messaging from the command line, built on matrix-sdk"
+repository = "https://github.com/netresearch/matrix-e2ee-cli"
+publish = false
+
+[dependencies]
