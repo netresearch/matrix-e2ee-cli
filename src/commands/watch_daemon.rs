@@ -296,14 +296,20 @@ pub mod unix {
             );
             return Ok(());
         }
-        ensure_private_dir(&paths.data_dir)?;
-        let log_file = paths.daemon_log();
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&log_file)
-            .with_context(|| format!("cannot open {}", log_file.display()))?;
+        let (data_dir, log_file) = (paths.data_dir.clone(), paths.daemon_log());
+        let log_path = log_file.clone();
+        // Blocking file I/O: off the async worker threads.
+        let log = tokio::task::spawn_blocking(move || -> Result<fs::File> {
+            ensure_private_dir(&data_dir)?;
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&log_file)
+                .with_context(|| format!("cannot open {}", log_file.display()))
+        })
+        .await
+        .context("the log-file task failed")??;
         let exe = std::env::current_exe().context("cannot find this program's path")?;
         let mut command = Command::new(exe);
         command
@@ -329,7 +335,7 @@ pub mod unix {
             if let Some(exit) = child.try_wait()? {
                 bail!(
                     "the watch daemon exited at once ({exit}); see {}",
-                    log_file.display()
+                    log_path.display()
                 );
             }
             if status_answer(paths).await?.is_some() {
@@ -340,7 +346,7 @@ pub mod unix {
         }
         println!(
             "Started the watch daemon (pid {pid}); it does not answer yet, see {}",
-            log_file.display()
+            log_path.display()
         );
         Ok(())
     }
@@ -407,7 +413,10 @@ pub mod unix {
             .await
             .context("the watch daemon needs the store to itself")?;
         let mut cleanup = Cleanup(vec![paths.daemon_pid_file()]);
-        fs::write(paths.daemon_pid_file(), std::process::id().to_string())
+        let pid_file = paths.daemon_pid_file();
+        tokio::task::spawn_blocking(move || fs::write(pid_file, std::process::id().to_string()))
+            .await
+            .context("the pid-file task failed")?
             .context("cannot write the pid file")?;
         let stop = stop_on_signals();
 
@@ -462,7 +471,10 @@ pub mod unix {
 
         let socket = paths.daemon_socket();
         // Holding the lock, so a socket file left here is stale.
-        fs::remove_file(&socket).ok();
+        let stale = socket.clone();
+        tokio::task::spawn_blocking(move || fs::remove_file(stale).ok())
+            .await
+            .context("the socket-cleanup task failed")?;
         let listener = UnixListener::bind(&socket).with_context(|| {
             format!(
                 "cannot listen on {} (a socket path is limited to about 100 bytes)",
@@ -472,8 +484,13 @@ pub mod unix {
         cleanup.0.push(socket.clone());
         // The data directory is 0700, so nobody else reaches the socket
         // between bind and chmod.
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("cannot restrict {}", socket.display()))?;
+        let restrict = socket.clone();
+        tokio::task::spawn_blocking(move || {
+            fs::set_permissions(&restrict, fs::Permissions::from_mode(0o600))
+        })
+        .await
+        .context("the socket-permission task failed")?
+        .with_context(|| format!("cannot restrict {}", socket.display()))?;
         println!(
             "watching {} room(s), socket at {}",
             daemon.rooms.len(),
