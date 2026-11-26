@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Netresearch DTT GmbH
+
+title = "matrix-e2ee-cli Betterleaks configuration"
+
+[extend]
+useDefault = true
+
+# The migrate-nio test fixture describes a throwaway test account
+# (@test:example.org) that nio generated offline: public curve25519/ed25519
+# keys, session ids and ciphertexts. generic-api-key matches the base64 keys.
+# The scan reads every fetched ref, so this applies while the branch that
+# adds the fixture is open too.
+[[allowlists]]
+description = "migrate-nio fixture: public keys and ids of a generated test account"
+targetRules = ["generic-api-key"]
+paths = ['''^tests/fixtures/nio_store/expected\.json$''']
