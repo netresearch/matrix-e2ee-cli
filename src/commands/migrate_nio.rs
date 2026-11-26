@@ -997,6 +997,9 @@ fn rollback(paths: &Paths, err: anyhow::Error) -> anyhow::Error {
 
 pub async fn run(store: Option<PathBuf>, yes: bool, check_online: bool) -> Result<()> {
     let paths = Paths::from_env()?;
+    // Like every command that writes this tool's store: one process at a
+    // time, held until the migration has been written or rolled back.
+    let _lock = paths.lock().await?;
     // Before config.json: the way out of an existing session is logout,
     // whatever state config.json is in.
     refuse_existing_state(&paths)?;
