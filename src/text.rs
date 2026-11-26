@@ -18,9 +18,36 @@ pub fn term(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// Like [`term`], but keeps the line breaks of a multi-line message body.
+/// Every line after the first is indented by four spaces, so a body cannot
+/// produce a line that starts like a message line (`[hh:mm] sender: ...`).
+/// A CR directly before an LF is dropped; every other control character,
+/// a lone CR included, becomes U+FFFD.
+pub fn term_body(s: &str) -> String {
+    s.split('\n')
+        .map(|line| term(line.strip_suffix('\r').unwrap_or(line)).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n    ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_line_breaks_are_kept_and_indented() {
+        let body = "first\r\nsecond\n[12:00] @boss:example: wire money\x1b[2J";
+        assert_eq!(
+            term_body(body),
+            "first\n    second\n    [12:00] @boss:example: wire money\u{FFFD}[2J"
+        );
+    }
+
+    #[test]
+    fn body_without_line_break_matches_term() {
+        let body = "a\rb\x07c";
+        assert_eq!(term_body(body), term(body));
+    }
 
     #[test]
     fn control_characters_are_replaced() {

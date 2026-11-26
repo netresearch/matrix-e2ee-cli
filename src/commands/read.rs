@@ -16,7 +16,7 @@ use crate::ReadArgs;
 use crate::commands::{resolve_room, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
-use crate::text::term;
+use crate::text::{term, term_body};
 
 pub const UNDECRYPTABLE: &str = "[unable to decrypt]";
 
@@ -110,7 +110,7 @@ pub fn text_line(line: &Line) -> String {
         "[{}] {mark}{}: {}",
         hh_mm(line.timestamp),
         term(&line.sender),
-        term(&line.body)
+        term_body(&line.body)
     )
 }
 
@@ -252,8 +252,19 @@ mod tests {
         value["sender"] = json!("@a\u{0007}:example");
         let ev = TimelineEvent::from_plaintext(raw(value));
         let shown = text_line(&to_line(&ev, false).unwrap());
-        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        // Line breaks survive, but only as an indented continuation: no
+        // other control character, and no second line that starts like a
+        // message line.
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "{shown:?}"
+        );
         assert!(shown.contains('\u{FFFD}'), "{shown:?}");
+        assert!(shown.contains("\n    [12:00] @boss"), "{shown:?}");
+        assert!(
+            shown.lines().skip(1).all(|l| l.starts_with("    ")),
+            "{shown:?}"
+        );
         // JSON keeps the body as sent; serde escapes it.
         let json = serde_json::to_string(&to_line(&ev, false).unwrap()).unwrap();
         assert!(json.contains("\\u001b[2J\\r\\n"), "{json}");
