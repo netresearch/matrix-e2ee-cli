@@ -5,13 +5,19 @@
 //! `--trust-unverified-devices` is given.
 
 use anyhow::{Context, Result, bail};
+use matrix_sdk::Client;
 use matrix_sdk::ruma::UserId;
 use matrix_sdk::ruma::events::room::message::{ReplacementMetadata, RoomMessageEventContent};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::EditArgs;
-use crate::commands::send::{Sent, key_sharing, send_guarded};
-use crate::commands::{event_sender, fetch_event, parse_event_id, resolve_room, sync_once};
+use crate::commands::send::{
+    Sent, key_sharing, print_warnings, request_str, request_trusts_unverified, send_guarded,
+};
+use crate::commands::{
+    event_sender, fetch_event, parse_event_id, resolve_room, sync_once, via_daemon,
+};
 use crate::config::load_config;
 use crate::session::{Paths, restore};
 use crate::text::{json_line, term};
@@ -25,14 +31,60 @@ pub enum EditKind {
 }
 
 pub async fn run(args: EditArgs) -> Result<()> {
-    let config = load_config()?;
     let paths = Paths::from_env()?;
-    let _lock = paths.lock().await?;
-    let restored = restore(&config, &paths, key_sharing(args.trust_unverified_devices)).await?;
-    let client = restored.client;
-    sync_once(&client).await?;
-    let room = resolve_room(&client, &args.room).await?;
-    let event_id = parse_event_id(&args.event_id)?;
+    // The request the watch daemon takes (matrix-watchd.py's "edit").
+    let request = json!({
+        "op": "edit",
+        "room": args.room,
+        "event_id": args.event_id,
+        "body": args.new_message,
+        "trust_unverified_devices": args.trust_unverified_devices,
+    });
+    let outcome = match via_daemon::<EditOutcome>(&paths, request.clone(), "edit").await? {
+        Some(outcome) => outcome,
+        None => {
+            let config = load_config()?;
+            let _lock = paths.lock().await?;
+            let restored =
+                restore(&config, &paths, key_sharing(args.trust_unverified_devices)).await?;
+            sync_once(&restored.client).await?;
+            execute(&restored.client, &request).await?
+        }
+    };
+    print_warnings(&outcome.warnings);
+    if args.json {
+        println!(
+            "{}",
+            json_line(&json!({
+                "event_id": outcome.event_id,
+                "replaces": outcome.replaces,
+                "room_id": outcome.room_id,
+                "encrypted": outcome.encrypted,
+            }))?
+        );
+    } else {
+        println!("{}", term(&outcome.event_id));
+    }
+    Ok(())
+}
+
+/// What an edit is reported as, on the direct path and in the daemon's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditOutcome {
+    pub event_id: String,
+    pub replaces: String,
+    pub room_id: String,
+    pub encrypted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Carry out an "edit" request with `client`, which must have been built
+/// with [`key_sharing`] of the request's `trust_unverified_devices`. The
+/// message type is the original's; a `msgtype` in the request is ignored.
+pub async fn execute(client: &Client, request: &Value) -> Result<EditOutcome> {
+    let room = resolve_room(client, request_str(request, "room")?).await?;
+    let event_id = parse_event_id(request_str(request, "event_id")?)?;
     let own = client
         .user_id()
         .context("the client has no user id")?
@@ -43,7 +95,7 @@ pub async fn run(args: EditArgs) -> Result<()> {
     // The wire type: a decrypted original reads m.room.message in its JSON.
     let original_encrypted = fetched.encryption_info().is_some() || fetched.kind.is_utd();
 
-    let body = args.new_message.as_str();
+    let body = request_str(request, "body")?;
     let content = match kind {
         EditKind::Text => RoomMessageEventContent::text_plain(body),
         EditKind::Notice => RoomMessageEventContent::notice_plain(body),
@@ -53,29 +105,22 @@ pub async fn run(args: EditArgs) -> Result<()> {
     let Sent {
         event_id: edit_id,
         encrypted,
+        warnings,
     } = send_guarded(
         &room,
         content,
-        args.trust_unverified_devices,
+        request_trusts_unverified(request),
         "edit",
         |encrypt| check_same_encryption(original_encrypted, encrypt),
     )
     .await?;
-
-    if args.json {
-        println!(
-            "{}",
-            json_line(&json!({
-                "event_id": edit_id,
-                "replaces": event_id,
-                "room_id": room.room_id(),
-                "encrypted": encrypted,
-            }))?
-        );
-    } else {
-        println!("{}", term(edit_id.as_str()));
-    }
-    Ok(())
+    Ok(EditOutcome {
+        event_id: edit_id.to_string(),
+        replaces: event_id.to_string(),
+        room_id: room.room_id().to_string(),
+        encrypted,
+        warnings,
+    })
 }
 
 /// Refuse an edit whose wire type would differ from the original's: the

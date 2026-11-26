@@ -11,57 +11,180 @@ use matrix_sdk::encryption::identities::Device;
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::events::MessageLikeEventContent;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-use matrix_sdk::{EncryptionState, Room, RoomMemberships};
-use serde_json::json;
+use matrix_sdk::{Client, EncryptionState, Room, RoomMemberships};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::SendArgs;
-use crate::commands::{resolve_room, sync_once};
+use crate::commands::{resolve_room, sync_once, via_daemon};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
 use crate::text::{json_line, term};
 
 pub async fn run(args: SendArgs) -> Result<()> {
-    let config = load_config()?;
     let paths = Paths::from_env()?;
-    let _lock = paths.lock().await?;
-    let restored = restore(&config, &paths, key_sharing(args.trust_unverified_devices)).await?;
-    let client = restored.client;
-    sync_once(&client).await?;
-    let room = resolve_room(&client, &args.room).await?;
-
-    let body = args.message.as_str();
-    let content = if args.notice {
-        RoomMessageEventContent::notice_plain(body)
+    let msgtype = if args.notice {
+        "m.notice"
     } else if args.emote {
-        RoomMessageEventContent::emote_plain(body)
+        "m.emote"
     } else {
-        RoomMessageEventContent::text_plain(body)
+        "m.text"
     };
-    let Sent {
-        event_id,
-        encrypted,
-    } = send_guarded(
-        &room,
-        content,
-        args.trust_unverified_devices,
-        "message",
-        |_| Ok(()),
-    )
-    .await?;
+    // The request the watch daemon takes (matrix-watchd.py's "send"); the
+    // direct path executes the same request.
+    let request = json!({
+        "op": "send",
+        "room": args.room,
+        "body": args.message,
+        "msgtype": msgtype,
+        "trust_unverified_devices": args.trust_unverified_devices,
+    });
+    let outcome = match via_daemon::<SendOutcome>(&paths, request.clone(), "message").await? {
+        Some(outcome) => outcome,
+        None => {
+            let config = load_config()?;
+            let _lock = paths.lock().await?;
+            let restored =
+                restore(&config, &paths, key_sharing(args.trust_unverified_devices)).await?;
+            sync_once(&restored.client).await?;
+            execute(&restored.client, &request).await?
+        }
+    };
+    print_outcome(&outcome, args.json)
+}
 
-    if args.json {
+/// What a sent message is reported as, on the direct path and in the
+/// daemon's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendOutcome {
+    pub event_id: String,
+    pub room_id: String,
+    pub encrypted: bool,
+    /// Printed to stderr as "warning: ...".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+fn print_outcome(outcome: &SendOutcome, json: bool) -> Result<()> {
+    print_warnings(&outcome.warnings);
+    if json {
         // json_line escapes DEL and C1, which a hostile server can put into a
         // room id and serde_json leaves raw.
         println!(
             "{}",
-            json_line(
-                &json!({"event_id": event_id, "room_id": room.room_id(), "encrypted": encrypted})
-            )?
+            json_line(&json!({
+                "event_id": outcome.event_id,
+                "room_id": outcome.room_id,
+                "encrypted": outcome.encrypted,
+            }))?
         );
     } else {
-        println!("{}", term(event_id.as_str()));
+        println!("{}", term(&outcome.event_id));
     }
     Ok(())
+}
+
+pub fn print_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {}", term(warning));
+    }
+}
+
+/// Carry out a "send" request with `client`, which must have been built with
+/// [`key_sharing`] of the request's `trust_unverified_devices`.
+pub async fn execute(client: &Client, request: &Value) -> Result<SendOutcome> {
+    let room = resolve_room(client, request_str(request, "room")?).await?;
+    let content = message_content(request)?;
+    let Sent {
+        event_id,
+        encrypted,
+        warnings,
+    } = send_guarded(
+        &room,
+        content,
+        request_trusts_unverified(request),
+        "message",
+        |_| Ok(()),
+    )
+    .await?;
+    Ok(SendOutcome {
+        event_id: event_id.to_string(),
+        room_id: room.room_id().to_string(),
+        encrypted,
+        warnings,
+    })
+}
+
+/// A required string field of a request.
+pub fn request_str<'a>(request: &'a Value, key: &str) -> Result<&'a str> {
+    request
+        .get(key)
+        .and_then(Value::as_str)
+        .with_context(|| format!("the request has no {key:?}"))
+}
+
+/// An optional, non-empty string field of a request.
+pub fn request_opt<'a>(request: &'a Value, key: &str) -> Option<&'a str> {
+    request
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+}
+
+/// The request's `trust_unverified_devices` (absent: false).
+pub fn request_trusts_unverified(request: &Value) -> bool {
+    request
+        .get("trust_unverified_devices")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The message a "send" request describes, built the way matrix-watchd.py's
+/// `op_send` builds it: `msgtype` (default `m.text`), `mentions` and
+/// `mention_room` as `m.mentions`, `formatted_body` as HTML, and
+/// `reply_to` or else `thread_root` as the relation. Unlike the Python
+/// daemon the body is not rendered as Markdown: this tool sends plain text.
+pub fn message_content(request: &Value) -> Result<RoomMessageEventContent> {
+    let body = request_str(request, "body")?;
+    let msgtype = request_opt(request, "msgtype").unwrap_or("m.text");
+    if !matches!(msgtype, "m.text" | "m.notice" | "m.emote") {
+        bail!("msgtype {msgtype:?} is not supported; use m.text, m.notice or m.emote");
+    }
+    let mut content = json!({"msgtype": msgtype, "body": body});
+    let mut mentions = serde_json::Map::new();
+    if let Some(users) = request.get("mentions").filter(|v| !v.is_null()) {
+        let users = users
+            .as_array()
+            .context("mentions must be a list of user ids")?;
+        let mut ids: Vec<&str> = Vec::new();
+        for user in users {
+            let user = user
+                .as_str()
+                .context("mentions must be a list of user ids")?;
+            if !ids.contains(&user) {
+                ids.push(user);
+            }
+        }
+        if !ids.is_empty() {
+            mentions.insert("user_ids".into(), json!(ids));
+        }
+    }
+    if request.get("mention_room").and_then(Value::as_bool) == Some(true) {
+        mentions.insert("room".into(), json!(true));
+    }
+    if !mentions.is_empty() {
+        content["m.mentions"] = Value::Object(mentions);
+    }
+    if let Some(html) = request_opt(request, "formatted_body") {
+        content["format"] = json!("org.matrix.custom.html");
+        content["formatted_body"] = json!(html);
+    }
+    if let Some(reply_to) = request_opt(request, "reply_to") {
+        content["m.relates_to"] = json!({"m.in_reply_to": {"event_id": reply_to}});
+    } else if let Some(root) = request_opt(request, "thread_root") {
+        content["m.relates_to"] = json!({"rel_type": "m.thread", "event_id": root});
+    }
+    serde_json::from_value(content).context("the request does not describe a valid message")
 }
 
 /// The room-key sharing rule for a command that sends an encrypted event:
@@ -79,6 +202,8 @@ pub struct Sent {
     pub event_id: OwnedEventId,
     /// The room is encrypted, so the event was sent encrypted.
     pub encrypted: bool,
+    /// For stderr ("warning: ..."); the daemon hands them to the client.
+    pub warnings: Vec<String>,
 }
 
 /// Send one message-like event the way `send` does. The client must have
@@ -136,9 +261,7 @@ pub async fn send_guarded(
         Ok(())
     };
     let (sent, warning) = settle_send(result, discarded)?;
-    if let Some(warning) = warning {
-        eprintln!("warning: {}", term(&warning));
-    }
+    let mut warnings: Vec<String> = warning.into_iter().collect();
     let event_id = sent.response.event_id;
 
     if encrypted && !trust_unverified_devices {
@@ -146,16 +269,17 @@ pub async fn send_guarded(
         // devices learnt there got the key withheld. Say so.
         let withheld = untrusted_devices(room).await.unwrap_or_default();
         if !withheld.is_empty() {
-            eprintln!(
-                "warning: sent, but the room key was withheld from unverified devices:{}",
+            warnings.push(format!(
+                "sent, but the room key was withheld from unverified devices:{}",
                 describe(&withheld)
-            );
+            ));
         }
     }
 
     Ok(Sent {
         event_id,
         encrypted,
+        warnings,
     })
 }
 
@@ -252,6 +376,56 @@ mod tests {
             "{chain}"
         );
         assert!(!chain.starts_with("sent"), "{chain}");
+    }
+
+    #[test]
+    fn message_content_follows_the_python_daemon() {
+        let plain = message_content(&json!({"body": "hi"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            json!({"msgtype": "m.text", "body": "hi"})
+        );
+        let notice = message_content(&json!({"body": "n", "msgtype": "m.notice"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&notice).unwrap()["msgtype"],
+            "m.notice"
+        );
+        let full = serde_json::to_value(
+            message_content(&json!({
+                "body": "hi @a", "msgtype": "m.emote",
+                "mentions": ["@a:example.org", "@a:example.org", "@b:example.org"],
+                "mention_room": true,
+                "formatted_body": "hi <b>a</b>",
+                "reply_to": "$parent:example.org",
+                "thread_root": "$ignored:example.org",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(full["msgtype"], "m.emote");
+        assert_eq!(
+            full["m.mentions"],
+            json!({"user_ids": ["@a:example.org", "@b:example.org"], "room": true})
+        );
+        assert_eq!(full["format"], "org.matrix.custom.html");
+        assert_eq!(full["formatted_body"], "hi <b>a</b>");
+        assert_eq!(
+            full["m.relates_to"]["m.in_reply_to"]["event_id"],
+            "$parent:example.org"
+        );
+        let thread = serde_json::to_value(
+            message_content(&json!({"body": "t", "thread_root": "$root:example.org"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(thread["m.relates_to"]["rel_type"], "m.thread");
+        assert_eq!(thread["m.relates_to"]["event_id"], "$root:example.org");
+    }
+
+    #[test]
+    fn message_content_refuses_what_it_cannot_send() {
+        assert!(message_content(&json!({})).is_err());
+        assert!(message_content(&json!({"body": "x", "msgtype": "m.image"})).is_err());
+        assert!(message_content(&json!({"body": "x", "mentions": "@a:e"})).is_err());
     }
 
     #[test]

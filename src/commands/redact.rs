@@ -2,25 +2,68 @@
 //! power levels.
 
 use anyhow::{Context, Result, bail};
+use matrix_sdk::Client;
 use matrix_sdk::ruma::UserId;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::RedactArgs;
-use crate::commands::{event_sender, fetch_event, parse_event_id, resolve_room, sync_once};
+use crate::commands::send::{request_opt, request_str};
+use crate::commands::{
+    event_sender, fetch_event, parse_event_id, resolve_room, sync_once, via_daemon,
+};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
 use crate::text::{json_line, term};
 
 pub async fn run(args: RedactArgs) -> Result<()> {
-    let config = load_config()?;
     let paths = Paths::from_env()?;
-    let _lock = paths.lock().await?;
-    // A redaction is never encrypted: no room key is shared.
-    let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
-    let client = restored.client;
-    sync_once(&client).await?;
-    let room = resolve_room(&client, &args.room).await?;
-    let event_id = parse_event_id(&args.event_id)?;
+    // The request the watch daemon takes (matrix-watchd.py's "redact").
+    let request = json!({
+        "op": "redact",
+        "room": args.room,
+        "event_id": args.event_id,
+        "reason": args.reason,
+    });
+    let outcome = match via_daemon::<RedactOutcome>(&paths, request.clone(), "redaction").await? {
+        Some(outcome) => outcome,
+        None => {
+            let config = load_config()?;
+            let _lock = paths.lock().await?;
+            // A redaction is never encrypted: no room key is shared.
+            let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
+            sync_once(&restored.client).await?;
+            execute(&restored.client, &request).await?
+        }
+    };
+    if args.json {
+        println!(
+            "{}",
+            json_line(&json!({
+                "event_id": outcome.event_id,
+                "redacts": outcome.redacts,
+                "room_id": outcome.room_id,
+            }))?
+        );
+    } else {
+        println!("{}", term(&outcome.event_id));
+    }
+    Ok(())
+}
+
+/// What a redaction is reported as, on the direct path and in the daemon's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactOutcome {
+    pub event_id: String,
+    pub redacts: String,
+    pub room_id: String,
+}
+
+/// Carry out a "redact" request with `client`, after checking the room's
+/// power levels.
+pub async fn execute(client: &Client, request: &Value) -> Result<RedactOutcome> {
+    let room = resolve_room(client, request_str(request, "room")?).await?;
+    let event_id = parse_event_id(request_str(request, "event_id")?)?;
     let own = client
         .user_id()
         .context("the client has no user id")?
@@ -45,23 +88,14 @@ pub async fn run(args: RedactArgs) -> Result<()> {
     )?;
 
     let response = room
-        .redact(&event_id, args.reason.as_deref(), None)
+        .redact(&event_id, request_opt(request, "reason"), None)
         .await
         .context("redaction failed")?;
-
-    if args.json {
-        println!(
-            "{}",
-            json_line(&json!({
-                "event_id": response.event_id,
-                "redacts": event_id,
-                "room_id": room.room_id(),
-            }))?
-        );
-    } else {
-        println!("{}", term(response.event_id.as_str()));
-    }
-    Ok(())
+    Ok(RedactOutcome {
+        event_id: response.event_id.to_string(),
+        redacts: event_id.to_string(),
+        room_id: room.room_id().to_string(),
+    })
 }
 
 /// Whether `own` may redact an event of `sender`, given what the power

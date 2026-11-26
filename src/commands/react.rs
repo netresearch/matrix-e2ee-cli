@@ -14,16 +14,17 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
-use matrix_sdk::Room;
 use matrix_sdk::room::{IncludeRelations, RelationsOptions};
 use matrix_sdk::ruma::events::reaction::ReactionEventContent;
 use matrix_sdk::ruma::events::relation::{Annotation, RelationType};
 use matrix_sdk::ruma::{EventId, OwnedEventId, UInt};
-use serde::Serialize;
+use matrix_sdk::{Client, Room};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::ReactArgs;
-use crate::commands::{fetch_event, parse_event_id, resolve_room, sync_once};
+use crate::commands::send::request_str;
+use crate::commands::{fetch_event, parse_event_id, resolve_room, sync_once, via_daemon};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
 use crate::text::{json_line, term};
@@ -32,7 +33,7 @@ use crate::text::{json_line, term};
 const MAX_PAGES: usize = 50;
 
 /// One live reaction of the user.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnReaction {
     pub key: String,
     pub event_id: String,
@@ -99,25 +100,141 @@ pub fn check_key(key: &str) -> Result<()> {
 }
 
 pub async fn run(args: ReactArgs) -> Result<()> {
-    let config = load_config()?;
     let paths = Paths::from_env()?;
-    let _lock = paths.lock().await?;
-    // Reactions are sent unencrypted (see the module comment): no room key.
-    let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
-    let client = restored.client;
-    sync_once(&client).await?;
-    let room = resolve_room(&client, &args.room).await?;
-    let event_id = parse_event_id(&args.event_id)?;
+    let request = request_for(&args)?;
+    let outcome = match via_daemon::<ReactOutcome>(&paths, request.clone(), "reaction").await? {
+        Some(outcome) => outcome,
+        None => {
+            let config = load_config()?;
+            let _lock = paths.lock().await?;
+            // Reactions are sent unencrypted (see the module comment): no room key.
+            let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
+            sync_once(&restored.client).await?;
+            execute(&restored.client, &request).await?
+        }
+    };
+    let skipped = outcome.skipped_unconfirmed;
+    if skipped > 0 {
+        eprintln!("{}", skipped_note(skipped));
+    }
+
+    if args.list {
+        let found = outcome.reactions.unwrap_or_default();
+        if args.json {
+            println!(
+                "{}",
+                json_line(&json!({
+                    "reactions": found,
+                    "skipped_unconfirmed": skipped,
+                }))?
+            );
+        } else {
+            for reaction in &found {
+                println!("{}\t{}", term(&reaction.key), term(&reaction.event_id));
+            }
+        }
+        return Ok(());
+    }
+    let key = outcome.key.unwrap_or_default();
+    if args.json {
+        println!(
+            "{}",
+            json_line(&json!({
+                "event_id": outcome.event_id,
+                "key": key,
+                "removed": outcome.removed,
+                "skipped_unconfirmed": skipped,
+            }))?
+        );
+    } else {
+        if let Some(id) = &outcome.event_id {
+            println!("{}", term(id));
+        }
+        for done in &outcome.removed {
+            println!("removed\t{}\t{}", term(&done.key), term(&done.event_id));
+        }
+        if args.remove && outcome.removed.is_empty() {
+            let event_id = parse_event_id(&args.event_id)?;
+            eprintln!("no {} reaction of yours on {event_id}", term(&key));
+        }
+    }
+    Ok(())
+}
+
+/// The request for the watch daemon. Without `--list`, `--remove` and
+/// `--replace` it is matrix-watchd.py's "react" (`room`, `event_id`,
+/// `key`); those three options travel as the extra fields `list`,
+/// `remove` and `replace`, which only this tool's daemon reads. The
+/// keys are checked as [`parse_mode`] checks them before anything is sent.
+pub fn request_for(args: &ReactArgs) -> Result<Value> {
+    let mut request = json!({"op": "react", "room": args.room, "event_id": args.event_id});
+    if args.list {
+        request["list"] = json!(true);
+        return Ok(request);
+    }
+    let (key, _) = parse_mode(args.key.clone(), args.remove, args.replace.clone())?;
+    request["key"] = json!(key);
+    if args.remove {
+        request["remove"] = json!(true);
+    } else if let Some(old) = &args.replace {
+        request["replace"] = json!(old);
+    }
+    Ok(request)
+}
+
+/// KEY and the mode a "react" request asks for, checked by [`parse_mode`].
+fn mode_of(request: &Value) -> Result<(String, Mode)> {
+    let key = request_str(request, "key")?.to_owned();
+    let remove = request.get("remove").and_then(Value::as_bool) == Some(true);
+    let replace = match request.get("replace").filter(|v| !v.is_null()) {
+        None => None,
+        Some(old) => Some(
+            old.as_array()
+                .context("replace must be a list of reaction keys")?
+                .iter()
+                .map(|k| {
+                    k.as_str()
+                        .map(str::to_owned)
+                        .context("replace must be a list of reaction keys")
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    };
+    parse_mode(Some(key), remove, replace)
+}
+
+/// What a reaction request is reported as, on the direct path and in the
+/// daemon's answer: `reactions` for a list, the rest otherwise.
+/// `skipped_unconfirmed` counts the annotations of the user this device
+/// cannot decrypt (listed: all of them; otherwise those with a key to drop).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactOutcome {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactions: Option<Vec<OwnReaction>>,
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub removed: Vec<OwnReaction>,
+    #[serde(default)]
+    pub skipped_unconfirmed: usize,
+}
+
+/// Carry out a "react" request with `client`.
+pub async fn execute(client: &Client, request: &Value) -> Result<ReactOutcome> {
+    let room = resolve_room(client, request_str(request, "room")?).await?;
+    let event_id = parse_event_id(request_str(request, "event_id")?)?;
     let own = client
         .user_id()
         .context("the client has no user id")?
         .to_owned();
 
-    if args.list {
-        return list(&room, &event_id, own.as_str(), args.json).await;
+    if request.get("list").and_then(Value::as_bool) == Some(true) {
+        return list(&room, &event_id, own.as_str()).await;
     }
 
-    let (key, mode) = parse_mode(args.key, args.remove, args.replace)?;
+    let (key, mode) = mode_of(request)?;
     let plan = Plan::new(&key, &mode);
     if plan.add {
         let (_, target) = fetch_event(&room, &event_id).await?;
@@ -143,55 +260,25 @@ pub async fn run(args: ReactArgs) -> Result<()> {
         &plan.drop,
     )
     .await?;
-    let skipped = lookup.unconfirmed_among(&plan.drop);
-    if skipped > 0 {
-        eprintln!("{}", skipped_note(skipped));
-    }
-
-    if args.json {
-        println!(
-            "{}",
-            json_line(&json!({
-                "event_id": reaction_id,
-                "key": key,
-                "removed": removed,
-                "skipped_unconfirmed": skipped,
-            }))?
-        );
-    } else {
-        if let Some(id) = &reaction_id {
-            println!("{}", term(id));
-        }
-        for done in &removed {
-            println!("removed\t{}\t{}", term(&done.key), term(&done.event_id));
-        }
-        if mode == Mode::Remove && removed.is_empty() {
-            eprintln!("no {} reaction of yours on {event_id}", term(&key));
-        }
-    }
-    Ok(())
+    Ok(ReactOutcome {
+        reactions: None,
+        event_id: reaction_id,
+        key: Some(key),
+        removed,
+        skipped_unconfirmed: lookup.unconfirmed_among(&plan.drop),
+    })
 }
 
 /// `--list`: the user's own confirmed reactions on the event.
-async fn list(room: &Room, event_id: &EventId, own: &str, json: bool) -> Result<()> {
+async fn list(room: &Room, event_id: &EventId, own: &str) -> Result<ReactOutcome> {
     let lookup = own_reactions(&annotations(room, event_id).await?, own, None);
-    if !lookup.unconfirmed.is_empty() {
-        eprintln!("{}", skipped_note(lookup.unconfirmed.len()));
-    }
-    if json {
-        println!(
-            "{}",
-            json_line(&json!({
-                "reactions": lookup.found,
-                "skipped_unconfirmed": lookup.unconfirmed.len(),
-            }))?
-        );
-    } else {
-        for reaction in &lookup.found {
-            println!("{}\t{}", term(&reaction.key), term(&reaction.event_id));
-        }
-    }
-    Ok(())
+    Ok(ReactOutcome {
+        reactions: Some(lookup.found),
+        event_id: None,
+        key: None,
+        removed: Vec::new(),
+        skipped_unconfirmed: lookup.unconfirmed.len(),
+    })
 }
 
 /// KEY and the mode from the arguments. Only a key this command sends (a
@@ -253,8 +340,9 @@ async fn set_key(
     Ok(sent.response.event_id.to_string())
 }
 
-/// Redact the found reactions whose key is in `drop`. On a failure, say
-/// on stderr what already happened (`reaction_id`: KEY was set) first.
+/// Redact the found reactions whose key is in `drop`. A failure says in
+/// the error what already happened (`reaction_id`: KEY was set), since the
+/// daemon's stderr is not the caller's.
 async fn remove_reactions(
     room: &Room,
     key: &str,
@@ -268,14 +356,25 @@ async fn remove_reactions(
             .with_context(|| format!("invalid reaction event id {:?}", reaction.event_id))?;
         if let Err(err) = room.redact(&target, None, None).await {
             // Say what already happened before the error.
+            let mut done: Vec<String> = Vec::new();
             if let Some(id) = reaction_id {
-                eprintln!("set: {} ({})", term(key), term(id));
+                done.push(format!("set {key} ({id})"));
             }
-            for done in &removed {
-                eprintln!("removed: {} ({})", term(&done.key), term(&done.event_id));
-            }
+            done.extend(
+                removed
+                    .iter()
+                    .map(|r| format!("removed {} ({})", r.key, r.event_id)),
+            );
+            let done = if done.is_empty() {
+                String::new()
+            } else {
+                format!(" (already done: {})", done.join(", "))
+            };
             return Err(anyhow::Error::new(err)).with_context(|| {
-                format!("could not remove {} ({})", reaction.key, reaction.event_id)
+                format!(
+                    "could not remove {} ({}){done}",
+                    reaction.key, reaction.event_id
+                )
             });
         }
         removed.push(reaction.clone());
@@ -495,6 +594,38 @@ mod tests {
         );
         assert_eq!(swap.lookup("✅"), keys(&["▶️", "✅", "🩹"]));
         assert_eq!(Plan::new("✅", &Mode::Remove).lookup("✅"), keys(&["✅"]));
+    }
+
+    #[test]
+    fn the_daemon_request_checks_keys_as_parse_mode_does() {
+        let args = |key: &str, remove: bool, replace: Option<Vec<String>>| ReactArgs {
+            room: "!r:e".into(),
+            event_id: "$e".into(),
+            key: Some(key.into()),
+            remove,
+            replace,
+            list: false,
+            json: false,
+        };
+        // --remove and the OLD keys of --replace name existing reactions.
+        let request = request_for(&args("a\nb", true, None)).unwrap();
+        assert_eq!(
+            mode_of(&request).unwrap(),
+            ("a\nb".to_owned(), Mode::Remove)
+        );
+        let request = request_for(&args("✅", false, Some(vec!["a\nb".into()]))).unwrap();
+        assert_eq!(
+            mode_of(&request).unwrap(),
+            ("✅".to_owned(), Mode::Replace(vec!["a\nb".into()]))
+        );
+        // A KEY that is sent is checked on both sides of the socket.
+        assert!(request_for(&args("a\nb", false, None)).is_err());
+        assert!(mode_of(&json!({"key": "a\nb"})).is_err());
+        assert!(mode_of(&json!({"key": "a\nb", "replace": ["✅"]})).is_err());
+        assert_eq!(
+            mode_of(&json!({"key": "✅"})).unwrap(),
+            ("✅".to_owned(), Mode::Add)
+        );
     }
 
     #[test]
