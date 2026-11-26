@@ -169,9 +169,11 @@ pub struct NioStore {
     device_files: Vec<String>,
 }
 
-/// A shared flock on `<store>/.daemon.lock`, held from before the store is read
+/// An exclusive flock on `<store>/.daemon.lock`, held from before the store is read
 /// until the migration is over (after the online check, if any), so the
 /// matrix-skill cannot take the store (and move its Olm state on) in between.
+/// Exclusive, not shared: a second migrate-nio with another data directory
+/// must not copy the same device at the same time either.
 /// A missing lock file is created the way the skill's `store_lock()` creates
 /// it (`open(path, "a+")`: create, never truncate), mode 0600, so that the
 /// lock is held in every case.
@@ -200,14 +202,14 @@ fn check_daemon_lock(store: &Path) -> Result<DaemonLockCheck> {
         .with_context(|| format!("cannot open or create {}", path.display()))?;
     // SAFETY: flock takes a valid descriptor and constant flags; failure is
     // reported through the return value.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
             let mut holder = String::new();
             let _ = (&file).take(32).read_to_string(&mut holder);
             let holder = holder.trim();
             bail!(
-                "the matrix-skill E2EE store {} is in use by pid {} (normally matrix-watchd); stop it with `matrix-watchd.py --stop` and run migrate-nio again",
+                "the matrix-skill E2EE store {} is in use by pid {} (normally matrix-watchd, or another migrate-nio); stop it with `matrix-watchd.py --stop` and run migrate-nio again",
                 store.display(),
                 if holder.is_empty() {
                     "unknown".into()
@@ -1673,6 +1675,21 @@ mod tests {
             "the matrix-skill could take the store between read and write"
         );
         assert!(exclusive_possible(), "the lock outlived the migration");
+    }
+
+    #[test]
+    fn a_second_migration_of_the_same_store_is_refused() {
+        // Two runs with different data directories share no data-dir lock;
+        // only the lock on the source store keeps them from copying the
+        // same device at once.
+        let setup = setup();
+        let first = check_daemon_lock(&setup.opts.nio_store).unwrap();
+        let err = check_daemon_lock(&setup.opts.nio_store)
+            .err()
+            .expect("a second lock on the source store was granted");
+        assert!(err.to_string().contains("is in use"), "{err}");
+        drop(first);
+        check_daemon_lock(&setup.opts.nio_store).unwrap();
     }
 
     #[tokio::test]
