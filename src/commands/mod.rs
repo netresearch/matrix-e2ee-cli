@@ -1,13 +1,17 @@
 //! The subcommands and the helpers they share.
 
 pub mod backup;
+pub mod download;
+pub mod edit;
 pub mod login;
 pub mod logout;
 // Unix only: the matrix-skill's nio store and its flock exist on Linux and
 // macOS, and the command uses flock and O_NOFOLLOW.
 #[cfg(unix)]
 pub mod migrate_nio;
+pub mod react;
 pub mod read;
+pub mod redact;
 pub mod send;
 pub mod status;
 pub mod verify;
@@ -17,7 +21,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use matrix_sdk::config::SyncSettings;
-use matrix_sdk::ruma::OwnedRoomAliasId;
+use matrix_sdk::deserialized_responses::TimelineEvent;
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomAliasId};
 use matrix_sdk::{Client, Room};
 
 use crate::room_arg::{RoomArg, classify, match_name};
@@ -32,6 +37,44 @@ pub async fn sync_once(client: &Client) -> Result<()> {
         .await
         .context("sync failed")?;
     Ok(())
+}
+
+/// Parse the EVENT_ID argument (`$...`).
+pub fn parse_event_id(arg: &str) -> Result<OwnedEventId> {
+    EventId::parse(arg.trim()).with_context(|| format!("invalid event id {arg:?}"))
+}
+
+/// Fetch one event of `room` from the server (decrypted where this device
+/// can) and return it with its JSON. For a decrypted event the JSON is the
+/// decrypted event; for one this device cannot decrypt it is the
+/// `m.room.encrypted` event as the server holds it.
+pub async fn fetch_event(
+    room: &Room,
+    event_id: &EventId,
+) -> Result<(TimelineEvent, serde_json::Value)> {
+    let event = room
+        .event(event_id, None)
+        .await
+        .with_context(|| format!("cannot fetch event {event_id}"))?;
+    let json = serde_json::from_str(event.raw().json().get())
+        .with_context(|| format!("event {event_id} is not valid JSON"))?;
+    Ok((event, json))
+}
+
+/// Whether the server says the event was redacted (`unsigned.redacted_because`).
+pub fn is_redacted(event: &serde_json::Value) -> bool {
+    event
+        .get("unsigned")
+        .and_then(|u| u.get("redacted_because"))
+        .is_some()
+}
+
+/// The `sender` of an event's JSON.
+pub fn event_sender(event: &serde_json::Value) -> Result<&str> {
+    event
+        .get("sender")
+        .and_then(serde_json::Value::as_str)
+        .context("the event has no sender")
 }
 
 /// Find a joined room by id, alias or name. An argument that parses as a
@@ -209,6 +252,15 @@ pub fn discard_typeahead(fd: std::os::fd::RawFd) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn redacted_events_are_recognised() {
+        let redacted = serde_json::json!({"type": "m.room.encrypted", "content": {},
+            "unsigned": {"redacted_because": {"type": "m.room.redaction"}}});
+        assert!(is_redacted(&redacted));
+        let live = serde_json::json!({"type": "m.room.message", "unsigned": {"age": 5}});
+        assert!(!is_redacted(&live));
+    }
 
     #[test]
     fn fresh_confirmation_refuses_without_a_terminal() {
