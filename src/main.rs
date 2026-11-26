@@ -217,7 +217,8 @@ pub struct WatchDaemonArgs {
 pub struct WatchArgs {
     /// Room id (!x:server), or the alias or room id as written in "watch_rooms".
     pub room: String,
-    /// Name this reader's position, so several sessions can follow one room.
+    /// Name this reader's position, so several sessions can follow one room
+    /// (at most 64 bytes).
     #[arg(long, default_value = "default", value_name = "NAME")]
     pub cursor: String,
     /// Skip the "since last" line.

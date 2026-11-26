@@ -35,7 +35,8 @@ pub enum Reply {
 ///
 /// Differs from daemon_client.py: once the whole request line is written,
 /// every outcome other than an answer is an error, not "no daemon": a
-/// timeout, the connection closed or reset, an empty or unreadable answer.
+/// timeout, the connection closed or reset, an empty or unreadable answer,
+/// an answer that ends before its newline.
 /// The daemon may have carried out the request (or may still), so falling
 /// back to the direct path could send the message twice.
 #[cfg(unix)]
@@ -95,11 +96,19 @@ pub fn request(socket: &Path, payload: &Value, timeout: Duration) -> Result<Repl
             Err(e) => anyhow::bail!("{CLOSED_WITHOUT_ANSWER} ({e})"),
         }
     }
-    if let Some(end) = answer.iter().position(|b| *b == b'\n') {
+    let end = answer.iter().position(|b| *b == b'\n');
+    if let Some(end) = end {
         answer.truncate(end + 1);
     }
     if answer.iter().all(u8::is_ascii_whitespace) {
         anyhow::bail!("{CLOSED_WITHOUT_ANSWER}");
+    }
+    // The connection ended inside the answer line: what arrived may be a
+    // part that happens to parse.
+    if end.is_none() {
+        anyhow::bail!(
+            "the watch daemon's answer ended before its newline; the request may have been carried out, so it is not retried directly"
+        );
     }
     match serde_json::from_slice::<Value>(&answer) {
         Ok(value) if value.is_object() => Ok(Reply::Answer(value)),
@@ -316,6 +325,20 @@ mod tests {
                     "{raw:?}: {err}"
                 );
             }
+        }
+
+        #[test]
+        fn an_answer_without_its_newline_is_an_error_not_a_fallback() {
+            let fake =
+                FakeDaemon::start_raw(Some(br#"{"ok":true,"event_id":"$x"}"#.to_vec()), false);
+            let err = request(&fake.path, &json!({"op": "send"}), REQUEST_TIMEOUT)
+                .expect_err("an answer cut before its newline was accepted");
+            assert!(
+                err.to_string().contains("ended before its newline")
+                    && err.to_string().contains("may have been carried out"),
+                "{err}"
+            );
+            assert_eq!(fake.received()["op"], "send");
         }
 
         #[test]

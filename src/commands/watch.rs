@@ -32,8 +32,8 @@ use crate::WatchArgs;
 use crate::daemon_client::{REQUEST_TIMEOUT, Reply, request};
 use crate::room_arg::{RoomArg, classify};
 use crate::roomlog::{
-    cursor_path, log_path, parse_line, read_cursor, read_records, read_room_index, rotated, seq_of,
-    summarize_since, write_cursor,
+    cursor_path, log_path, parse_line, read_cursor, read_room_index, rotated, seq_of,
+    summarize_since, try_read_records, write_cursor,
 };
 use crate::session::Paths;
 use crate::text::term;
@@ -51,13 +51,15 @@ pub async fn run(args: WatchArgs) -> Result<()> {
     #[cfg(unix)]
     {
         let paths = Paths::from_env()?;
-        tokio::task::spawn_blocking(move || follow_room(&paths, &args))
-            .await
-            .context("the reader task failed")?
+        tokio::task::spawn_blocking(move || {
+            follow_room(&paths, &args, &mut std::io::stdout().lock())
+        })
+        .await
+        .context("the reader task failed")?
     }
 }
 
-fn follow_room(paths: &Paths, args: &WatchArgs) -> Result<()> {
+fn follow_room(paths: &Paths, args: &WatchArgs, out: &mut dyn Write) -> Result<()> {
     let rooms_dir = paths.rooms_dir();
     let room_id = resolve_watched_room(&rooms_dir, &args.room);
     let status = || match request(
@@ -85,27 +87,30 @@ fn follow_room(paths: &Paths, args: &WatchArgs) -> Result<()> {
     let log = log_path(&rooms_dir, &room_id)?;
     let cursor = cursor_path(&rooms_dir, &room_id, &args.cursor)?;
 
-    if !log.exists() && without_log(status().as_ref(), &room_id, args.once)? == NoLog::Finish {
+    // A daemon stopped between rotating the log and creating its successor
+    // leaves only the retained generation, whose records are still unread.
+    if !log.exists()
+        && !rotated(&log).exists()
+        && without_log(status().as_ref(), &room_id, args.once)? == NoLog::Finish
+    {
         return Ok(());
     }
 
     let seen = read_cursor(&cursor);
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
     if !args.no_summary
         && let Some(line) = summary_line(&log, seen)
     {
         writeln!(out, "{line}")?;
     }
     let mut follower = Follower::new(log, cursor, seen);
-    follower.poll(&mut out)?;
+    follower.poll(out)?;
     out.flush()?;
     if args.once {
         return Ok(());
     }
     loop {
         std::thread::sleep(POLL);
-        follower.poll(&mut out)?;
+        follower.poll(out)?;
         out.flush()?;
     }
 }
@@ -226,8 +231,14 @@ impl Follower {
         // it is read, and the handle then has nothing newer than the cursor.
         let opened = self.file.is_some() || self.open()?;
         if !self.retained_read {
+            // An unreadable retained generation fails the poll before any
+            // record is printed or the cursor moves: the active log's records
+            // would move the cursor past the retained ones.
+            let retained = rotated(&self.log);
+            let records = try_read_records(&retained)
+                .with_context(|| format!("cannot read {}", retained.display()))?;
             self.retained_read = true;
-            for record in read_records(&rotated(&self.log)) {
+            for record in records {
                 self.emit(out, &record)?;
             }
         }
@@ -520,6 +531,71 @@ mod tests {
     }
 
     #[test]
+    fn a_room_with_only_the_retained_generation_is_read() {
+        let data = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            data_dir: data.path().to_owned(),
+        };
+        let rooms = paths.rooms_dir();
+        let log = log_path(&rooms, "!r:example.org").unwrap();
+        append(&log, 1, "eins", DEFAULT_MAX_BYTES);
+        append(&log, 2, "zwei", DEFAULT_MAX_BYTES);
+        // A daemon stopped between rotating the log and the next append.
+        fs::rename(&log, rotated(&log)).unwrap();
+        let args = WatchArgs {
+            room: "!r:example.org".into(),
+            cursor: "default".into(),
+            no_summary: true,
+            once: true,
+        };
+        let mut out = Vec::new();
+        // No daemon answers on the socket in the temporary data directory.
+        let result = follow_room(&paths, &args, &mut out);
+        assert!(
+            result.is_ok(),
+            "the retained generation was not read: {result:?}"
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.lines().count(), 2, "{out}");
+        let cursor = cursor_path(&rooms, "!r:example.org", "default").unwrap();
+        assert_eq!(read_cursor(&cursor), 2);
+    }
+
+    #[test]
+    fn an_unreadable_retained_generation_fails_before_the_cursor_moves() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads a file of mode 000");
+            return;
+        }
+        let s = setup();
+        for seq in 1..=11 {
+            append(&s.log, seq, &format!("nachricht {seq}"), DEFAULT_MAX_BYTES);
+        }
+        // Rotates: 1 to 11 move to .1, 12 starts the active log.
+        append(&s.log, 12, "nachricht 12", 1);
+        write_cursor(&s.cursor, 10).unwrap();
+        let retained = rotated(&s.log);
+        fs::set_permissions(&retained, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut f = Follower::new(s.log.clone(), s.cursor.clone(), 10);
+        let mut out = Vec::new();
+        let result = f.poll(&mut out);
+        fs::set_permissions(&retained, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = result.expect_err("an unreadable retained generation read as empty");
+        assert!(err.to_string().contains("cannot read"), "{err:#}");
+        assert!(out.is_empty(), "printed before the failure: {out:?}");
+        assert_eq!(
+            read_cursor(&s.cursor),
+            10,
+            "the cursor moved past record 11"
+        );
+        // Readable again: the next poll prints what the failed one held back.
+        assert_eq!(printed(&mut f), vec!["nachricht 11", "nachricht 12"]);
+        assert_eq!(read_cursor(&s.cursor), 12);
+    }
+
+    #[test]
     fn a_gap_record_is_printed_as_one_line() {
         let s = setup();
         append(&s.log, 1, "eins", DEFAULT_MAX_BYTES);
@@ -530,6 +606,7 @@ mod tests {
                 after: Some(("$e1".into(), 1_786_568_100_000)),
                 before: None,
                 noticed: 1_786_568_100_000,
+                cause: crate::roomlog::GapCause::Server,
             },
         );
         append_record(&s.log, &gap, DEFAULT_MAX_BYTES).unwrap();

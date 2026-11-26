@@ -4,13 +4,15 @@
 //! readers cannot follow a log this tool writes.
 //!
 //! - Every file of a room is named after its stem, the readable slug of the
-//!   room id, `-` and the first 12 hex digits of the SHA-256 of the exact
-//!   room id (`a_b_example.org-0123456789ab`): `<stem>.jsonl`, its rotated
+//!   room id (at most [`SLUG_LIMIT`] bytes of it), `-` and the first 12 hex
+//!   digits of the SHA-256 of the exact room id
+//!   (`a_b_example.org-0123456789ab`): `<stem>.jsonl`, its rotated
 //!   generation `<stem>.jsonl.1`, the reader cursors
 //!   `<stem>.<name>.cursor` and the room page `<stem>.md`. The slug alone
 //!   is not unique (`!a+b:…` and `!a_b:…` share it).
 //! - Besides the event records, a log holds `gap` records: events the
-//!   server left out of a sync that could not be fetched afterwards.
+//!   server left out of a sync that could not be fetched afterwards
+//!   (`cause` `server`), or events whose append failed (`write_failed`).
 //! - `index.json` beside `index.md` lists the rooms the daemon watches now;
 //!   only it resolves an alias. Pages of rooms no longer watched stay.
 //!
@@ -70,14 +72,30 @@ pub fn room_slug(room_id: &str) -> String {
     safe_name(room_id.trim_start_matches('!'))
 }
 
-/// The name every file of a room starts with: the slug, `-` and the first
-/// 12 hex digits of the SHA-256 of the exact room id, so two rooms whose
-/// slugs agree still get files of their own.
+/// The most bytes of the slug a file name carries. A room id may be 255
+/// bytes long; with this bound the longest name, a cursor file
+/// (`<stem>.<reader>.cursor`, [`READER_NAME_LIMIT`]), stays within the
+/// 255 bytes most file systems allow.
+pub const SLUG_LIMIT: usize = 160;
+
+/// The longest reader name [`cursor_path`] takes, in bytes.
+pub const READER_NAME_LIMIT: usize = 64;
+
+/// The name every file of a room starts with: the slug cut to
+/// [`SLUG_LIMIT`] bytes, `-` and the first 12 hex digits of the SHA-256 of
+/// the exact room id, so two rooms whose slugs agree (or agree up to the
+/// cut) still get files of their own.
 pub fn room_file_stem(room_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(room_id.as_bytes());
     let hash: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
-    format!("{}-{hash}", room_slug(room_id))
+    let mut slug = room_slug(room_id);
+    let mut cut = slug.len().min(SLUG_LIMIT);
+    while !slug.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    slug.truncate(cut);
+    format!("{slug}-{hash}")
 }
 
 fn safe_name(s: &str) -> String {
@@ -316,8 +334,7 @@ fn render_text(record: &Record, subject: Option<&str>, hh_mm: &dyn Fn(i64) -> St
     }
 }
 
-/// Events missing from a log: the server left them out of a sync (a
-/// limited timeline) and they could not be fetched afterwards. `after` is
+/// Events missing from a log, for the reason in `cause`. `after` is
 /// the last event logged before them, `before` the first logged after
 /// them, each as (event id, ms since the epoch) when known.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -327,6 +344,28 @@ pub struct Gap {
     pub before: Option<(String, i64)>,
     /// When the gap was noticed, ms since the epoch.
     pub noticed: i64,
+    pub cause: GapCause,
+}
+
+/// Why a [`Gap`]'s events are missing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GapCause {
+    /// The server left them out of a sync (a limited timeline) and they
+    /// could not be fetched afterwards.
+    #[default]
+    Server,
+    /// Their append to the log failed (for example a full volume).
+    WriteFailed,
+}
+
+impl GapCause {
+    /// The value of a gap record's `cause` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::WriteFailed => "write_failed",
+        }
+    }
 }
 
 /// The record of a [`Gap`]. It has no `event_id` (it is no event) and its
@@ -343,6 +382,7 @@ pub struct GapRecord {
     pub after_ts: Option<i64>,
     pub before_event_id: Option<String>,
     pub before_ts: Option<i64>,
+    pub cause: &'static str,
     pub text: String,
 }
 
@@ -374,9 +414,14 @@ pub fn build_gap_record_with(seq: i64, gap: &Gap, hh_mm: &dyn Fn(i64) -> String)
         after_ts: gap.after.as_ref().map(|(_, ts)| *ts),
         before_event_id: gap.before.as_ref().map(|(id, _)| id.clone()),
         before_ts: gap.before.as_ref().map(|(_, ts)| *ts),
+        cause: gap.cause.as_str(),
         text: format!(
-            "[{}] --- gap: {span} are missing from this log; the server left them out and they could not be fetched ---",
-            hh_mm(ts)
+            "[{}] --- gap: {span} are missing from this log; {} ---",
+            hh_mm(ts),
+            match gap.cause {
+                GapCause::Server => "the server left them out and they could not be fetched",
+                GapCause::WriteFailed => "writing them to the log failed",
+            }
         ),
     }
 }
@@ -483,14 +528,22 @@ pub fn parse_line(line: &[u8]) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-/// Records oldest first; damaged lines (a daemon killed mid-write) are skipped.
+/// Records oldest first; damaged lines (a daemon killed mid-write) are
+/// skipped. A file that cannot be read reads as empty.
 pub fn read_records(path: &Path) -> Vec<Value> {
+    try_read_records(path).unwrap_or_default()
+}
+
+/// [`read_records`], with every read error but a missing file (no records)
+/// returned.
+pub fn try_read_records(path: &Path) -> std::io::Result<Vec<Value>> {
     match fs::read(path) {
-        Ok(bytes) => bytes
+        Ok(bytes) => Ok(bytes
             .split(|b| *b == b'\n')
             .filter_map(parse_line)
-            .collect(),
-        Err(_) => Vec::new(),
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
     }
 }
 
@@ -607,8 +660,17 @@ fn ends_torn(file: &mut fs::File) -> std::io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-/// Where one reader's position in a room log is kept.
+/// Where one reader's position in a room log is kept. A reader name longer
+/// than [`READER_NAME_LIMIT`] bytes is refused, not cut: two names that
+/// agree up to the cut would share one cursor.
 pub fn cursor_path(rooms_dir: &Path, room_id: &str, name: &str) -> Result<PathBuf> {
+    if name.len() > READER_NAME_LIMIT {
+        anyhow::bail!(
+            "the reader name {:?} is {} bytes long; at most {READER_NAME_LIMIT} are allowed",
+            name,
+            name.len()
+        );
+    }
     fs::create_dir_all(rooms_dir)
         .with_context(|| format!("cannot create {}", rooms_dir.display()))?;
     Ok(rooms_dir.join(format!(
@@ -714,9 +776,17 @@ pub fn write_room_bundle_at(
     for (room_id, label) in sorted {
         let stem = room_file_stem(room_id);
         let description = format!("Matrix room {label}, watched by matrix-e2ee-cli watch-daemon.");
+        // Every frontmatter string as a JSON string, which is a YAML
+        // double-quoted scalar: a label like `#ops:…` would start a comment.
+        let quote = |s: &str| serde_json::to_string(s).context("cannot serialize the room page");
+        let resource = format!("matrix:roomid/{}", room_id.trim_start_matches('!'));
         let page = format!(
-            "---\ntype: matrix-room\ntitle: {label}\ndescription: {description}\nresource: matrix:roomid/{}\ntags: [matrix, room, watched]\ntimestamp: {stamp}\n---\n\n# {label}\n\nRoom ID `{room_id}`. Events are appended to `{stem}.jsonl`;\nfollow them with `matrix-e2ee-cli watch`.\n",
-            room_id.trim_start_matches('!')
+            "---\ntype: {}\ntitle: {}\ndescription: {}\nresource: {}\ntags: [matrix, room, watched]\ntimestamp: {}\n---\n\n# {label}\n\nRoom ID `{room_id}`. Events are appended to `{stem}.jsonl`;\nfollow them with `matrix-e2ee-cli watch`.\n",
+            quote("matrix-room")?,
+            quote(label)?,
+            quote(&description)?,
+            quote(&resource)?,
+            quote(stamp)?,
         );
         let path = directory.join(format!("{stem}.md"));
         fs::write(&path, page).with_context(|| format!("cannot write {}", path.display()))?;
@@ -811,11 +881,12 @@ pub fn read_room_pages(directory: &Path) -> Vec<(String, String)> {
             front
                 .lines()
                 .find_map(|l| l.strip_prefix(key))
-                .map(str::to_owned)
+                .and_then(|v| serde_json::from_str::<String>(v).ok())
         };
-        if let (Some(title), Some(resource)) = (field("title: "), field("resource: matrix:roomid/"))
+        if let (Some(title), Some(resource)) = (field("title: "), field("resource: "))
+            && let Some(id) = resource.strip_prefix("matrix:roomid/")
         {
-            rooms.push((format!("!{resource}"), title));
+            rooms.push((format!("!{id}"), title));
         }
     }
     rooms.sort();
@@ -1029,7 +1100,7 @@ mod tests {
         let read = |name: &str| fs::read_to_string(dir.path().join(name)).unwrap();
         assert_eq!(
             read("a_example.org-c372f7da2d38.md"),
-            "---\ntype: matrix-room\ntitle: #ops:example.org\ndescription: Matrix room #ops:example.org, watched by matrix-e2ee-cli watch-daemon.\nresource: matrix:roomid/a:example.org\ntags: [matrix, room, watched]\ntimestamp: STAMP\n---\n\n# #ops:example.org\n\nRoom ID `!a:example.org`. Events are appended to `a_example.org-c372f7da2d38.jsonl`;\nfollow them with `matrix-e2ee-cli watch`.\n"
+            "---\ntype: \"matrix-room\"\ntitle: \"#ops:example.org\"\ndescription: \"Matrix room #ops:example.org, watched by matrix-e2ee-cli watch-daemon.\"\nresource: \"matrix:roomid/a:example.org\"\ntags: [matrix, room, watched]\ntimestamp: \"STAMP\"\n---\n\n# #ops:example.org\n\nRoom ID `!a:example.org`. Events are appended to `a_example.org-c372f7da2d38.jsonl`;\nfollow them with `matrix-e2ee-cli watch`.\n"
         );
         assert_eq!(
             read("index.md"),
@@ -1514,7 +1585,7 @@ mod tests {
                 .join(format!("{}.md", room_file_stem("!a:example.org"))),
         )
         .unwrap();
-        assert!(text.starts_with("---\n") && text.contains("type: matrix-room"));
+        assert!(text.starts_with("---\n") && text.contains("type: \"matrix-room\""));
         for field in ["title:", "description:", "resource:", "tags:", "timestamp:"] {
             assert!(text.contains(field), "{field}");
         }
@@ -1878,6 +1949,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn file_names_of_a_long_room_id_stay_within_255_bytes() {
+        let room = format!("!{}:example.org", "a".repeat(241));
+        assert_eq!(room.len(), 254);
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_path(dir.path(), &room).unwrap();
+        let reader = "r".repeat(READER_NAME_LIMIT);
+        let names = [
+            log.clone(),
+            rotated(&log),
+            dir.path().join(format!("{}.md", room_file_stem(&room))),
+            cursor_path(dir.path(), &room, &reader).unwrap(),
+        ];
+        for path in &names {
+            let name = path.file_name().unwrap().len();
+            assert!(name <= 255, "{name} bytes: {}", path.display());
+        }
+        // The files can be written.
+        append_record(&log, &serde_json::json!({"seq": 1}), DEFAULT_MAX_BYTES).unwrap();
+        write_cursor(&names[3], 1).unwrap();
+        write_room_bundle_at(
+            dir.path(),
+            &[(room.clone(), "#long:example.org".into())],
+            "STAMP",
+        )
+        .unwrap();
+        // Two rooms that agree in the slug's first SLUG_LIMIT bytes keep
+        // files of their own.
+        let other = format!("!{}b:example.org", "a".repeat(240));
+        assert_eq!(
+            room_slug(&room)[..SLUG_LIMIT],
+            room_slug(&other)[..SLUG_LIMIT]
+        );
+        assert_ne!(room_file_stem(&room), room_file_stem(&other));
+    }
+
+    #[test]
+    fn a_reader_name_over_the_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(cursor_path(dir.path(), "!r:example.org", &"r".repeat(READER_NAME_LIMIT)).is_ok());
+        let err = cursor_path(
+            dir.path(),
+            "!r:example.org",
+            &"r".repeat(READER_NAME_LIMIT + 1),
+        )
+        .expect_err("a 65-byte reader name was taken");
+        assert!(err.to_string().contains("at most 64"), "{err}");
+    }
+
+    #[test]
+    fn frontmatter_strings_are_quoted_yaml_scalars() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias = "#ops:example.org";
+        write_room_bundle_at(
+            dir.path(),
+            &[("!a:example.org".into(), alias.into())],
+            "STAMP",
+        )
+        .unwrap();
+        let page = fs::read_to_string(
+            dir.path()
+                .join(format!("{}.md", room_file_stem("!a:example.org"))),
+        )
+        .unwrap();
+        assert!(page.contains("\ntitle: \"#ops:example.org\"\n"), "{page}");
+        let quoted = page
+            .lines()
+            .find_map(|l| l.strip_prefix("title: "))
+            .unwrap();
+        assert_eq!(serde_json::from_str::<String>(quoted).unwrap(), alias);
+    }
+
     // --- gap records (4712777805) ----------------------------------------------
 
     fn gap(after: Option<(&str, i64)>, before: Option<(&str, i64)>) -> GapRecord {
@@ -1888,6 +2031,7 @@ mod tests {
                 after: after.map(|(id, ts)| (id.to_owned(), ts)),
                 before: before.map(|(id, ts)| (id.to_owned(), ts)),
                 noticed: 1_786_568_100_000,
+                cause: GapCause::Server,
             },
             &utc,
         )
@@ -1904,7 +2048,7 @@ mod tests {
             concat!(
                 r#"{"seq":7,"ts":1786568040000,"room_id":"!r:example.org","type":"gap","#,
                 r#""after_event_id":"$last","after_ts":1786560000000,"#,
-                r#""before_event_id":"$next","before_ts":1786568040000,"#,
+                r#""before_event_id":"$next","before_ts":1786568040000,"cause":"server","#,
                 r#""text":"[20:54] --- gap: events after 18:40 and before 20:54 are missing from this log; the server left them out and they could not be fetched ---"}"#
             )
         );
@@ -1922,6 +2066,22 @@ mod tests {
             gap(Some(("$l", 1_786_560_000_000)), None)
                 .text
                 .contains("events after 18:40 are")
+        );
+        let lost = build_gap_record_with(
+            8,
+            &Gap {
+                room_id: "!r:example.org".into(),
+                before: Some(("$next".into(), 1_786_568_040_000)),
+                noticed: 1_786_568_100_000,
+                cause: GapCause::WriteFailed,
+                ..Gap::default()
+            },
+            &utc,
+        );
+        assert_eq!(lost.cause, "write_failed");
+        assert_eq!(
+            lost.text,
+            "[20:54] --- gap: events before 20:54 are missing from this log; writing them to the log failed ---"
         );
     }
 

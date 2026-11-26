@@ -65,7 +65,7 @@ pub mod unix {
     use crate::config::{Config, config_path, load_config, load_watch_rooms};
     use crate::daemon_client::{REQUEST_TIMEOUT, Reply, request_async, running_daemon_pid};
     use crate::roomlog::{
-        DEFAULT_MAX_BYTES, Event, Gap, LoggedEvents, Own, SubjectIndex, append_record,
+        DEFAULT_MAX_BYTES, Event, Gap, GapCause, LoggedEvents, Own, SubjectIndex, append_record,
         build_gap_record, build_record, log_path, next_seq, write_room_bundle,
     };
     use crate::session::{
@@ -763,6 +763,9 @@ pub mod unix {
         next_seq: HashMap<String, i64>,
         subjects: HashMap<String, SubjectIndex>,
         logged: HashMap<String, LoggedEvents>,
+        /// Rooms where a record did not reach the log: their next record
+        /// gets a gap record before it.
+        lost: HashSet<String>,
     }
 
     /// What one write appends to a room's log.
@@ -811,13 +814,32 @@ pub mod unix {
         /// numbers, subjects and the logged event ids are read from the log
         /// once per room and then kept in memory: the daemon is the only
         /// writer. True when the record was appended.
+        ///
+        /// A record that was not appended is not retried here: the room is
+        /// flagged, and its next record gets a gap record before it, so a
+        /// reader sees that something is missing between the records.
         pub fn record_entry(&self, room_id: &str, entry: &Entry) -> bool {
             match self.try_record_entry(room_id, entry) {
                 Ok(()) => true,
                 Err(err) => {
                     eprintln!("cannot log an event of {room_id}: {err:#}");
+                    self.flag_loss(room_id, entry);
                     false
                 }
+            }
+        }
+
+        /// Flag the room of a record that did not reach the log. Not for a
+        /// correction (an event already logged, as undecryptable): the event
+        /// is in the log, and the retry round queues the correction again.
+        fn flag_loss(&self, room_id: &str, entry: &Entry) {
+            let Ok(mut state) = self.log.lock() else {
+                return;
+            };
+            let correction = matches!(entry, Entry::Event(event)
+                if state.logged.get(room_id).is_some_and(|l| l.contains(&event.event_id)));
+            if !correction {
+                state.lost.insert(room_id.to_owned());
             }
         }
 
@@ -827,10 +849,34 @@ pub mod unix {
                 .log
                 .lock()
                 .map_err(|_| anyhow::anyhow!("the log state is poisoned"))?;
-            let seq = *state
+            let mut seq = *state
                 .next_seq
                 .entry(room_id.to_owned())
                 .or_insert_with(|| next_seq(&path));
+            if state.lost.contains(room_id) {
+                // A record before this one did not reach the log. When this
+                // gap record cannot be appended either, the room stays
+                // flagged and this record is not appended: it would follow
+                // the loss without a gap.
+                let logged = state
+                    .logged
+                    .entry(room_id.to_owned())
+                    .or_insert_with(|| LoggedEvents::from_log(&path));
+                let gap = Gap {
+                    room_id: room_id.to_owned(),
+                    after: logged.last().cloned(),
+                    before: match entry {
+                        Entry::Event(event) => Some((event.event_id.clone(), event.ts)),
+                        Entry::Gap(_) => None,
+                    },
+                    cause: GapCause::WriteFailed,
+                    noticed: now_ms(),
+                };
+                append_record(&path, &build_gap_record(seq, &gap), DEFAULT_MAX_BYTES)?;
+                seq += 1;
+                state.next_seq.insert(room_id.to_owned(), seq);
+                state.lost.remove(room_id);
+            }
             let event = match entry {
                 Entry::Gap(gap) => {
                     append_record(&path, &build_gap_record(seq, gap), DEFAULT_MAX_BYTES)?;
@@ -1059,6 +1105,7 @@ pub mod unix {
                         after,
                         before: events.first().map(|e| (e.event_id.clone(), e.ts)),
                         noticed: now_ms(),
+                        cause: GapCause::Server,
                     };
                     batch.push((room_id.to_string(), Entry::Gap(gap)));
                 }
@@ -2575,6 +2622,7 @@ pub mod unix {
                 after: Some(("$e1".into(), 5)),
                 before: Some(("$e2".into(), 5)),
                 noticed: 9,
+                cause: GapCause::Server,
             };
             assert_eq!(
                 writer
@@ -2664,6 +2712,71 @@ pub mod unix {
                 vec![false]
             );
             writer.close().await;
+        }
+
+        /// Make the next append to the log at `path` fail (a directory takes
+        /// its place); the returned guard puts the log back.
+        fn break_log(path: &Path) -> impl FnOnce() {
+            let aside = path.with_extension("aside");
+            fs::rename(path, &aside).unwrap();
+            fs::create_dir(path).unwrap();
+            let path = path.to_owned();
+            move || {
+                fs::remove_dir(&path).unwrap();
+                fs::rename(&aside, &path).unwrap();
+            }
+        }
+
+        #[test]
+        fn a_failed_append_leaves_a_gap_before_the_next_record() {
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = Recorder::new(dir.path().to_path_buf(), "@me:e".into(), None, None);
+            let log = log_path(dir.path(), "!r:e").unwrap();
+            // The writer maps record_entry over a batch: these three calls
+            // are one batch whose middle append fails.
+            assert!(recorder.record_entry("!r:e", &text_event(1).into()));
+            let repair = break_log(&log);
+            assert!(!recorder.record_entry("!r:e", &text_event(2).into()));
+            repair();
+            assert!(recorder.record_entry("!r:e", &text_event(3).into()));
+            let records = crate::roomlog::read_records(&log);
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|r| (r["seq"].clone(), r["type"].clone(), r["event_id"].clone()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (json!(1), json!("m.text"), json!("$e1")),
+                    (json!(2), json!("gap"), json!(null)),
+                    (json!(3), json!("m.text"), json!("$e3")),
+                ],
+                "no gap record between the records around the lost one"
+            );
+            assert_eq!(records[1]["after_event_id"], "$e1");
+            assert_eq!(records[1]["before_event_id"], "$e3");
+            assert_eq!(records[1]["cause"], "write_failed");
+            // The loss is recorded once.
+            assert!(recorder.record_entry("!r:e", &text_event(4).into()));
+            assert_eq!(crate::roomlog::read_records(&log).len(), 4);
+        }
+
+        #[test]
+        fn a_failed_correction_leaves_no_gap() {
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = Recorder::new(dir.path().to_path_buf(), "@me:e".into(), None, None);
+            let log = log_path(dir.path(), "!r:e").unwrap();
+            assert!(recorder.record_entry("!r:e", &text_event(1).into()));
+            // The same event again: a correction, which the retry round queues
+            // again when it fails.
+            let repair = break_log(&log);
+            assert!(!recorder.record_entry("!r:e", &text_event(1).into()));
+            repair();
+            assert!(recorder.record_entry("!r:e", &text_event(2).into()));
+            let types: Vec<Value> = crate::roomlog::read_records(&log)
+                .iter()
+                .map(|r| r["type"].clone())
+                .collect();
+            assert_eq!(types, vec![json!("m.text"), json!("m.text")]);
         }
 
         #[tokio::test]
