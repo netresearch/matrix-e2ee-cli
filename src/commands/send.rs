@@ -15,6 +15,7 @@ use crate::SendArgs;
 use crate::commands::{resolve_room, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
+use crate::text::term;
 
 pub async fn run(args: SendArgs) -> Result<()> {
     let config = load_config()?;
@@ -63,14 +64,18 @@ pub async fn run(args: SendArgs) -> Result<()> {
     };
 
     let result = room.send(content).await;
-    if encrypted && args.trust_unverified_devices {
+    let discarded = if encrypted && args.trust_unverified_devices {
         // The opt-in covers this message only: drop the session the
-        // unverified devices now hold, before anything else can reuse it.
-        room.discard_room_key()
-            .await
-            .context("sent, but discarding the shared room key failed")?;
+        // unverified devices may now hold, before anything else can reuse
+        // it. Also after a failed send: the key may have been shared already.
+        room.discard_room_key().await
+    } else {
+        Ok(())
+    };
+    let (sent, warning) = settle_send(result, discarded)?;
+    if let Some(warning) = warning {
+        eprintln!("warning: {}", term(&warning));
     }
-    let sent = result.context("sending failed")?;
     let event_id = sent.response.event_id;
 
     if encrypted && !args.trust_unverified_devices {
@@ -91,9 +96,32 @@ pub async fn run(args: SendArgs) -> Result<()> {
             json!({"event_id": event_id, "room_id": room.room_id(), "encrypted": encrypted})
         );
     } else {
-        println!("{event_id}");
+        println!("{}", term(event_id.as_str()));
     }
     Ok(())
+}
+
+/// Combine the send result with the result of discarding the room key: a
+/// failed send is the error (a discard failure attached as context); after a
+/// successful send a discard failure is only a warning.
+fn settle_send<T, E, D>(sent: Result<T, E>, discarded: Result<(), D>) -> Result<(T, Option<String>)>
+where
+    E: std::error::Error + Send + Sync + 'static,
+    D: std::fmt::Display,
+{
+    match (sent, discarded) {
+        (Ok(sent), Ok(())) => Ok((sent, None)),
+        (Ok(sent), Err(discard)) => Ok((
+            sent,
+            Some(format!(
+                "sent, but discarding the room key shared with unverified devices failed ({discard}); the next message may reuse it"
+            )),
+        )),
+        (Err(err), Ok(())) => Err(anyhow::Error::new(err).context("sending failed")),
+        (Err(err), Err(discard)) => Err(anyhow::Error::new(err).context(format!(
+            "sending failed, and discarding the room key shared with unverified devices failed too ({discard})"
+        ))),
+    }
 }
 
 fn describe(devices: &[Device]) -> String {
@@ -102,9 +130,13 @@ fn describe(devices: &[Device]) -> String {
         .map(|d| {
             let name = d
                 .display_name()
-                .map(|n| format!(" ({n})"))
+                .map(|n| format!(" ({})", term(n)))
                 .unwrap_or_default();
-            format!(" {} {}{name};", d.user_id(), d.device_id())
+            format!(
+                " {} {}{name};",
+                term(d.user_id().as_str()),
+                term(d.device_id().as_str())
+            )
         })
         .collect()
 }
@@ -140,4 +172,35 @@ async fn untrusted_devices(room: &Room) -> Result<Vec<Device>> {
         }
     }
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn send_error() -> std::io::Error {
+        std::io::Error::other("server said no")
+    }
+
+    #[test]
+    fn failed_send_is_an_error_even_when_the_discard_fails() {
+        let err = settle_send::<u8, _, _>(Err(send_error()), Err("disk full")).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("server said no"), "{chain}");
+        assert!(
+            chain.contains("sending failed") && chain.contains("disk full"),
+            "{chain}"
+        );
+        assert!(!chain.starts_with("sent"), "{chain}");
+    }
+
+    #[test]
+    fn successful_send_with_failed_discard_is_a_warning() {
+        let (sent, warning) =
+            settle_send::<u8, std::io::Error, _>(Ok(7), Err("disk full")).unwrap();
+        assert_eq!(sent, 7);
+        assert!(warning.is_some_and(|w| w.contains("disk full")));
+        let (_, warning) = settle_send::<u8, std::io::Error, &str>(Ok(7), Ok(())).unwrap();
+        assert!(warning.is_none());
+    }
 }

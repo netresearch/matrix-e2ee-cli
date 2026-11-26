@@ -12,6 +12,8 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# tcflush (discard typed-ahead input before the emoji confirmation).
+libc = "0.2"
 matrix-sdk = { version = "=0.20.0", default-features = false, features = [
     "e2e-encryption",
     "automatic-room-key-forwarding",

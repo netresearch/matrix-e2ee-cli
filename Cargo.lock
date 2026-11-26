@@ -1872,6 +1872,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
+ "libc",
  "matrix-sdk",
  "matrix-sdk-base",
  "rand 0.9.5",

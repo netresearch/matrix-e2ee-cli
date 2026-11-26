@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
-use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
+use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId, UserId};
 use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::{Client, SessionMeta, SessionTokens};
 use matrix_sdk_base::crypto::CollectStrategy;
@@ -168,12 +168,56 @@ fn stash_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// The stash paths (`*.prev`) that exist.
+pub fn existing_stash(paths: &Paths) -> Vec<PathBuf> {
+    [paths.session_file(), paths.store_dir()]
+        .iter()
+        .map(|path| stash_path(path))
+        .filter(|stash| fs::symlink_metadata(stash).is_ok())
+        .collect()
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// Why a stash blocks the next login, and the commands that resolve it in
+/// the current state.
+pub fn stash_refusal(paths: &Paths) -> String {
+    let stash = existing_stash(paths);
+    let listed = stash
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let drop_cmd = format!(
+        "rm -r {}",
+        stash
+            .iter()
+            .map(|p| shell_quote(p))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if paths.session_file().exists() {
+        format!(
+            "a previous session is still kept aside in {listed} by an interrupted `login --force`; to put it back, run `matrix-e2ee-cli logout` (logs out the current device) and then `matrix-e2ee-cli login --restore-previous`; to keep the current session and drop the previous one, run: {drop_cmd}"
+        )
+    } else {
+        format!(
+            "a previous session is still kept aside in {listed} by an interrupted `login --force`; to put it back, run `matrix-e2ee-cli login --restore-previous`; to drop it, run: {drop_cmd}"
+        )
+    }
+}
+
 /// Move an existing session file and store aside (`*.prev`), so a failed
-/// `login --force` can put them back. Older stashes are replaced.
+/// `login --force` can put them back. Refuses when a stash already exists:
+/// it is the only copy of an earlier session.
 pub fn stash_local_state(paths: &Paths) -> Result<()> {
+    if !existing_stash(paths).is_empty() {
+        bail!(stash_refusal(paths));
+    }
     for path in [paths.session_file(), paths.store_dir()] {
         let stash = stash_path(&path);
-        remove_path(&stash)?;
         match fs::rename(&path, &stash) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -185,9 +229,11 @@ pub fn stash_local_state(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// Put a stash back in place of the current session file and store.
+/// Put a stash back in place of the current session file and store. The
+/// store goes first and the session file last, so a session file is never
+/// live while its store is still aside.
 pub fn restore_stash(paths: &Paths) -> Result<()> {
-    for path in [paths.session_file(), paths.store_dir()] {
+    for path in [paths.store_dir(), paths.session_file()] {
         let stash = stash_path(&path);
         if fs::symlink_metadata(&stash).is_ok() {
             remove_path(&path)?;
@@ -196,6 +242,50 @@ pub fn restore_stash(paths: &Paths) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `login --restore-previous`: put a stash left by an interrupted
+/// `login --force` back. Refuses while a session file exists, because that
+/// session's device would be lost. A store without a session file is unusable
+/// (its passphrase was in the session file) and is replaced only when its own
+/// stash exists.
+pub fn restore_previous(paths: &Paths) -> Result<()> {
+    if existing_stash(paths).is_empty() {
+        bail!("no previous session is kept aside; nothing to restore");
+    }
+    if paths.session_file().exists() {
+        bail!(stash_refusal(paths));
+    }
+    restore_stash(paths)
+}
+
+/// Undo the local side of a failed login: delete what the attempt left and
+/// put the stash back. Always tries both steps and returns the login error,
+/// with any cleanup failure attached as context.
+pub fn rollback_failed_login(paths: &Paths, err: anyhow::Error) -> anyhow::Error {
+    let cleanup = delete_local_state(paths);
+    let restore = restore_stash(paths);
+    let problems: Vec<String> = [cleanup.err(), restore.err()]
+        .into_iter()
+        .flatten()
+        .map(|e| format!("{e:#}"))
+        .collect();
+    if problems.is_empty() {
+        err
+    } else if existing_stash(paths).is_empty() {
+        // Nothing is kept aside any more: report what failed, no guidance
+        // about a stash that does not exist.
+        err.context(format!(
+            "cleaning up after the failed login failed: {}",
+            problems.join("; ")
+        ))
+    } else {
+        err.context(format!(
+            "the previous session could not be fully put back ({}); {}",
+            problems.join("; "),
+            stash_refusal(paths)
+        ))
+    }
 }
 
 pub fn discard_stash(paths: &Paths) -> Result<()> {
@@ -273,17 +363,74 @@ pub struct Restored {
     pub session: SessionFile,
 }
 
-pub async fn restore(config: &Config, paths: &Paths, sharing: KeySharing) -> Result<Restored> {
-    let Some(session) = read_session(&paths.session_file())? else {
-        bail!("not logged in: run `matrix-e2ee-cli login` first");
-    };
-    if session.user_id != config.user_id {
+/// How a user id the server or the session file names relates to the one in
+/// config.json.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserIdMatch {
+    Same,
+    /// Same server, localparts equal except for letter case.
+    CaseOnly,
+    Different,
+}
+
+pub fn parse_user_id(value: &str, what: &str) -> Result<OwnedUserId> {
+    UserId::parse(value).with_context(|| format!("invalid user id {value:?} in {what}"))
+}
+
+pub fn compare_user_ids(configured: &UserId, other: &UserId) -> UserIdMatch {
+    if configured == other {
+        UserIdMatch::Same
+    } else if configured.server_name() == other.server_name()
+        && configured.localpart().to_lowercase() == other.localpart().to_lowercase()
+    {
+        UserIdMatch::CaseOnly
+    } else {
+        UserIdMatch::Different
+    }
+}
+
+/// The session file must belong to the user config.json names; a difference
+/// in the case of the localpart is the same account.
+pub fn check_session_user(config: &Config, session: &SessionFile) -> Result<()> {
+    let configured = parse_user_id(&config.user_id, "config.json")?;
+    let stored = parse_user_id(&session.user_id, "the session file")?;
+    if compare_user_ids(&configured, &stored) == UserIdMatch::Different {
         bail!(
             "the session belongs to {} but config.json names {}; run `matrix-e2ee-cli logout` or fix config.json",
             session.user_id,
             config.user_id
         );
     }
+    Ok(())
+}
+
+pub async fn restore(config: &Config, paths: &Paths, sharing: KeySharing) -> Result<Restored> {
+    let session = read_existing_session(paths)?;
+    check_session_user(config, &session)?;
+    restore_from(session, paths, sharing).await
+}
+
+/// Restore from the session file alone, without config.json (for `logout`).
+pub async fn restore_session(paths: &Paths, sharing: KeySharing) -> Result<Restored> {
+    let session = read_existing_session(paths)?;
+    restore_from(session, paths, sharing).await
+}
+
+fn read_existing_session(paths: &Paths) -> Result<SessionFile> {
+    match read_session(&paths.session_file())? {
+        Some(session) => Ok(session),
+        None if !existing_stash(paths).is_empty() => {
+            bail!("not logged in; {}", stash_refusal(paths))
+        }
+        None => bail!("not logged in: run `matrix-e2ee-cli login` first"),
+    }
+}
+
+async fn restore_from(
+    session: SessionFile,
+    paths: &Paths,
+    sharing: KeySharing,
+) -> Result<Restored> {
     let client = build_client(
         &session.homeserver,
         paths,
@@ -492,6 +639,172 @@ mod tests {
                 .symlink_metadata()
                 .is_err()
         );
+    }
+
+    fn paths_in(tmp: &tempfile::TempDir) -> Paths {
+        Paths {
+            data_dir: tmp.path().join("app"),
+        }
+    }
+
+    fn write_state(paths: &Paths, session: &SessionFile, db: &str) {
+        write_session(&paths.session_file(), session).unwrap();
+        fs::create_dir_all(paths.store_dir()).unwrap();
+        fs::write(paths.store_dir().join("db"), db).unwrap();
+    }
+
+    fn stash_files(paths: &Paths) -> (Option<SessionFile>, String) {
+        (
+            read_session(&paths.data_dir.join("session.json.prev")).unwrap(),
+            fs::read_to_string(paths.data_dir.join("store.prev").join("db")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn existing_stash_is_never_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(&tmp);
+        let old = sample();
+        write_state(&paths, &old, "old");
+        stash_local_state(&paths).unwrap();
+        // Simulated crash: no restore, no discard. The next login --force
+        // created a new session in the meantime.
+        let mut newer = sample();
+        newer.device_id = "NEWER".into();
+        write_state(&paths, &newer, "newer");
+
+        let err = stash_local_state(&paths).unwrap_err().to_string();
+        assert!(
+            err.contains("--restore-previous") && err.contains("logout"),
+            "{err}"
+        );
+        assert_eq!(stash_files(&paths), (Some(old), "old".to_owned()));
+        assert_eq!(read_session(&paths.session_file()).unwrap(), Some(newer));
+    }
+
+    #[test]
+    fn restore_previous_puts_the_stash_back_after_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(&tmp);
+        let old = sample();
+        write_state(&paths, &old, "old");
+        stash_local_state(&paths).unwrap();
+        // Crash during the login: a half-made store, no session file.
+        fs::create_dir_all(paths.store_dir()).unwrap();
+        fs::write(paths.store_dir().join("db"), "half").unwrap();
+        let err = stash_refusal(&paths);
+        assert!(
+            err.contains("login --restore-previous") && !err.contains("logout"),
+            "{err}"
+        );
+
+        restore_previous(&paths).unwrap();
+        assert_eq!(read_session(&paths.session_file()).unwrap(), Some(old));
+        assert_eq!(
+            fs::read_to_string(paths.store_dir().join("db")).unwrap(),
+            "old"
+        );
+        assert!(existing_stash(&paths).is_empty());
+        assert!(restore_previous(&paths).is_err(), "nothing left to restore");
+    }
+
+    #[test]
+    fn restore_previous_refuses_while_a_session_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(&tmp);
+        let old = sample();
+        write_state(&paths, &old, "old");
+        stash_local_state(&paths).unwrap();
+        let newer = sample();
+        write_state(&paths, &newer, "newer");
+        assert!(restore_previous(&paths).is_err());
+        assert_eq!(stash_files(&paths), (Some(old), "old".to_owned()));
+        assert_eq!(read_session(&paths.session_file()).unwrap(), Some(newer));
+    }
+
+    #[test]
+    fn crash_between_the_two_renames_keeps_the_unstashed_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(&tmp);
+        let old = sample();
+        write_state(&paths, &old, "old");
+        // Only the session file was moved aside.
+        fs::rename(
+            paths.session_file(),
+            paths.data_dir.join("session.json.prev"),
+        )
+        .unwrap();
+        restore_previous(&paths).unwrap();
+        assert_eq!(read_session(&paths.session_file()).unwrap(), Some(old));
+        assert_eq!(
+            fs::read_to_string(paths.store_dir().join("db")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn rollback_restores_the_stash_even_when_cleanup_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(&tmp);
+        let old = sample();
+        write_state(&paths, &old, "old");
+        stash_local_state(&paths).unwrap();
+        // A directory where the session file belongs: delete_local_state
+        // cannot remove it with remove_file and fails.
+        fs::create_dir_all(paths.session_file().join("x")).unwrap();
+        assert!(delete_local_state(&paths).is_err());
+
+        let err = rollback_failed_login(&paths, anyhow::anyhow!("login failed: M_FORBIDDEN"));
+        assert_eq!(err.root_cause().to_string(), "login failed: M_FORBIDDEN");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("cleaning up after the failed login failed"),
+            "{chain}"
+        );
+        // The stash is back in place: no advice about a stash or a logout.
+        assert!(
+            !chain.contains("logout") && !chain.contains("--restore-previous"),
+            "{chain}"
+        );
+        assert_eq!(read_session(&paths.session_file()).unwrap(), Some(old));
+        assert_eq!(
+            fs::read_to_string(paths.store_dir().join("db")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn user_ids_differing_only_in_localpart_case_match() {
+        let id = |s: &str| parse_user_id(s, "test").unwrap();
+        assert_eq!(
+            compare_user_ids(&id("@Alice:example.org"), &id("@alice:example.org")),
+            UserIdMatch::CaseOnly
+        );
+        assert_eq!(
+            compare_user_ids(&id("@alice:example.org"), &id("@alice:example.org")),
+            UserIdMatch::Same
+        );
+        assert_eq!(
+            compare_user_ids(&id("@alice:example.org"), &id("@bob:example.org")),
+            UserIdMatch::Different
+        );
+        assert_eq!(
+            compare_user_ids(&id("@alice:example.org"), &id("@alice:other.org")),
+            UserIdMatch::Different
+        );
+
+        let config = Config {
+            homeserver: "https://m.example".into(),
+            user_id: "@Alice:example.org".into(),
+        };
+        let mut session = sample();
+        session.user_id = "@alice:example.org".into();
+        check_session_user(&config, &session).unwrap();
+        session.user_id = "@bob:example.org".into();
+        let err = check_session_user(&config, &session)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("logout"), "{err}");
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod commands;
 mod config;
 mod room_arg;
 mod session;
+mod text;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -28,6 +29,10 @@ enum Command {
         /// Replace an existing local session (the old device stays on the server).
         #[arg(long)]
         force: bool,
+        /// Put back the session an interrupted `login --force` kept aside
+        /// (session.json.prev, store.prev) instead of logging in.
+        #[arg(long, conflicts_with = "force")]
+        restore_previous: bool,
     },
     /// Show user, device, cross-signing/verification and key-backup state.
     Status {
@@ -102,7 +107,10 @@ pub struct ReadArgs {
 async fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Login { force } => commands::login::run(force).await,
+        Command::Login {
+            force,
+            restore_previous,
+        } => commands::login::run(force, restore_previous).await,
         Command::Status { json } => commands::status::run(json).await,
         Command::Verify(args) => commands::verify::run(args).await,
         Command::Send(args) => commands::send::run(args).await,
@@ -119,7 +127,8 @@ async fn main() {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(": ");
-            eprintln!("error: {msg}");
+            // Server error texts and names in the chain are not ours.
+            eprintln!("error: {}", text::term(&msg));
             1
         }
     };

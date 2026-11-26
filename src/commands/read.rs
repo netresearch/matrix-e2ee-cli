@@ -2,7 +2,10 @@
 
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
-use matrix_sdk::deserialized_responses::{TimelineEvent, TimelineEventKind};
+use matrix_sdk::EncryptionState;
+use matrix_sdk::deserialized_responses::{
+    DeviceLinkProblem, TimelineEvent, TimelineEventKind, VerificationLevel, VerificationState,
+};
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::UInt;
 use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent};
@@ -13,6 +16,7 @@ use crate::ReadArgs;
 use crate::commands::{resolve_room, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
+use crate::text::term;
 
 pub const UNDECRYPTABLE: &str = "[unable to decrypt]";
 
@@ -27,7 +31,17 @@ pub struct Line {
     pub decrypted: bool,
     /// The event was encrypted (decrypted or not).
     pub encrypted: bool,
+    /// Decrypted, and matrix-sdk links the sending device to a verified
+    /// identity (`VerificationState::Verified`).
+    pub sender_verified: bool,
+    /// The room is encrypted (an unknown state counts as encrypted).
+    pub room_encrypted: bool,
 }
+
+/// Prefix in text mode: unencrypted events in an encrypted room, and
+/// decrypted events whose sending device is not verified.
+pub const UNENCRYPTED_MARK: &str = "[unencrypted] ";
+pub const UNVERIFIED_MARK: &str = "[unverified device] ";
 
 pub async fn run(args: ReadArgs) -> Result<()> {
     let config = load_config()?;
@@ -36,6 +50,22 @@ pub async fn run(args: ReadArgs) -> Result<()> {
     let client = restored.client;
     sync_once(&client).await?;
     let room = resolve_room(&client, &args.room).await?;
+    let room_encrypted = match room
+        .latest_encryption_state()
+        .await
+        .context("cannot read the room's encryption state")?
+    {
+        EncryptionState::Encrypted => true,
+        EncryptionState::NotEncrypted => false,
+        // Treat it as encrypted, so unencrypted events get marked.
+        EncryptionState::Unknown => {
+            eprintln!(
+                "warning: the encryption state of {} is unknown; treating it as encrypted",
+                term(room.room_id().as_str())
+            );
+            true
+        }
+    };
 
     let mut options = MessagesOptions::backward();
     options.limit = UInt::from(args.limit);
@@ -46,11 +76,13 @@ pub async fn run(args: ReadArgs) -> Result<()> {
 
     // /messages backwards returns newest first; print oldest first.
     for event in messages.chunk.iter().rev() {
-        let Some(line) = to_line(event) else { continue };
+        let Some(line) = to_line(event, room_encrypted) else {
+            continue;
+        };
         if args.json {
             println!("{}", serde_json::to_string(&line)?);
         } else {
-            println!("[{}] {}: {}", hh_mm(line.timestamp), line.sender, line.body);
+            println!("{}", text_line(&line));
         }
     }
     Ok(())
@@ -64,9 +96,44 @@ fn hh_mm(ms: u64) -> String {
         .unwrap_or_else(|| "--:--".to_owned())
 }
 
+/// One line of text output: control characters of sender and body replaced,
+/// marks for unencrypted events and unverified sending devices.
+pub fn text_line(line: &Line) -> String {
+    let mark = if line.room_encrypted && !line.encrypted {
+        UNENCRYPTED_MARK
+    } else if line.decrypted && !line.sender_verified {
+        UNVERIFIED_MARK
+    } else {
+        ""
+    };
+    format!(
+        "[{}] {mark}{}: {}",
+        hh_mm(line.timestamp),
+        term(&line.sender),
+        term(&line.body)
+    )
+}
+
+/// Only `Verified` counts. Every variant is named, so a new one in a later
+/// matrix-sdk is a compile error here instead of a silent default.
+fn is_verified(state: &VerificationState) -> bool {
+    match state {
+        VerificationState::Verified => true,
+        VerificationState::Unverified(
+            VerificationLevel::UnverifiedIdentity
+            | VerificationLevel::VerificationViolation
+            | VerificationLevel::UnsignedDevice
+            | VerificationLevel::None(
+                DeviceLinkProblem::MissingDevice | DeviceLinkProblem::InsecureSource,
+            )
+            | VerificationLevel::MismatchedSender,
+        ) => false,
+    }
+}
+
 /// A printable line for a message event or an undecryptable event; `None`
 /// for everything else (state events, reactions, redactions, ...).
-pub fn to_line(event: &TimelineEvent) -> Option<Line> {
+pub fn to_line(event: &TimelineEvent, room_encrypted: bool) -> Option<Line> {
     // Room::messages() hands an event it could not decrypt back as plain
     // text when decrypt_event() fails with an error, so check the type too.
     let still_encrypted = event
@@ -77,17 +144,23 @@ pub fn to_line(event: &TimelineEvent) -> Option<Line> {
         .as_deref()
         == Some("m.room.encrypted");
     match &event.kind {
-        TimelineEventKind::PlainText { event: raw } if still_encrypted => Some(undecryptable(raw)),
-        TimelineEventKind::UnableToDecrypt { event: raw, .. } => Some(undecryptable(raw)),
+        TimelineEventKind::PlainText { event: raw } if still_encrypted => {
+            Some(undecryptable(raw, room_encrypted))
+        }
+        TimelineEventKind::UnableToDecrypt { event: raw, .. } => {
+            Some(undecryptable(raw, room_encrypted))
+        }
         TimelineEventKind::Decrypted(_) | TimelineEventKind::PlainText { .. } => {
-            let encrypted = event.encryption_info().is_some();
+            let info = event.encryption_info();
+            let encrypted = info.is_some();
+            let sender_verified = info.is_some_and(|i| is_verified(&i.verification_state));
             let parsed = event.raw().deserialize().ok()?;
-            message_line(&parsed, encrypted)
+            message_line(&parsed, encrypted, sender_verified, room_encrypted)
         }
     }
 }
 
-fn undecryptable(raw: &Raw<AnySyncTimelineEvent>) -> Line {
+fn undecryptable(raw: &Raw<AnySyncTimelineEvent>, room_encrypted: bool) -> Line {
     Line {
         event_id: raw
             .get_field::<String>("event_id")
@@ -108,10 +181,17 @@ fn undecryptable(raw: &Raw<AnySyncTimelineEvent>) -> Line {
         msgtype: "m.room.encrypted".to_owned(),
         decrypted: false,
         encrypted: true,
+        sender_verified: false,
+        room_encrypted,
     }
 }
 
-fn message_line(event: &AnySyncTimelineEvent, encrypted: bool) -> Option<Line> {
+fn message_line(
+    event: &AnySyncTimelineEvent,
+    encrypted: bool,
+    sender_verified: bool,
+    room_encrypted: bool,
+) -> Option<Line> {
     let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(msg)) = event else {
         return None;
     };
@@ -125,14 +205,98 @@ fn message_line(event: &AnySyncTimelineEvent, encrypted: bool) -> Option<Line> {
         msgtype: content.msgtype().to_owned(),
         decrypted: encrypted,
         encrypted,
+        sender_verified,
+        room_encrypted,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::deserialized_responses::UnableToDecryptInfo;
+    use matrix_sdk::deserialized_responses::{
+        AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, UnableToDecryptInfo,
+    };
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn decrypted(body: &str, state: VerificationState) -> TimelineEvent {
+        let mut value = message("m.text", body);
+        value["room_id"] = json!("!r:example");
+        TimelineEvent::from_decrypted(
+            DecryptedRoomEvent {
+                event: serde_json::from_value(value).unwrap(),
+                encryption_info: Arc::new(EncryptionInfo {
+                    sender: "@a:example".try_into().unwrap(),
+                    sender_device: Some("DEV".into()),
+                    forwarder: None,
+                    algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                        curve25519_key: "k".into(),
+                        sender_claimed_keys: BTreeMap::new(),
+                        session_id: None,
+                    },
+                    verification_state: state,
+                }),
+                unsigned_encryption_info: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn text_output_neutralises_control_characters() {
+        let mut value = message(
+            "m.text",
+            "hi\x1b[2J\r\n[12:00] @boss:example: wire money\u{009b}",
+        );
+        value["sender"] = json!("@a\u{0007}:example");
+        let ev = TimelineEvent::from_plaintext(raw(value));
+        let shown = text_line(&to_line(&ev, false).unwrap());
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.contains('\u{FFFD}'), "{shown:?}");
+        // JSON keeps the body as sent; serde escapes it.
+        let json = serde_json::to_string(&to_line(&ev, false).unwrap()).unwrap();
+        assert!(json.contains("\\u001b[2J\\r\\n"), "{json}");
+    }
+
+    #[test]
+    fn unencrypted_event_in_encrypted_room_is_marked() {
+        let ev = TimelineEvent::from_plaintext(raw(message("m.text", "hi")));
+        let line = to_line(&ev, true).unwrap();
+        assert!(line.room_encrypted && !line.encrypted && !line.sender_verified);
+        assert!(text_line(&line).contains(&format!("{UNENCRYPTED_MARK}@a:example: hi")));
+        // In an unencrypted room there is nothing to mark.
+        let line = to_line(&ev, false).unwrap();
+        assert!(!text_line(&line).contains(UNENCRYPTED_MARK));
+    }
+
+    #[test]
+    fn decrypted_event_from_an_unverified_device_is_marked() {
+        let unverified = [
+            VerificationLevel::UnverifiedIdentity,
+            VerificationLevel::VerificationViolation,
+            VerificationLevel::UnsignedDevice,
+            VerificationLevel::None(DeviceLinkProblem::MissingDevice),
+            VerificationLevel::None(DeviceLinkProblem::InsecureSource),
+            VerificationLevel::MismatchedSender,
+        ];
+        for level in unverified {
+            let ev = decrypted("hi", VerificationState::Unverified(level.clone()));
+            let line = to_line(&ev, true).unwrap();
+            assert!(line.decrypted && !line.sender_verified, "{level:?}");
+            assert!(
+                text_line(&line).contains(&format!("{UNVERIFIED_MARK}@a:example: hi")),
+                "{level:?}"
+            );
+        }
+        let line = to_line(&decrypted("hi", VerificationState::Verified), true).unwrap();
+        assert!(line.decrypted && line.sender_verified);
+        let shown = text_line(&line);
+        assert!(
+            !shown.contains(UNVERIFIED_MARK) && !shown.contains(UNENCRYPTED_MARK),
+            "{shown}"
+        );
+    }
 
     fn raw(value: serde_json::Value) -> Raw<AnySyncTimelineEvent> {
         serde_json::from_value(value).unwrap()
@@ -152,7 +316,7 @@ mod tests {
     fn plaintext_message_becomes_a_line() {
         let ev = TimelineEvent::from_plaintext(raw(message("m.notice", "hello")));
         assert_eq!(
-            to_line(&ev),
+            to_line(&ev, false),
             Some(Line {
                 event_id: "$e1".into(),
                 sender: "@a:example".into(),
@@ -161,6 +325,8 @@ mod tests {
                 msgtype: "m.notice".into(),
                 decrypted: false,
                 encrypted: false,
+                sender_verified: false,
+                room_encrypted: false,
             })
         );
     }
@@ -178,7 +344,7 @@ mod tests {
             })),
             serde_json::from_value::<UnableToDecryptInfo>(json!({"session_id": "s"})).unwrap(),
         );
-        let line = to_line(&ev).unwrap();
+        let line = to_line(&ev, true).unwrap();
         assert_eq!(line.body, UNDECRYPTABLE);
         assert_eq!(
             (line.event_id.as_str(), line.sender.as_str(), line.timestamp),
@@ -197,7 +363,7 @@ mod tests {
             "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "x",
                         "session_id": "s", "sender_key": "k", "device_id": "D"}
         })));
-        let line = to_line(&ev).expect("an encrypted event must not be dropped");
+        let line = to_line(&ev, true).expect("an encrypted event must not be dropped");
         assert_eq!(line.body, UNDECRYPTABLE);
         assert!(line.encrypted && !line.decrypted);
     }
@@ -208,13 +374,16 @@ mod tests {
             "type": "m.room.topic", "state_key": "", "event_id": "$e3",
             "sender": "@a:example", "origin_server_ts": 1u64, "content": {"topic": "t"}
         });
-        assert_eq!(to_line(&TimelineEvent::from_plaintext(raw(state))), None);
+        assert_eq!(
+            to_line(&TimelineEvent::from_plaintext(raw(state)), true),
+            None
+        );
     }
 
     #[test]
     fn json_line_has_the_documented_keys() {
         let ev = TimelineEvent::from_plaintext(raw(message("m.text", "hi")));
-        let value = serde_json::to_value(to_line(&ev).unwrap()).unwrap();
+        let value = serde_json::to_value(to_line(&ev, true).unwrap()).unwrap();
         for key in [
             "event_id",
             "sender",
@@ -222,6 +391,8 @@ mod tests {
             "body",
             "msgtype",
             "decrypted",
+            "sender_verified",
+            "room_encrypted",
         ] {
             assert!(value.get(key).is_some(), "missing {key}");
         }

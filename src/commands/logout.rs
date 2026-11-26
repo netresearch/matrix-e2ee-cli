@@ -1,18 +1,20 @@
 //! `logout`: log the device out on the server, then delete the local
-//! session file and store.
+//! session file and store. Works from the session file alone, without
+//! config.json.
 
 use anyhow::{Context, Result, bail};
 use matrix_sdk::ruma::api::error::ErrorKind;
 
 use crate::commands::ask_yes_no;
-use crate::config::load_config;
-use crate::session::{KeySharing, Paths, delete_local_state, restore};
+use crate::session::{KeySharing, Paths, delete_local_state, restore_session};
+use crate::text::term;
 
 pub async fn run(yes: bool) -> Result<()> {
-    let config = load_config()?;
     let paths = Paths::from_env()?;
-    let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
-    let device = restored.session.device_id.clone();
+    // The session file alone: logout is the way out of a session that does
+    // not match config.json, so it must not depend on config.json.
+    let restored = restore_session(&paths, KeySharing::VerifiedOnly).await?;
+    let device = term(&restored.session.device_id).into_owned();
 
     if !yes
         && !ask_yes_no(

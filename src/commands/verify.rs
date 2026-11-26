@@ -3,6 +3,7 @@
 //! A sync loop runs in the background for the whole flow, because every
 //! verification step arrives as a to-device event.
 
+use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,9 +19,28 @@ use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
 use tokio::sync::mpsc;
 
 use crate::VerifyArgs;
-use crate::commands::{ask_yes_no, sync_once};
+use crate::commands::{confirm_fresh_on, discard_typeahead_stdin, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
+use crate::text::term;
+
+const MATCH_QUESTION: &str = "Do they match exactly?";
+
+/// The emoji confirmation: a person at a terminal, answering after the emoji
+/// appeared (input typed earlier is discarded).
+fn confirm_emoji() -> Result<bool> {
+    let stdin = std::io::stdin();
+    let is_terminal = stdin.is_terminal();
+    confirm_emoji_on(is_terminal, &mut stdin.lock(), discard_typeahead_stdin)
+}
+
+fn confirm_emoji_on(
+    is_terminal: bool,
+    input: &mut dyn std::io::BufRead,
+    discard_typeahead: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    confirm_fresh_on(MATCH_QUESTION, is_terminal, input, discard_typeahead)
+}
 
 /// How long a listener waits for the requesting device to start SAS before
 /// starting it itself.
@@ -29,6 +49,11 @@ const OTHER_SIDE_START_GRACE: Duration = Duration::from_secs(5);
 const SETTLE_TIME: Duration = Duration::from_secs(5);
 
 pub async fn run(args: VerifyArgs) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "verify needs a terminal: the emoji comparison must be confirmed by a person; no verification was started"
+        );
+    }
     let config = load_config()?;
     let paths = Paths::from_env()?;
     let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
@@ -48,8 +73,9 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
             async move {
                 if ev.sender != own {
                     eprintln!(
-                        "Ignoring a verification request from {}: only devices of {own} are verified here.",
-                        ev.sender
+                        "Ignoring a verification request from {}: only devices of {} are verified here.",
+                        term(ev.sender.as_str()),
+                        term(own.as_str())
                     );
                     return;
                 }
@@ -68,7 +94,7 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
     let sync_task = tokio::spawn(async move {
         let settings = SyncSettings::default().timeout(Duration::from_secs(5));
         if let Err(err) = sync_client.sync(settings).await {
-            eprintln!("sync stopped: {err}");
+            eprintln!("sync stopped: {}", term(&err.to_string()));
         }
     });
 
@@ -118,9 +144,9 @@ async fn flow(
                 .map(|d| {
                     format!(
                         "{}{}",
-                        d.device_id(),
+                        term(d.device_id().as_str()),
                         d.display_name()
-                            .map(|n| format!(" ({n})"))
+                            .map(|n| format!(" ({})", term(n)))
                             .unwrap_or_default()
                     )
                 })
@@ -134,7 +160,10 @@ async fn flow(
                 }
             );
         };
-        eprintln!("Requesting verification with {device_id}; accept it on that device.");
+        eprintln!(
+            "Requesting verification with {}; accept it on that device.",
+            term(device_id.as_str())
+        );
         device
             .request_verification()
             .await
@@ -240,7 +269,7 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
                     Some(short) => {
                         println!("Compare these emoji with the other device:");
                         for emoji in &short.emojis {
-                            println!("  {}  {}", emoji.symbol, emoji.description);
+                            println!("  {}  {}", term(emoji.symbol), term(emoji.description));
                         }
                     }
                     None => println!(
@@ -249,10 +278,18 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
                     ),
                 }
                 println!();
-                let answer =
-                    tokio::task::spawn_blocking(|| ask_yes_no("Do they match exactly?", false))
-                        .await
-                        .context("the prompt failed")??;
+                let answer = match tokio::task::spawn_blocking(confirm_emoji).await {
+                    Ok(Ok(answer)) => answer,
+                    Ok(Err(err)) => {
+                        sas.cancel().await.ok();
+                        return Err(err.context("verification cancelled"));
+                    }
+                    Err(err) => {
+                        sas.cancel().await.ok();
+                        return Err(anyhow::Error::new(err)
+                            .context("the prompt failed; verification cancelled"));
+                    }
+                };
                 if answer {
                     sas.confirm()
                         .await
@@ -266,7 +303,7 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
             SasState::Done { .. } => {
                 println!(
                     "Verification done: device {} is verified.",
-                    sas.other_device().device_id()
+                    term(sas.other_device().device_id().as_str())
                 );
                 return Ok(());
             }
@@ -295,4 +332,34 @@ async fn print_final_state(client: &Client) -> Result<()> {
         yn(own.as_ref().is_some_and(|d| d.is_verified()))
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn emoji_confirmation_is_not_taken_from_a_pipe() {
+        let mut input = Cursor::new("y\n");
+        let result = confirm_emoji_on(false, &mut input, || Ok(()));
+        assert!(
+            result.is_err(),
+            "a piped \"y\" confirmed the emoji: {result:?}"
+        );
+        assert_eq!(input.position(), 0);
+    }
+
+    #[test]
+    fn emoji_confirmation_discards_typed_ahead_input_first() {
+        let mut input = Cursor::new("y\n");
+        let mut discarded = false;
+        let answer = confirm_emoji_on(true, &mut input, || {
+            discarded = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(answer);
+        assert!(discarded, "typed-ahead input was not discarded");
+    }
 }
