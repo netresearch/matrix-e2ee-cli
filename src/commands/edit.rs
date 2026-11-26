@@ -79,6 +79,9 @@ pub fn check_editable(event: &Value, own: &UserId) -> Result<EditKind> {
     if sender != own.as_str() {
         bail!("the event was sent by {sender}, not by {own}; only your own messages can be edited");
     }
+    if super::is_redacted(event) {
+        bail!("the event was redacted; there is nothing left to edit");
+    }
     let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
     match event_type {
         "m.room.message" => {}

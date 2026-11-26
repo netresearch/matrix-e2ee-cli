@@ -27,6 +27,9 @@ pub async fn run(args: RedactArgs) -> Result<()> {
         .to_owned();
 
     let (_, target) = fetch_event(&room, &event_id).await?;
+    if super::is_redacted(&target) {
+        bail!("the event is already redacted");
+    }
     let sender = UserId::parse(event_sender(&target)?).context("the event's sender is invalid")?;
     // Without the room's power levels the permission cannot be checked;
     // assumed defaults could be wrong either way, so refuse.

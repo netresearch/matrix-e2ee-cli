@@ -61,6 +61,14 @@ pub async fn fetch_event(
     Ok((event, json))
 }
 
+/// Whether the server says the event was redacted (`unsigned.redacted_because`).
+pub fn is_redacted(event: &serde_json::Value) -> bool {
+    event
+        .get("unsigned")
+        .and_then(|u| u.get("redacted_because"))
+        .is_some()
+}
+
 /// The `sender` of an event's JSON.
 pub fn event_sender(event: &serde_json::Value) -> Result<&str> {
     event
@@ -244,6 +252,15 @@ pub fn discard_typeahead(fd: std::os::fd::RawFd) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn redacted_events_are_recognised() {
+        let redacted = serde_json::json!({"type": "m.room.encrypted", "content": {},
+            "unsigned": {"redacted_because": {"type": "m.room.redaction"}}});
+        assert!(is_redacted(&redacted));
+        let live = serde_json::json!({"type": "m.room.message", "unsigned": {"age": 5}});
+        assert!(!is_redacted(&live));
+    }
 
     #[test]
     fn fresh_confirmation_refuses_without_a_terminal() {

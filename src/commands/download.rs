@@ -39,6 +39,9 @@ pub async fn run(args: DownloadArgs) -> Result<()> {
     let event_id = parse_event_id(&args.event_id)?;
 
     let (event, json) = fetch_event(&room, &event_id).await?;
+    if super::is_redacted(&json) {
+        bail!("the event was redacted; its media is no longer referenced");
+    }
     if json.get("type").and_then(serde_json::Value::as_str) == Some("m.room.encrypted") {
         bail!("this device cannot decrypt the event; run backup-restore to import the room key");
     }
