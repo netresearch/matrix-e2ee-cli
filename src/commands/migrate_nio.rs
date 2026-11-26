@@ -1007,7 +1007,7 @@ fn rollback(paths: &Paths, err: anyhow::Error) -> anyhow::Error {
 pub async fn run(store: Option<PathBuf>, yes: bool, check_online: bool) -> Result<()> {
     let paths = Paths::from_env()?;
     // Like every command that writes this tool's store: one process at a
-    // time, held until the migration has been written or rolled back.
+    // time, held until this command returns (after the online check, if any).
     let _lock = paths.lock().await?;
     // Before config.json: the way out of an existing session is logout,
     // whatever state config.json is in.
@@ -1029,7 +1029,9 @@ pub async fn run(store: Option<PathBuf>, yes: bool, check_online: bool) -> Resul
             ask_yes_no(question, true)
         }
     };
-    migrate(&paths, &opts, &mut confirm, &mut std::io::stdout()).await
+    // stderr, like the question: the summary the user confirms and the
+    // question must reach the same place, also when stdout is redirected.
+    migrate(&paths, &opts, &mut confirm, &mut std::io::stderr()).await
 }
 
 // Unix only: nio's database name contains ":", which Windows does not allow
