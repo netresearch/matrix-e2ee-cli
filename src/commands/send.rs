@@ -15,7 +15,7 @@ use crate::SendArgs;
 use crate::commands::{resolve_room, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
-use crate::text::term;
+use crate::text::{json_line, term};
 
 pub async fn run(args: SendArgs) -> Result<()> {
     let config = load_config()?;
@@ -91,9 +91,13 @@ pub async fn run(args: SendArgs) -> Result<()> {
     }
 
     if args.json {
+        // json_line escapes DEL and C1, which a hostile server can put into a
+        // room id and serde_json leaves raw.
         println!(
             "{}",
-            json!({"event_id": event_id, "room_id": room.room_id(), "encrypted": encrypted})
+            json_line(
+                &json!({"event_id": event_id, "room_id": room.room_id(), "encrypted": encrypted})
+            )?
         );
     } else {
         println!("{}", term(event_id.as_str()));

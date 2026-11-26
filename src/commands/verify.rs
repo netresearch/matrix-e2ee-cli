@@ -91,9 +91,11 @@ const OTHER_SIDE_START_GRACE: Duration = Duration::from_secs(5);
 const SETTLE_TIME: Duration = Duration::from_secs(5);
 
 pub async fn run(args: VerifyArgs) -> Result<()> {
-    if !std::io::stdin().is_terminal() {
+    // stdin: the answer comes from a person. stderr: the emoji and the
+    // question are shown to that person, not written to a file.
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         bail!(
-            "verify needs a terminal: the emoji comparison must be confirmed by a person; no verification was started"
+            "verify needs a terminal on stdin and stderr: the emoji comparison must be seen and confirmed by a person; no verification was started"
         );
     }
     let config = load_config()?;

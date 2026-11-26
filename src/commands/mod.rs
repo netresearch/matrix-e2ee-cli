@@ -31,8 +31,9 @@ pub async fn sync_once(client: &Client) -> Result<()> {
 }
 
 /// Find a joined room by id, alias or name. An argument that parses as a
-/// room id is looked up as one first; if no joined room has that id, it is
-/// matched as a name, since a room name may start with `!`.
+/// room id resolves only to the joined room with that id, never to a room of
+/// that name, so a room named like an id cannot receive what was meant for
+/// the room with that id.
 pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
     let joined = |room: &Room| room.state() == matrix_sdk::RoomState::Joined;
     let room_id = match classify(arg) {
@@ -42,7 +43,7 @@ pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
             match client.get_room(&id).filter(joined) {
                 Some(room) => return Ok(room),
                 None => bail!(
-                    "not joined to room {id}; to address a room whose name starts with \"!\", use its alias or id"
+                    "not joined to room {id}; a room whose name starts with \"!\" can only be addressed by its alias"
                 ),
             }
         }
