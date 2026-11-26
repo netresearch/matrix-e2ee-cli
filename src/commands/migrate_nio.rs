@@ -937,7 +937,7 @@ pub async fn migrate(
     )?;
     writeln!(
         out,
-        "  2. Retire the matrix-skill's copy of this device, {retire_when}: stop the daemon (`matrix-watchd.py --stop`), then run `matrix-e2ee-setup.py --logout`. It deletes credentials.json and this device's nio store files only; it does not log the device out on the server, which would end the migrated device too."
+        "  2. Retire the matrix-skill's copy of this device, {retire_when}: stop the daemon (`matrix-watchd.py --stop`), then run `matrix-e2ee-setup.py --logout`. It deletes credentials.json and the nio store files named after credentials.json's spelling of the user id (files named after another spelling stay); it does not log the device out on the server, which would end the migrated device too."
     )?;
     Ok(())
 }
