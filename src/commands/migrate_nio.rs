@@ -53,6 +53,8 @@ use crate::text::term;
 /// The key nio 0.25 encrypts its libolm pickles with: `ClientConfig.pickle_key`
 /// defaults to "DEFAULT_KEY", and the matrix-skill never sets another one.
 const NIO_PICKLE_KEY: &[u8] = b"DEFAULT_KEY";
+/// How long --check-online may hold the skill's store lock.
+const ONLINE_CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// The only nio store schema version this reads (nio 0.25: `MatrixStore.store_version`).
 const NIO_STORE_VERSION: i64 = 2;
 /// The flock the matrix-skill takes for the right to open the store.
@@ -964,9 +966,17 @@ pub async fn migrate(
         "Local trust: {verified} verified, {blacklisted} blacklisted and {ignored} ignored devices taken over from nio."
     )?;
     let retire_when = if opts.check_online {
-        sync_once(&client).await.context(
-            "migrated, but the online check (one sync) failed; the new session was kept",
-        )?;
+        // Bounded: matrix-sdk retries 5xx and 429 for up to about 15 minutes,
+        // and the skill's store stays locked while this runs.
+        match tokio::time::timeout(ONLINE_CHECK_LIMIT, sync_once(&client)).await {
+            Ok(result) => result.context(
+                "migrated, but the online check (one sync) failed; the new session was kept",
+            )?,
+            Err(_) => bail!(
+                "migrated, but the online check (one sync) did not finish within {} s; the new session was kept",
+                ONLINE_CHECK_LIMIT.as_secs()
+            ),
+        }
         writeln!(out, "Online check: one sync succeeded.")?;
         "now that the online check succeeded"
     } else {
