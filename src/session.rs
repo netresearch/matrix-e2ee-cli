@@ -89,7 +89,7 @@ pub fn generate_passphrase() -> String {
 }
 
 /// Windows: refuse a data directory outside %USERPROFILE%.
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(test)))]
 fn check_inside_profile(dir: &Path) -> Result<()> {
     let profile = std::env::var("USERPROFILE").context("USERPROFILE is not set")?;
     if !is_inside(dir, Path::new(&profile)) {
@@ -128,7 +128,8 @@ pub fn home_dir() -> Option<String> {
 /// a directory outside the profile is refused: its ACL may let others read
 /// the access token.
 pub fn ensure_private_dir(dir: &Path) -> Result<()> {
-    #[cfg(not(unix))]
+    // Not under test: CI's temporary directory is outside the profile.
+    #[cfg(all(not(unix), not(test)))]
     check_inside_profile(dir)?;
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     #[cfg(unix)]
@@ -653,6 +654,7 @@ mod tests {
         .await
         .unwrap();
         drop(client);
+        #[cfg(unix)]
         assert_eq!(mode(&paths.store_dir()), 0o700);
         assert!(
             fs::read_dir(paths.store_dir()).unwrap().next().is_some(),
