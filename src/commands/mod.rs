@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use matrix_sdk::config::SyncSettings;
-use matrix_sdk::ruma::{OwnedRoomAliasId, OwnedRoomId};
+use matrix_sdk::ruma::OwnedRoomAliasId;
 use matrix_sdk::{Client, Room};
 
 use crate::room_arg::{RoomArg, classify, match_name};
@@ -30,13 +30,21 @@ pub async fn sync_once(client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// Find a joined room by id, alias or name.
+/// Find a joined room by id, alias or name. An argument that parses as a
+/// room id is looked up as one first; if no joined room has that id, it is
+/// matched as a name, since a room name may start with `!`.
 pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
-    let room_id: OwnedRoomId = match classify(arg) {
-        RoomArg::Id(id) => id
-            .as_str()
-            .try_into()
-            .with_context(|| format!("invalid room id {id}"))?,
+    let joined = |room: &Room| room.state() == matrix_sdk::RoomState::Joined;
+    let room_id = match classify(arg) {
+        RoomArg::Id(id) => {
+            if let Some(room) = client.get_room(&id).filter(joined) {
+                return Ok(room);
+            }
+            match find_by_name(client, arg.trim()).await? {
+                Some(room_id) => room_id,
+                None => bail!("not joined to room {id}, and no joined room is named {arg:?}"),
+            }
+        }
         RoomArg::Alias(alias) => {
             let alias: OwnedRoomAliasId = alias
                 .as_str()
@@ -48,36 +56,46 @@ pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
                 .with_context(|| format!("cannot resolve {alias}"))?
                 .room_id
         }
-        RoomArg::Name(name) => {
-            let rooms = client.joined_rooms();
-            let mut names = Vec::with_capacity(rooms.len());
-            for room in &rooms {
-                let display = room
-                    .display_name()
-                    .await
-                    .map(|n| n.to_string())
-                    .unwrap_or_default();
-                names.push(display);
-            }
-            let hits = match_name(&names, &name);
-            match hits.as_slice() {
-                [] => bail!("no joined room is named {name:?}"),
-                [one] => rooms[*one].room_id().to_owned(),
-                many => {
-                    let list = many
-                        .iter()
-                        .map(|&i| format!("{} ({})", term(&names[i]), rooms[i].room_id()))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    bail!("room name {name:?} is ambiguous; use a room id: {list}");
-                }
-            }
-        }
+        RoomArg::Name(name) => match find_by_name(client, &name).await? {
+            Some(room_id) => room_id,
+            None => bail!("no joined room is named {name:?}"),
+        },
     };
     client
         .get_room(&room_id)
-        .filter(|room| room.state() == matrix_sdk::RoomState::Joined)
+        .filter(joined)
         .with_context(|| format!("not joined to room {room_id}"))
+}
+
+/// The joined room whose display name is `name` (ignoring case), `None` if
+/// there is none; an error if several rooms carry that name.
+async fn find_by_name(
+    client: &Client,
+    name: &str,
+) -> Result<Option<matrix_sdk::ruma::OwnedRoomId>> {
+    let rooms = client.joined_rooms();
+    let mut names = Vec::with_capacity(rooms.len());
+    for room in &rooms {
+        let display = room
+            .display_name()
+            .await
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        names.push(display);
+    }
+    let hits = match_name(&names, name);
+    match hits.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(rooms[*one].room_id().to_owned())),
+        many => {
+            let list = many
+                .iter()
+                .map(|&i| format!("{} ({})", term(&names[i]), rooms[i].room_id()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("room name {name:?} is ambiguous; use one of these room ids: {list}");
+        }
+    }
 }
 
 /// Ask a yes/no question on stderr, read the answer from stdin. With
@@ -85,20 +103,28 @@ pub async fn resolve_room(client: &Client, arg: &str) -> Result<Room> {
 pub fn ask_yes_no(question: &str, require_terminal: bool) -> Result<bool> {
     let stdin = std::io::stdin();
     let is_terminal = stdin.is_terminal();
-    ask_yes_no_on(question, require_terminal, is_terminal, &mut stdin.lock())
+    ask_yes_no_on(
+        question,
+        require_terminal,
+        is_terminal,
+        &mut stdin.lock(),
+        &mut std::io::stderr(),
+    )
 }
 
+/// Write the question to `output`, read the answer from `input`.
 pub fn ask_yes_no_on(
     question: &str,
     require_terminal: bool,
     is_terminal: bool,
     input: &mut dyn BufRead,
+    output: &mut dyn Write,
 ) -> Result<bool> {
     if require_terminal && !is_terminal {
         bail!("no terminal to ask on: {question}");
     }
-    eprint!("{question} [y/N] ");
-    std::io::stderr().flush().ok();
+    write!(output, "{question} [y/N] ").context("cannot show the question")?;
+    output.flush().ok();
     let mut line = String::new();
     input
         .read_line(&mut line)
@@ -113,6 +139,7 @@ pub fn confirm_fresh_on(
     question: &str,
     is_terminal: bool,
     input: &mut dyn BufRead,
+    output: &mut dyn Write,
     discard_typeahead: impl FnOnce() -> Result<()>,
 ) -> Result<bool> {
     if !is_terminal {
@@ -121,7 +148,7 @@ pub fn confirm_fresh_on(
         );
     }
     discard_typeahead()?;
-    ask_yes_no_on(question, true, is_terminal, input)
+    ask_yes_no_on(question, true, is_terminal, input, output)
 }
 
 #[cfg(unix)]
@@ -155,7 +182,7 @@ mod tests {
     fn fresh_confirmation_refuses_without_a_terminal() {
         let mut input = Cursor::new("y\n");
         let mut discarded = false;
-        let err = confirm_fresh_on("Match?", false, &mut input, || {
+        let err = confirm_fresh_on("Match?", false, &mut input, &mut Vec::new(), || {
             discarded = true;
             Ok(())
         })
@@ -171,7 +198,7 @@ mod tests {
         let mut input = Cursor::new("y\n");
         let mut discarded = false;
         assert!(
-            confirm_fresh_on("Match?", true, &mut input, || {
+            confirm_fresh_on("Match?", true, &mut input, &mut Vec::new(), || {
                 discarded = true;
                 Ok(())
             })

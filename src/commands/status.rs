@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::commands::sync_once;
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
-use crate::text::term;
+use crate::text::{json_line, term};
 
 #[derive(Debug, Serialize)]
 struct Status {
@@ -58,7 +58,7 @@ pub async fn run(json: bool) -> Result<()> {
     };
 
     if json {
-        println!("{}", serde_json::to_string(&status)?);
+        println!("{}", json_line(&status)?);
     } else {
         let yn = |b: bool| if b { "yes" } else { "no" };
         println!("User:           {}", term(&status.user_id));

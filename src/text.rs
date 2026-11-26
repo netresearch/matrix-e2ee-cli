@@ -2,10 +2,35 @@
 
 use std::borrow::Cow;
 
+/// Serialize `value` as one JSON line. serde_json escapes only U+0000-U+001F
+/// in strings; DEL (U+007F) and C1 (U+0080-U+009F) are escaped here as
+/// `\u007f` and `\u0080`..`\u009f`, so a terminal showing the line does not
+/// act on them. These characters can only occur inside JSON strings, so the
+/// result stays valid JSON with the same values.
+pub fn json_line<T: serde::Serialize>(value: &T) -> serde_json::Result<String> {
+    let json = serde_json::to_string(value)?;
+    if !json.chars().any(is_del_or_c1) {
+        return Ok(json);
+    }
+    let mut escaped = String::with_capacity(json.len() + 16);
+    for c in json.chars() {
+        if is_del_or_c1(c) {
+            escaped.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            escaped.push(c);
+        }
+    }
+    Ok(escaped)
+}
+
+fn is_del_or_c1(c: char) -> bool {
+    matches!(c, '\u{7f}'..='\u{9f}')
+}
+
 /// Replace control characters (C0 including CR, LF and ESC, DEL, and C1
 /// U+0080-U+009F) with U+FFFD, so text a room member or a server chose cannot
 /// move the cursor, clear the screen or start a fake line. For text output
-/// only; JSON output is escaped by serde.
+/// only; JSON output goes through [`json_line`].
 pub fn term(s: &str) -> Cow<'_, str> {
     if s.chars().any(char::is_control) {
         Cow::Owned(
@@ -21,8 +46,8 @@ pub fn term(s: &str) -> Cow<'_, str> {
 /// Like [`term`], but keeps the line breaks of a multi-line message body.
 /// Every line after the first is indented by four spaces, so a body cannot
 /// produce a line that starts like a message line (`[hh:mm] sender: ...`).
-/// A CR directly before an LF is dropped; every other control character,
-/// a lone CR included, becomes U+FFFD.
+/// A CR directly before an LF, or at the very end of the body, is dropped;
+/// every other control character, any other CR included, becomes U+FFFD.
 pub fn term_body(s: &str) -> String {
     s.split('\n')
         .map(|line| term(line.strip_suffix('\r').unwrap_or(line)).into_owned())

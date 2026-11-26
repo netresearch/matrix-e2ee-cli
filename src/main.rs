@@ -29,7 +29,7 @@ enum Command {
         /// Replace an existing local session (the old device stays on the server).
         #[arg(long)]
         force: bool,
-        /// Put back the session an interrupted `login --force` kept aside
+        /// Put back the session an interrupted login kept aside
         /// (session.json.prev, store.prev) instead of logging in.
         #[arg(long, conflicts_with = "force")]
         restore_previous: bool,
@@ -74,7 +74,7 @@ pub struct VerifyArgs {
 
 #[derive(Debug, Args)]
 pub struct SendArgs {
-    /// Room id (!x:server), alias (#x:server) or room name.
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
     pub room: String,
     pub message: String,
     /// Send as m.notice (for automation).
@@ -93,7 +93,7 @@ pub struct SendArgs {
 
 #[derive(Debug, Args)]
 pub struct ReadArgs {
-    /// Room id (!x:server), alias (#x:server) or room name.
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
     pub room: String,
     /// Number of timeline events to fetch (non-message events are skipped).
     #[arg(long, default_value_t = 10)]

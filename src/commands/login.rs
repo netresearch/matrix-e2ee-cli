@@ -59,7 +59,7 @@ pub async fn run(force: bool, restore_prev: bool) -> Result<()> {
     stash_local_state(&paths)?;
     let (client, session) = match create_device(&config, &paths, &password).await {
         Ok(done) => done,
-        Err(err) => return Err(rollback_failed_login(&paths, err)),
+        Err(err) => return rollback_failed_login(&paths, err),
     };
     drop(password);
     discard_stash(&paths)?;
@@ -147,9 +147,11 @@ async fn create_device(
         ReturnedUser::Reject(reason) => {
             let err = anyhow::anyhow!("{reason}; the new device {device_id} was logged out again");
             if let Err(logout) = client.logout().await {
-                return Err(anyhow::Error::new(logout).context(format!(
-                    "{reason}; logging the new device {device_id} out failed, remove it with Element or another client"
-                )));
+                return Err(logout).with_context(|| {
+                    format!(
+                        "{reason}; logging the new device {device_id} out failed, remove it with Element or another client"
+                    )
+                });
             }
             return Err(err);
         }

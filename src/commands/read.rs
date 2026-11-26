@@ -16,7 +16,7 @@ use crate::ReadArgs;
 use crate::commands::{resolve_room, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
-use crate::text::{term, term_body};
+use crate::text::{json_line, term, term_body};
 
 pub const UNDECRYPTABLE: &str = "[unable to decrypt]";
 
@@ -80,7 +80,7 @@ pub async fn run(args: ReadArgs) -> Result<()> {
             continue;
         };
         if args.json {
-            println!("{}", serde_json::to_string(&line)?);
+            println!("{}", json_line(&line)?);
         } else {
             println!("{}", text_line(&line));
         }
@@ -265,9 +265,26 @@ mod tests {
             shown.lines().skip(1).all(|l| l.starts_with("    ")),
             "{shown:?}"
         );
-        // JSON keeps the body as sent; serde escapes it.
-        let json = serde_json::to_string(&to_line(&ev, false).unwrap()).unwrap();
+        // JSON keeps the body as sent, with every control character escaped.
+        let json = json_line(&to_line(&ev, false).unwrap()).unwrap();
         assert!(json.contains("\\u001b[2J\\r\\n"), "{json}");
+    }
+
+    #[test]
+    fn json_escapes_del_and_c1_and_keeps_the_body() {
+        let body = "a\u{7f}b\u{9b}2Jc\u{80}\u{9f}\u{a0}d";
+        let ev = TimelineEvent::from_plaintext(raw(message("m.text", body)));
+        let json = json_line(&to_line(&ev, false).unwrap()).unwrap();
+        assert!(
+            !json.chars().any(|c| matches!(c, '\u{7f}'..='\u{9f}')),
+            "raw DEL or C1 in {json:?}"
+        );
+        assert!(
+            json.contains("a\\u007fb\\u009b2Jc\\u0080\\u009f\u{a0}d"),
+            "{json}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["body"], body);
     }
 
     #[test]

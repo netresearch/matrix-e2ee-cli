@@ -52,8 +52,18 @@ pub async fn run() -> Result<()> {
     let mut done = 0usize;
     let mut failed = Vec::new();
     for room in client.joined_rooms() {
-        if !matches!(room.encryption_state(), EncryptionState::Encrypted) {
-            continue;
+        // As read and send do: ask the server when the state is not cached
+        // yet. A state that stays unknown counts as encrypted, as in read.
+        match room.latest_encryption_state().await {
+            Ok(EncryptionState::NotEncrypted) => continue,
+            Ok(EncryptionState::Encrypted | EncryptionState::Unknown) => {}
+            Err(err) => {
+                failed.push(format!(
+                    "{}: cannot read the encryption state: {err}",
+                    room.room_id()
+                ));
+                continue;
+            }
         }
         match backups.download_room_keys_for_room(room.room_id()).await {
             Ok(()) => done += 1,

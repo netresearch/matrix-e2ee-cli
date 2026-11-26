@@ -1,10 +1,15 @@
 //! Classification of the ROOM argument and matching of room names. Pure, no I/O.
 
+use matrix_sdk::ruma::{OwnedRoomId, RoomId};
+
 /// What the user passed as ROOM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomArg {
-    /// `!opaque:server`
-    Id(String),
+    /// Anything ruma parses as a room id: `!opaque:server`, or `!hash`
+    /// without a server part (room version 12). It may still be a room name
+    /// that starts with `!`; the caller falls back to name matching when no
+    /// joined room has this id.
+    Id(OwnedRoomId),
     /// `#alias:server`
     Alias(String),
     /// Anything else: a display name, matched case-insensitively.
@@ -13,8 +18,12 @@ pub enum RoomArg {
 
 pub fn classify(arg: &str) -> RoomArg {
     let arg = arg.trim();
-    if arg.starts_with('!') && arg.contains(':') {
-        RoomArg::Id(arg.to_owned())
+    if let Some(id) = arg
+        .starts_with('!')
+        .then(|| RoomId::parse(arg).ok())
+        .flatten()
+    {
+        RoomArg::Id(id)
     } else if arg.starts_with('#') && arg.contains(':') {
         RoomArg::Alias(arg.to_owned())
     } else {
@@ -41,7 +50,7 @@ mod tests {
     fn classifies_ids_aliases_and_names() {
         assert_eq!(
             classify("!abc:example.org"),
-            RoomArg::Id("!abc:example.org".into())
+            RoomArg::Id(RoomId::parse("!abc:example.org").unwrap())
         );
         assert_eq!(
             classify("#ops:example.org"),
@@ -52,10 +61,26 @@ mod tests {
     }
 
     #[test]
-    fn sigil_without_server_is_a_name() {
+    fn alias_sigil_without_server_is_a_name() {
         // "#general" is how people write a room name, not a full alias.
         assert_eq!(classify("#general"), RoomArg::Name("#general".into()));
-        assert_eq!(classify("!wow"), RoomArg::Name("!wow".into()));
+    }
+
+    #[test]
+    fn room_id_without_server_is_an_id() {
+        // Room version 12 ids have no server part: "!" plus a hash. A name
+        // starting with "!" also lands here; resolve_room falls back to name
+        // matching when no joined room has that id.
+        let v12 = "!31hneApxJ_1o-63DmFrpeqnkFfWppnzWso1JvH3ogLM";
+        assert_eq!(classify(v12), RoomArg::Id(RoomId::parse(v12).unwrap()));
+        assert_eq!(
+            classify("!wow"),
+            RoomArg::Id(RoomId::parse("!wow").unwrap())
+        );
+        // The ambiguous-name error lists room ids as RoomId displays them;
+        // each one must come back as an id.
+        let listed = RoomId::parse(v12).unwrap().to_string();
+        assert!(matches!(classify(&listed), RoomArg::Id(_)));
     }
 
     #[test]

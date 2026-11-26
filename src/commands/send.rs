@@ -118,9 +118,11 @@ where
             )),
         )),
         (Err(err), Ok(())) => Err(anyhow::Error::new(err).context("sending failed")),
-        (Err(err), Err(discard)) => Err(anyhow::Error::new(err).context(format!(
-            "sending failed, and discarding the room key shared with unverified devices failed too ({discard})"
-        ))),
+        (Err(err), Err(discard)) => Err(err).with_context(|| {
+            format!(
+                "sending failed, and discarding the room key shared with unverified devices failed too ({discard})"
+            )
+        }),
     }
 }
 

@@ -200,17 +200,17 @@ pub fn stash_refusal(paths: &Paths) -> String {
     );
     if paths.session_file().exists() {
         format!(
-            "a previous session is still kept aside in {listed} by an interrupted `login --force`; to put it back, run `matrix-e2ee-cli logout` (logs out the current device) and then `matrix-e2ee-cli login --restore-previous`; to keep the current session and drop the previous one, run: {drop_cmd}"
+            "a previous session is still kept aside in {listed} by an interrupted login; to put it back, run `matrix-e2ee-cli logout` (logs out the current device) and then `matrix-e2ee-cli login --restore-previous`; to keep the current session and drop the previous one, run: {drop_cmd}"
         )
     } else {
         format!(
-            "a previous session is still kept aside in {listed} by an interrupted `login --force`; to put it back, run `matrix-e2ee-cli login --restore-previous`; to drop it, run: {drop_cmd}"
+            "a previous session is still kept aside in {listed} by an interrupted login; to put it back, run `matrix-e2ee-cli login --restore-previous`; to drop it, run: {drop_cmd}"
         )
     }
 }
 
 /// Move an existing session file and store aside (`*.prev`), so a failed
-/// `login --force` can put them back. Refuses when a stash already exists:
+/// login can put them back. Refuses when a stash already exists:
 /// it is the only copy of an earlier session.
 pub fn stash_local_state(paths: &Paths) -> Result<()> {
     if !existing_stash(paths).is_empty() {
@@ -244,8 +244,8 @@ pub fn restore_stash(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// `login --restore-previous`: put a stash left by an interrupted
-/// `login --force` back. Refuses while a session file exists, because that
+/// `login --restore-previous`: put a stash left by an interrupted login
+/// back. Refuses while a session file exists, because that
 /// session's device would be lost. A store without a session file is unusable
 /// (its passphrase was in the session file) and is replaced only when its own
 /// stash exists.
@@ -260,9 +260,9 @@ pub fn restore_previous(paths: &Paths) -> Result<()> {
 }
 
 /// Undo the local side of a failed login: delete what the attempt left and
-/// put the stash back. Always tries both steps and returns the login error,
-/// with any cleanup failure attached as context.
-pub fn rollback_failed_login(paths: &Paths, err: anyhow::Error) -> anyhow::Error {
+/// put the stash back. Always tries both steps and returns the login error
+/// (always `Err`), with any cleanup failure attached as context.
+pub fn rollback_failed_login<T>(paths: &Paths, err: anyhow::Error) -> Result<T> {
     let cleanup = delete_local_state(paths);
     let restore = restore_stash(paths);
     let problems: Vec<String> = [cleanup.err(), restore.err()]
@@ -271,20 +271,24 @@ pub fn rollback_failed_login(paths: &Paths, err: anyhow::Error) -> anyhow::Error
         .map(|e| format!("{e:#}"))
         .collect();
     if problems.is_empty() {
-        err
+        Err(err)
     } else if existing_stash(paths).is_empty() {
         // Nothing is kept aside any more: report what failed, no guidance
         // about a stash that does not exist.
-        err.context(format!(
-            "cleaning up after the failed login failed: {}",
-            problems.join("; ")
-        ))
+        Err(err).with_context(|| {
+            format!(
+                "cleaning up after the failed login failed: {}",
+                problems.join("; ")
+            )
+        })
     } else {
-        err.context(format!(
-            "the previous session could not be fully put back ({}); {}",
-            problems.join("; "),
-            stash_refusal(paths)
-        ))
+        Err(err).with_context(|| {
+            format!(
+                "the previous session could not be fully put back ({}); {}",
+                problems.join("; "),
+                stash_refusal(paths)
+            )
+        })
     }
 }
 
@@ -368,7 +372,9 @@ pub struct Restored {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserIdMatch {
     Same,
-    /// Same server, localparts equal except for letter case.
+    /// Same account, spelled with different letter case in the localpart or
+    /// the server name (both are compared case-insensitively; the port must
+    /// be equal).
     CaseOnly,
     Different,
 }
@@ -380,7 +386,9 @@ pub fn parse_user_id(value: &str, what: &str) -> Result<OwnedUserId> {
 pub fn compare_user_ids(configured: &UserId, other: &UserId) -> UserIdMatch {
     if configured == other {
         UserIdMatch::Same
-    } else if configured.server_name() == other.server_name()
+    } else if configured.server_name().host().to_lowercase()
+        == other.server_name().host().to_lowercase()
+        && configured.server_name().port() == other.server_name().port()
         && configured.localpart().to_lowercase() == other.localpart().to_lowercase()
     {
         UserIdMatch::CaseOnly
@@ -390,7 +398,7 @@ pub fn compare_user_ids(configured: &UserId, other: &UserId) -> UserIdMatch {
 }
 
 /// The session file must belong to the user config.json names; a difference
-/// in the case of the localpart is the same account.
+/// in letter case (localpart or server name) is the same account.
 pub fn check_session_user(config: &Config, session: &SessionFile) -> Result<()> {
     let configured = parse_user_id(&config.user_id, "config.json")?;
     let stored = parse_user_id(&session.user_id, "the session file")?;
@@ -723,6 +731,24 @@ mod tests {
     }
 
     #[test]
+    fn stash_refusal_does_not_blame_login_force() {
+        // A plain login stashes too (a store without a session file), so
+        // the advice must not claim the stash came from `login --force`.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(&tmp);
+        write_state(&paths, &sample(), "old");
+        stash_local_state(&paths).unwrap();
+        let without_session = stash_refusal(&paths);
+        write_state(&paths, &sample(), "newer");
+        let with_session = stash_refusal(&paths);
+        assert_ne!(without_session, with_session);
+        for text in [without_session, with_session] {
+            assert!(text.contains("by an interrupted login;"), "{text}");
+            assert!(!text.contains("--force"), "{text}");
+        }
+    }
+
+    #[test]
     fn crash_between_the_two_renames_keeps_the_unstashed_store() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(&tmp);
@@ -754,7 +780,8 @@ mod tests {
         fs::create_dir_all(paths.session_file().join("x")).unwrap();
         assert!(delete_local_state(&paths).is_err());
 
-        let err = rollback_failed_login(&paths, anyhow::anyhow!("login failed: M_FORBIDDEN"));
+        let err = rollback_failed_login::<()>(&paths, anyhow::anyhow!("login failed: M_FORBIDDEN"))
+            .unwrap_err();
         assert_eq!(err.root_cause().to_string(), "login failed: M_FORBIDDEN");
         let chain = format!("{err:#}");
         assert!(
@@ -790,6 +817,33 @@ mod tests {
         );
         assert_eq!(
             compare_user_ids(&id("@alice:example.org"), &id("@alice:other.org")),
+            UserIdMatch::Different
+        );
+    }
+
+    #[test]
+    fn user_ids_differing_in_server_name_case_match() {
+        let id = |s: &str| parse_user_id(s, "test").unwrap();
+        assert_eq!(
+            compare_user_ids(&id("@alice:example.org"), &id("@Alice:Example.ORG")),
+            UserIdMatch::CaseOnly
+        );
+        assert_eq!(
+            compare_user_ids(
+                &id("@alice:example.org:8448"),
+                &id("@alice:EXAMPLE.org:8448")
+            ),
+            UserIdMatch::CaseOnly
+        );
+        assert_eq!(
+            compare_user_ids(
+                &id("@alice:example.org:8448"),
+                &id("@alice:Example.org:443")
+            ),
+            UserIdMatch::Different
+        );
+        assert_eq!(
+            compare_user_ids(&id("@alice:example.org"), &id("@alice:example.org:8448")),
             UserIdMatch::Different
         );
 

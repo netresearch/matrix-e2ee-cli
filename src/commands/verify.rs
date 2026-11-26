@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use matrix_sdk::Client;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::encryption::verification::{
-    SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState,
+    Emoji, SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState,
 };
 use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
 use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
@@ -26,20 +26,62 @@ use crate::text::term;
 
 const MATCH_QUESTION: &str = "Do they match exactly?";
 
+/// The emoji (or numbers) to compare, as shown before the question.
+fn comparison_text(emojis: Option<&[Emoji]>, decimals: (u16, u16, u16)) -> String {
+    let mut text = String::from("\n");
+    match emojis {
+        Some(emojis) => {
+            text.push_str("Compare these emoji with the other device:\n");
+            for emoji in emojis {
+                text.push_str(&format!(
+                    "  {}  {}\n",
+                    term(emoji.symbol),
+                    term(emoji.description)
+                ));
+            }
+        }
+        None => text.push_str(&format!(
+            "Compare these numbers: {} {} {}\n",
+            decimals.0, decimals.1, decimals.2
+        )),
+    }
+    text.push('\n');
+    text
+}
+
 /// The emoji confirmation: a person at a terminal, answering after the emoji
-/// appeared (input typed earlier is discarded).
-fn confirm_emoji() -> Result<bool> {
+/// appeared (input typed earlier is discarded). The emoji and the question go
+/// to stderr, the same stream, so a redirected stdout cannot hide the emoji
+/// while the question still asks about them.
+fn confirm_emoji(comparison: &str) -> Result<bool> {
     let stdin = std::io::stdin();
     let is_terminal = stdin.is_terminal();
-    confirm_emoji_on(is_terminal, &mut stdin.lock(), discard_typeahead_stdin)
+    confirm_emoji_on(
+        comparison,
+        is_terminal,
+        &mut stdin.lock(),
+        &mut std::io::stderr(),
+        discard_typeahead_stdin,
+    )
 }
 
 fn confirm_emoji_on(
+    comparison: &str,
     is_terminal: bool,
     input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
     discard_typeahead: impl FnOnce() -> Result<()>,
 ) -> Result<bool> {
-    confirm_fresh_on(MATCH_QUESTION, is_terminal, input, discard_typeahead)
+    output
+        .write_all(comparison.as_bytes())
+        .context("cannot show the emoji")?;
+    confirm_fresh_on(
+        MATCH_QUESTION,
+        is_terminal,
+        input,
+        output,
+        discard_typeahead,
+    )
 }
 
 /// How long a listener waits for the requesting device to start SAS before
@@ -264,32 +306,21 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
         match &state {
             SasState::KeysExchanged { emojis, decimals } if !asked => {
                 asked = true;
-                println!();
-                match emojis {
-                    Some(short) => {
-                        println!("Compare these emoji with the other device:");
-                        for emoji in &short.emojis {
-                            println!("  {}  {}", term(emoji.symbol), term(emoji.description));
+                let comparison =
+                    comparison_text(emojis.as_ref().map(|short| &short.emojis[..]), *decimals);
+                let answer =
+                    match tokio::task::spawn_blocking(move || confirm_emoji(&comparison)).await {
+                        Ok(Ok(answer)) => answer,
+                        Ok(Err(err)) => {
+                            sas.cancel().await.ok();
+                            return Err(err.context("verification cancelled"));
                         }
-                    }
-                    None => println!(
-                        "Compare these numbers: {} {} {}",
-                        decimals.0, decimals.1, decimals.2
-                    ),
-                }
-                println!();
-                let answer = match tokio::task::spawn_blocking(confirm_emoji).await {
-                    Ok(Ok(answer)) => answer,
-                    Ok(Err(err)) => {
-                        sas.cancel().await.ok();
-                        return Err(err.context("verification cancelled"));
-                    }
-                    Err(err) => {
-                        sas.cancel().await.ok();
-                        return Err(anyhow::Error::new(err)
-                            .context("the prompt failed; verification cancelled"));
-                    }
-                };
+                        Err(err) => {
+                            sas.cancel().await.ok();
+                            return Err(anyhow::Error::new(err)
+                                .context("the prompt failed; verification cancelled"));
+                        }
+                    };
                 if answer {
                     sas.confirm()
                         .await
@@ -342,7 +373,7 @@ mod tests {
     #[test]
     fn emoji_confirmation_is_not_taken_from_a_pipe() {
         let mut input = Cursor::new("y\n");
-        let result = confirm_emoji_on(false, &mut input, || Ok(()));
+        let result = confirm_emoji_on("", false, &mut input, &mut Vec::new(), || Ok(()));
         assert!(
             result.is_err(),
             "a piped \"y\" confirmed the emoji: {result:?}"
@@ -354,12 +385,48 @@ mod tests {
     fn emoji_confirmation_discards_typed_ahead_input_first() {
         let mut input = Cursor::new("y\n");
         let mut discarded = false;
-        let answer = confirm_emoji_on(true, &mut input, || {
+        let answer = confirm_emoji_on("", true, &mut input, &mut Vec::new(), || {
             discarded = true;
             Ok(())
         })
         .unwrap();
         assert!(answer);
         assert!(discarded, "typed-ahead input was not discarded");
+    }
+
+    #[test]
+    fn emoji_and_question_go_to_the_same_writer() {
+        let emojis = [
+            Emoji {
+                symbol: "🐶",
+                description: "Dog",
+            },
+            Emoji {
+                symbol: "\u{1b}[2J",
+                description: "Cat",
+            },
+        ];
+        for comparison in [
+            comparison_text(Some(&emojis), (1, 2, 3)),
+            comparison_text(None, (1111, 2222, 3333)),
+        ] {
+            let mut input = Cursor::new("n\n");
+            let mut output = Vec::new();
+            let answer =
+                confirm_emoji_on(&comparison, true, &mut input, &mut output, || Ok(())).unwrap();
+            assert!(!answer);
+            let shown = String::from_utf8(output).unwrap();
+            let question = shown
+                .find(MATCH_QUESTION)
+                .unwrap_or_else(|| panic!("no question in {shown:?}"));
+            let compared = shown
+                .find("Compare these")
+                .unwrap_or_else(|| panic!("no emoji or numbers in {shown:?}"));
+            assert!(compared < question, "{shown:?}");
+        }
+        let text = comparison_text(Some(&emojis), (1, 2, 3));
+        assert!(text.contains("  🐶  Dog\n"), "{text:?}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(comparison_text(None, (1111, 2222, 3333)).contains("1111 2222 3333"));
     }
 }
