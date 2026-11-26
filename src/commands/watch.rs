@@ -3,11 +3,14 @@
 //! opens the store or takes the data-dir lock, so any number of these can run
 //! beside the daemon.
 //!
-//! Two deliberate differences from matrix-watch.py:
-//! - After a rotation, and when it starts following, the reader reads the log
-//!   from its start and prints the records whose `seq` is newer than the
-//!   cursor. matrix-watch.py seeks to the end there, which loses the records
-//!   written between its last read and the (re)open.
+//! The log format is this tool's own (see `roomlog.rs`): matrix-watch.py
+//! cannot follow it. Where the reader works differently from matrix-watch.py:
+//! - When it starts following, the reader first reads the retained
+//!   generation (`.jsonl.1`), then the active log from its start, and prints
+//!   the records whose `seq` is newer than the cursor; after a rotation it
+//!   reads the new log from its start. matrix-watch.py seeks to the end
+//!   there, which loses the records written between its last read and the
+//!   (re)open, and never reads the retained generation.
 //! - A line without its newline is kept until it is complete. matrix-watch.py
 //!   reads it, fails to parse it and drops it, losing that record.
 //!
@@ -29,8 +32,8 @@ use crate::WatchArgs;
 use crate::daemon_client::{REQUEST_TIMEOUT, Reply, request};
 use crate::room_arg::{RoomArg, classify};
 use crate::roomlog::{
-    cursor_path, log_path, parse_line, read_cursor, read_room_pages, seq_of, summarize_since,
-    write_cursor,
+    cursor_path, log_path, parse_line, read_cursor, read_records, read_room_index, rotated, seq_of,
+    summarize_since, write_cursor,
 };
 use crate::session::Paths;
 use crate::text::term;
@@ -144,16 +147,17 @@ fn watches(status: &Value, room_id: &str) -> bool {
         .is_some_and(|rooms| rooms.iter().any(|r| r.as_str() == Some(room_id)))
 }
 
-/// The room id for ROOM without a client: a room id stands for itself; an
-/// alias or a name is looked up in the room pages the daemon writes, by
-/// their title (the `watch_rooms` entry) ignoring case. `None` when no
-/// watched room has that title.
+/// The room id for ROOM without a client: a room id stands for itself (also
+/// one no longer watched, whose log stays); an alias or a name is looked up
+/// in the daemon's current room index (`index.json`) by its title (the
+/// `watch_rooms` entry) ignoring case. `None` when no watched room has that
+/// title.
 pub fn resolve_watched_room(rooms_dir: &Path, arg: &str) -> Option<String> {
     if let RoomArg::Id(id) = classify(arg) {
         return Some(id.to_string());
     }
     let wanted = arg.trim().to_lowercase();
-    read_room_pages(rooms_dir)
+    read_room_index(rooms_dir)
         .into_iter()
         .find(|(_, title)| title.to_lowercase() == wanted)
         .map(|(id, _)| id)
@@ -186,7 +190,8 @@ fn identity(_meta: &fs::Metadata) -> Option<(u64, u64)> {
 }
 
 /// Follows one log by its path across rotation (like `tail -F`), printing
-/// each record newer than the cursor once and advancing the cursor.
+/// each record newer than the cursor once and advancing the cursor. The
+/// first poll reads the retained generation before the active log.
 pub struct Follower {
     log: PathBuf,
     cursor: PathBuf,
@@ -195,6 +200,7 @@ pub struct Follower {
     offset: u64,
     partial: Vec<u8>,
     cursor_written: bool,
+    retained_read: bool,
 }
 
 impl Follower {
@@ -207,6 +213,7 @@ impl Follower {
             offset: 0,
             partial: Vec::new(),
             cursor_written: false,
+            retained_read: false,
         }
     }
 
@@ -214,7 +221,17 @@ impl Follower {
     /// file (rotation) or a shorter one (truncation), after reading what was
     /// left in the old one.
     pub fn poll(&mut self, out: &mut dyn Write) -> Result<()> {
-        if self.file.is_none() && !self.open()? {
+        // The active log is opened before the retained generation is read:
+        // a rotation in between moves what the handle holds to `.1`, where
+        // it is read, and the handle then has nothing newer than the cursor.
+        let opened = self.file.is_some() || self.open()?;
+        if !self.retained_read {
+            self.retained_read = true;
+            for record in read_records(&rotated(&self.log)) {
+                self.emit(out, &record)?;
+            }
+        }
+        if !opened {
             return self.mark_read();
         }
         let replaced = match (fs::metadata(&self.log), &self.file) {
@@ -274,20 +291,25 @@ impl Follower {
         };
         let complete: Vec<u8> = self.partial.drain(..=end).collect();
         for line in complete.split(|b| *b == b'\n') {
-            let Some(record) = parse_line(line) else {
-                continue;
-            };
-            let seq = seq_of(&record);
-            if seq <= self.seen {
-                continue;
+            if let Some(record) = parse_line(line) {
+                self.emit(out, &record)?;
             }
-            if let Some(text) = record.get("text").and_then(Value::as_str) {
-                writeln!(out, "{}", term(text))?;
-            }
-            self.seen = seq;
-            write_cursor(&self.cursor, seq)?;
-            self.cursor_written = true;
         }
+        Ok(())
+    }
+
+    /// Print a record newer than the cursor and advance the cursor to it.
+    fn emit(&mut self, out: &mut dyn Write, record: &Value) -> Result<()> {
+        let seq = seq_of(record);
+        if seq <= self.seen {
+            return Ok(());
+        }
+        if let Some(text) = record.get("text").and_then(Value::as_str) {
+            writeln!(out, "{}", term(text))?;
+        }
+        self.seen = seq;
+        write_cursor(&self.cursor, seq)?;
+        self.cursor_written = true;
         Ok(())
     }
 }
@@ -472,5 +494,80 @@ mod tests {
         );
         assert_eq!(resolve_watched_room(&s.dir, "#it:example.org"), None);
         assert_eq!(resolve_watched_room(&s.dir, "ops"), None);
+    }
+
+    #[test]
+    fn a_reader_resuming_after_rotation_reads_the_retained_generation_first() {
+        let s = setup();
+        for seq in 1..=11 {
+            append(&s.log, seq, &format!("nachricht {seq}"), DEFAULT_MAX_BYTES);
+        }
+        // Rotates: 1 to 11 move to .1, 12 starts the active log.
+        append(&s.log, 12, "nachricht 12", 1);
+        assert!(crate::roomlog::rotated(&s.log).exists());
+        write_cursor(&s.cursor, 10).unwrap();
+        let seen = read_cursor(&s.cursor);
+        assert_eq!(
+            summary_line(&s.log, seen).as_deref(),
+            Some("since last: 2 messages, 0 mentioning you")
+        );
+        let mut f = Follower::new(s.log.clone(), s.cursor.clone(), seen);
+        assert_eq!(printed(&mut f), vec!["nachricht 11", "nachricht 12"]);
+        assert_eq!(read_cursor(&s.cursor), 12);
+        assert!(printed(&mut f).is_empty(), "a record was printed twice");
+        append(&s.log, 13, "nachricht 13", DEFAULT_MAX_BYTES);
+        assert_eq!(printed(&mut f), vec!["nachricht 13"]);
+    }
+
+    #[test]
+    fn a_gap_record_is_printed_as_one_line() {
+        let s = setup();
+        append(&s.log, 1, "eins", DEFAULT_MAX_BYTES);
+        let gap = crate::roomlog::build_gap_record(
+            2,
+            &crate::roomlog::Gap {
+                room_id: "!r:example.org".into(),
+                after: Some(("$e1".into(), 1_786_568_100_000)),
+                before: None,
+                noticed: 1_786_568_100_000,
+            },
+        );
+        append_record(&s.log, &gap, DEFAULT_MAX_BYTES).unwrap();
+        let mut f = Follower::new(s.log.clone(), s.cursor.clone(), 0);
+        let mut out = Vec::new();
+        f.poll(&mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(
+            lines[1].contains("--- gap: events after ")
+                && lines[1].contains(" are missing from this log"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_alias_resolves_through_the_current_index_only() {
+        let s = setup();
+        let ops = "#ops:example.org";
+        write_room_bundle_at(&s.dir, &[("!a:example.org".into(), ops.into())], "STAMP").unwrap();
+        assert_eq!(
+            resolve_watched_room(&s.dir, ops).as_deref(),
+            Some("!a:example.org")
+        );
+        // The alias moved to another room; the page of !a stays behind.
+        write_room_bundle_at(&s.dir, &[("!z:example.org".into(), ops.into())], "STAMP").unwrap();
+        assert_eq!(crate::roomlog::read_room_pages(&s.dir).len(), 2);
+        assert_eq!(
+            resolve_watched_room(&s.dir, ops).as_deref(),
+            Some("!z:example.org"),
+            "the alias resolved through the obsolete page"
+        );
+        // The old room's log stays reachable by its id.
+        assert_eq!(
+            resolve_watched_room(&s.dir, "!a:example.org").as_deref(),
+            Some("!a:example.org")
+        );
+        assert!(!s.dir.join("index.json.tmp").exists());
     }
 }

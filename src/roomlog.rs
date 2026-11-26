@@ -1,9 +1,22 @@
-//! Room event log: slugs, records, append, the room pages and the reader's
-//! cursor. A port of the matrix-skill's `_lib/roomlog.py`: the JSONL
-//! records, the rotation and the room pages (`index.md`, `<slug>.md`) are
-//! byte-compatible with what it writes, so the skill's readers can follow a
-//! log this tool writes. `tests/fixtures/roomlog/expected.json` holds lines
-//! the Python module wrote; the tests compare against them.
+//! Room event log: file names, records, append, the room pages and the
+//! reader's cursor. Started as a port of the matrix-skill's
+//! `_lib/roomlog.py` and no longer byte-compatible with it: the skill's
+//! readers cannot follow a log this tool writes.
+//!
+//! - Every file of a room is named after its stem, the readable slug of the
+//!   room id, `-` and the first 12 hex digits of the SHA-256 of the exact
+//!   room id (`a_b_example.org-0123456789ab`): `<stem>.jsonl`, its rotated
+//!   generation `<stem>.jsonl.1`, the reader cursors
+//!   `<stem>.<name>.cursor` and the room page `<stem>.md`. The slug alone
+//!   is not unique (`!a+b:…` and `!a_b:…` share it).
+//! - Besides the event records, a log holds `gap` records: events the
+//!   server left out of a sync that could not be fetched afterwards.
+//! - `index.json` beside `index.md` lists the rooms the daemon watches now;
+//!   only it resolves an alias. Pages of rooms no longer watched stay.
+//!
+//! The event records still have roomlog.py's shape:
+//! `tests/fixtures/roomlog/expected.json` holds lines the Python module
+//! wrote, and the tests compare against them.
 
 // The writing half serves the watch daemon, which exists on Unix only.
 #![cfg_attr(not(unix), allow(dead_code))]
@@ -52,9 +65,19 @@ fn shorten(s: String, limit: usize) -> String {
 }
 
 /// Filename-safe form of a room id: without the leading `!`, every character
-/// outside `[A-Za-z0-9._-]` replaced by `_`.
+/// outside `[A-Za-z0-9._-]` replaced by `_`. Readable, not unique.
 pub fn room_slug(room_id: &str) -> String {
     safe_name(room_id.trim_start_matches('!'))
+}
+
+/// The name every file of a room starts with: the slug, `-` and the first
+/// 12 hex digits of the SHA-256 of the exact room id, so two rooms whose
+/// slugs agree still get files of their own.
+pub fn room_file_stem(room_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(room_id.as_bytes());
+    let hash: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{hash}", room_slug(room_id))
 }
 
 fn safe_name(s: &str) -> String {
@@ -293,6 +316,71 @@ fn render_text(record: &Record, subject: Option<&str>, hh_mm: &dyn Fn(i64) -> St
     }
 }
 
+/// Events missing from a log: the server left them out of a sync (a
+/// limited timeline) and they could not be fetched afterwards. `after` is
+/// the last event logged before them, `before` the first logged after
+/// them, each as (event id, ms since the epoch) when known.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Gap {
+    pub room_id: String,
+    pub after: Option<(String, i64)>,
+    pub before: Option<(String, i64)>,
+    /// When the gap was noticed, ms since the epoch.
+    pub noticed: i64,
+}
+
+/// The record of a [`Gap`]. It has no `event_id` (it is no event) and its
+/// own `type`, `gap`; `ts` is the time of the first event after the gap,
+/// or when it was noticed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GapRecord {
+    pub seq: i64,
+    pub ts: i64,
+    pub room_id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub after_event_id: Option<String>,
+    pub after_ts: Option<i64>,
+    pub before_event_id: Option<String>,
+    pub before_ts: Option<i64>,
+    pub text: String,
+}
+
+/// The `type` of a gap record.
+pub const GAP: &str = "gap";
+
+/// A gap's record; its line in local time.
+pub fn build_gap_record(seq: i64, gap: &Gap) -> GapRecord {
+    build_gap_record_with(seq, gap, &local_hh_mm)
+}
+
+/// [`build_gap_record`] with the clock rendering given (tests use UTC).
+pub fn build_gap_record_with(seq: i64, gap: &Gap, hh_mm: &dyn Fn(i64) -> String) -> GapRecord {
+    let ts = gap.before.as_ref().map_or(gap.noticed, |(_, ts)| *ts);
+    let span = match (&gap.after, &gap.before) {
+        (Some((_, a)), Some((_, b))) => {
+            format!("events after {} and before {}", hh_mm(*a), hh_mm(*b))
+        }
+        (Some((_, a)), None) => format!("events after {}", hh_mm(*a)),
+        (None, Some((_, b))) => format!("events before {}", hh_mm(*b)),
+        (None, None) => "events".to_owned(),
+    };
+    GapRecord {
+        seq,
+        ts,
+        room_id: gap.room_id.clone(),
+        kind: GAP,
+        after_event_id: gap.after.as_ref().map(|(id, _)| id.clone()),
+        after_ts: gap.after.as_ref().map(|(_, ts)| *ts),
+        before_event_id: gap.before.as_ref().map(|(id, _)| id.clone()),
+        before_ts: gap.before.as_ref().map(|(_, ts)| *ts),
+        text: format!(
+            "[{}] --- gap: {span} are missing from this log; the server left them out and they could not be fetched ---",
+            hh_mm(ts)
+        ),
+    }
+}
+
 /// The event a record applies to: a reaction's target or a redaction's.
 #[cfg(test)]
 pub fn target_of(record: &Value) -> Option<&str> {
@@ -369,11 +457,11 @@ impl SubjectIndex {
     }
 }
 
-/// `<rooms_dir>/<slug>.jsonl`; creates `rooms_dir`.
+/// `<rooms_dir>/<stem>.jsonl`; creates `rooms_dir`.
 pub fn log_path(rooms_dir: &Path, room_id: &str) -> Result<PathBuf> {
     fs::create_dir_all(rooms_dir)
         .with_context(|| format!("cannot create {}", rooms_dir.display()))?;
-    Ok(rooms_dir.join(format!("{}.jsonl", room_slug(room_id))))
+    Ok(rooms_dir.join(format!("{}.jsonl", room_file_stem(room_id))))
 }
 
 /// The one retained previous generation of a log.
@@ -411,6 +499,66 @@ pub fn seq_of(record: &Value) -> i64 {
     record.get("seq").and_then(Value::as_i64).unwrap_or(0)
 }
 
+/// How many event ids per room [`LoggedEvents`] keeps.
+pub const LOGGED_IDS_SIZE: usize = 1000;
+
+/// The events most recently logged for a room: where a back-fill stops.
+/// Daemon notices (`$daemon-...`) and gap records are left out, and a
+/// correction (an id logged again) keeps the first place and `last`.
+#[derive(Debug, Clone, Default)]
+pub struct LoggedEvents {
+    order: VecDeque<String>,
+    ids: HashSet<String>,
+    last: Option<(String, i64)>,
+}
+
+impl LoggedEvents {
+    /// Seeded from both generations of a log, oldest first.
+    pub fn from_log(path: &Path) -> Self {
+        let mut logged = Self::default();
+        for record in [rotated(path), path.to_path_buf()]
+            .iter()
+            .flat_map(|p| read_records(p))
+        {
+            logged.remember(&record);
+        }
+        logged
+    }
+
+    pub fn remember(&mut self, record: &Value) {
+        if record.get("type").and_then(Value::as_str) == Some(GAP) {
+            return;
+        }
+        let Some(event_id) = record
+            .get("event_id")
+            .and_then(Value::as_str)
+            .filter(|e| !e.is_empty() && !e.starts_with("$daemon-"))
+        else {
+            return;
+        };
+        if !self.ids.insert(event_id.to_owned()) {
+            return;
+        }
+        self.order.push_back(event_id.to_owned());
+        let ts = record.get("ts").and_then(Value::as_i64).unwrap_or(0);
+        self.last = Some((event_id.to_owned(), ts));
+        if self.order.len() > LOGGED_IDS_SIZE
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.ids.remove(&oldest);
+        }
+    }
+
+    pub fn contains(&self, event_id: &str) -> bool {
+        self.ids.contains(event_id)
+    }
+
+    /// The newest event logged (id and ts); `None` before the first.
+    pub fn last(&self) -> Option<&(String, i64)> {
+        self.last.as_ref()
+    }
+}
+
 /// One past the highest seq, counting the rotated generation too.
 pub fn next_seq(path: &Path) -> i64 {
     [rotated(path), path.to_path_buf()]
@@ -427,7 +575,7 @@ pub fn next_seq(path: &Path) -> i64 {
 /// mid-line): the new record starts on a line of its own, so the torn one
 /// does not swallow it. roomlog.py has no such guard; for a log that ends in
 /// a newline the bytes written are the same.
-pub fn append_record(path: &Path, record: &Record, max_bytes: u64) -> Result<()> {
+pub fn append_record<T: Serialize>(path: &Path, record: &T, max_bytes: u64) -> Result<()> {
     if fs::metadata(path).is_ok_and(|m| m.len() >= max_bytes) {
         fs::rename(path, rotated(path))
             .with_context(|| format!("cannot rotate {}", path.display()))?;
@@ -463,7 +611,11 @@ fn ends_torn(file: &mut fs::File) -> std::io::Result<bool> {
 pub fn cursor_path(rooms_dir: &Path, room_id: &str, name: &str) -> Result<PathBuf> {
     fs::create_dir_all(rooms_dir)
         .with_context(|| format!("cannot create {}", rooms_dir.display()))?;
-    Ok(rooms_dir.join(format!("{}.{}.cursor", room_slug(room_id), safe_name(name))))
+    Ok(rooms_dir.join(format!(
+        "{}.{}.cursor",
+        room_file_stem(room_id),
+        safe_name(name)
+    )))
 }
 
 /// The last seq this reader saw; 0 when there is none or it is damaged.
@@ -487,11 +639,14 @@ pub struct Summary {
     /// Distinct events that mention the user in any of their records.
     pub mentions: u64,
     pub last_seq: i64,
-    /// The oldest record left is newer than the cursor: the counts are a
-    /// lower bound, rotation carried the rest away.
+    /// The counts are a lower bound: the oldest record left is newer than
+    /// the cursor (rotation carried the rest away), or a gap record after
+    /// the cursor says events are missing.
     pub truncated: bool,
 }
 
+/// What arrived after `seq`, over both generations of the log (the
+/// rotated one first). A gap record counts as no message.
 pub fn summarize_since(log: &Path, seq: i64) -> Summary {
     let mut summary = Summary {
         total: 0,
@@ -502,11 +657,17 @@ pub fn summarize_since(log: &Path, seq: i64) -> Summary {
     let mut oldest_seen = None;
     let mut counted: HashSet<String> = HashSet::new();
     let mut mentioned: HashSet<String> = HashSet::new();
-    for record in read_records(log) {
+    let mut gap = false;
+    for record in [rotated(log), log.to_path_buf()]
+        .iter()
+        .flat_map(|p| read_records(p))
+    {
         let record_seq = seq_of(&record);
         oldest_seen.get_or_insert(record_seq);
         summary.last_seq = summary.last_seq.max(record_seq);
-        if record_seq > seq {
+        if record_seq > seq && record.get("type").and_then(Value::as_str) == Some(GAP) {
+            gap = true;
+        } else if record_seq > seq {
             let mentions_me = record.get("mentions_me").and_then(Value::as_bool) == Some(true);
             // A record without an event id counts on its own.
             let id = record.get("event_id").and_then(Value::as_str);
@@ -518,7 +679,7 @@ pub fn summarize_since(log: &Path, seq: i64) -> Summary {
             }
         }
     }
-    summary.truncated = seq != 0 && oldest_seen.is_some_and(|o| o > seq + 1);
+    summary.truncated = gap || (seq != 0 && oldest_seen.is_some_and(|o| o > seq + 1));
     summary
 }
 
@@ -533,7 +694,8 @@ fn iso_now() -> String {
 }
 
 /// Describe the watched rooms (room id, label) as an OKF bundle: one page per
-/// room and an index, as roomlog.py's `write_room_bundle` writes them.
+/// room, `index.md`, and last `index.json`, the machine-readable list of
+/// the rooms watched now (see [`read_room_index`]).
 pub fn write_room_bundle(directory: &Path, rooms: &[(String, String)]) -> Result<()> {
     write_room_bundle_at(directory, rooms, &iso_now())
 }
@@ -548,27 +710,82 @@ pub fn write_room_bundle_at(
     let mut sorted: Vec<&(String, String)> = rooms.iter().collect();
     sorted.sort_by(|a, b| a.1.cmp(&b.1));
     let mut entries = Vec::new();
+    let mut listed = Vec::new();
     for (room_id, label) in sorted {
-        let slug = room_slug(room_id);
-        let description = format!("Matrix room {label}, watched by matrix-watchd.");
+        let stem = room_file_stem(room_id);
+        let description = format!("Matrix room {label}, watched by matrix-e2ee-cli watch-daemon.");
         let page = format!(
-            "---\ntype: matrix-room\ntitle: {label}\ndescription: {description}\nresource: matrix:roomid/{}\ntags: [matrix, room, watched]\ntimestamp: {stamp}\n---\n\n# {label}\n\nRoom ID `{room_id}`. Events are appended to `{slug}.jsonl`;\nfollow them with `matrix-watch.py`.\n",
+            "---\ntype: matrix-room\ntitle: {label}\ndescription: {description}\nresource: matrix:roomid/{}\ntags: [matrix, room, watched]\ntimestamp: {stamp}\n---\n\n# {label}\n\nRoom ID `{room_id}`. Events are appended to `{stem}.jsonl`;\nfollow them with `matrix-e2ee-cli watch`.\n",
             room_id.trim_start_matches('!')
         );
-        let path = directory.join(format!("{slug}.md"));
+        let path = directory.join(format!("{stem}.md"));
         fs::write(&path, page).with_context(|| format!("cannot write {}", path.display()))?;
-        entries.push(format!("- [{label}]({slug}.md) - {description}"));
+        entries.push(format!("- [{label}]({stem}.md) - {description}"));
+        listed.push(IndexedRoom {
+            room_id: room_id.clone(),
+            title: label.clone(),
+            file: format!("{stem}.jsonl"),
+        });
     }
     let index = format!(
-        "# Watched rooms\n\nWritten by `matrix-watchd.py`. Each room's events are in the `.jsonl` file next to its page.\n\n{}\n",
+        "# Watched rooms\n\nWritten by `matrix-e2ee-cli watch-daemon`. Each room's events are in the `.jsonl` file next to its page.\n\n{}\n",
         entries.join("\n")
     );
     let path = directory.join("index.md");
-    fs::write(&path, index).with_context(|| format!("cannot write {}", path.display()))
+    fs::write(&path, index).with_context(|| format!("cannot write {}", path.display()))?;
+    let mut json = serde_json::to_string(&RoomIndex { rooms: listed })
+        .context("cannot serialize the room index")?;
+    json.push('\n');
+    write_atomically(&directory.join(ROOM_INDEX), json.as_bytes())
+}
+
+/// The machine-readable list of the watched rooms, next to `index.md`.
+pub const ROOM_INDEX: &str = "index.json";
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct RoomIndex {
+    rooms: Vec<IndexedRoom>,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct IndexedRoom {
+    room_id: String,
+    title: String,
+    /// The room's log, relative to the index.
+    file: String,
+}
+
+/// Write `path` through a temporary file in the same directory and a
+/// rename, so a reader sees the old content or the new, never a part.
+fn write_atomically(path: &Path, content: &[u8]) -> Result<()> {
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    fs::write(&temp, content).with_context(|| format!("cannot write {}", temp.display()))?;
+    fs::rename(&temp, path).with_context(|| format!("cannot replace {}", path.display()))
+}
+
+/// Room id and title of each room the daemon watches now, from
+/// `index.json`; empty when there is none or it is damaged. Pages of rooms
+/// that are no longer watched do not count.
+pub fn read_room_index(directory: &Path) -> Vec<(String, String)> {
+    fs::read(directory.join(ROOM_INDEX))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<RoomIndex>(&bytes).ok())
+        .map(|index| {
+            index
+                .rooms
+                .into_iter()
+                .map(|r| (r.room_id, r.title))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Room id and title of each room page in `directory`, read from the
-/// frontmatter (`title:` and `resource: matrix:roomid/...`).
+/// frontmatter (`title:` and `resource: matrix:roomid/...`). Every page
+/// ever written, also of rooms no longer watched: not for alias lookup.
+#[cfg(test)]
 pub fn read_room_pages(directory: &Path) -> Vec<(String, String)> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
@@ -655,7 +872,9 @@ mod tests {
         serde_json::to_value(r).unwrap()
     }
 
-    // --- byte compatibility with roomlog.py ---------------------------------
+    // --- the record shape roomlog.py writes ----------------------------------
+    // The records are still the lines the Python module wrote (the file names,
+    // the room pages and the gap records are this tool's own).
 
     fn golden() -> Value {
         serde_json::from_str(include_str!("../tests/fixtures/roomlog/expected.json")).unwrap()
@@ -784,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn room_pages_are_byte_identical_to_roomlog_py() {
+    fn room_pages_have_the_bundle_format() {
         let dir = tempfile::tempdir().unwrap();
         let rooms = vec![
             ("!a:example.org".to_owned(), "#ops:example.org".to_owned()),
@@ -792,26 +1011,48 @@ mod tests {
             ("!c:example.org".to_owned(), "!c:example.org".to_owned()),
         ];
         write_room_bundle_at(dir.path(), &rooms, "STAMP").unwrap();
-        let expected = golden();
-        let files = expected["files"].as_object().unwrap();
         let mut written: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         written.sort();
-        assert_eq!(written, files.keys().cloned().collect::<Vec<_>>());
-        for (name, content) in files {
-            assert_eq!(
-                fs::read_to_string(dir.path().join(name)).unwrap(),
-                content.as_str().unwrap(),
-                "{name}"
-            );
-        }
-        assert_eq!(read_room_pages(dir.path()), {
-            let mut r = rooms.clone();
-            r.sort();
-            r
-        });
+        assert_eq!(
+            written,
+            [
+                "a_example.org-c372f7da2d38.md",
+                "b_example.org-0c9bd274a481.md",
+                "c_example.org-5086bb002d42.md",
+                "index.json",
+                "index.md",
+            ]
+        );
+        let read = |name: &str| fs::read_to_string(dir.path().join(name)).unwrap();
+        assert_eq!(
+            read("a_example.org-c372f7da2d38.md"),
+            "---\ntype: matrix-room\ntitle: #ops:example.org\ndescription: Matrix room #ops:example.org, watched by matrix-e2ee-cli watch-daemon.\nresource: matrix:roomid/a:example.org\ntags: [matrix, room, watched]\ntimestamp: STAMP\n---\n\n# #ops:example.org\n\nRoom ID `!a:example.org`. Events are appended to `a_example.org-c372f7da2d38.jsonl`;\nfollow them with `matrix-e2ee-cli watch`.\n"
+        );
+        assert_eq!(
+            read("index.md"),
+            "# Watched rooms\n\nWritten by `matrix-e2ee-cli watch-daemon`. Each room's events are in the `.jsonl` file next to its page.\n\n\
+             - [!c:example.org](c_example.org-5086bb002d42.md) - Matrix room !c:example.org, watched by matrix-e2ee-cli watch-daemon.\n\
+             - [#it:example.org](b_example.org-0c9bd274a481.md) - Matrix room #it:example.org, watched by matrix-e2ee-cli watch-daemon.\n\
+             - [#ops:example.org](a_example.org-c372f7da2d38.md) - Matrix room #ops:example.org, watched by matrix-e2ee-cli watch-daemon.\n"
+        );
+        assert_eq!(
+            read("index.json"),
+            concat!(
+                r##"{"rooms":[{"room_id":"!c:example.org","title":"!c:example.org","file":"c_example.org-5086bb002d42.jsonl"},"##,
+                r##"{"room_id":"!b:example.org","title":"#it:example.org","file":"b_example.org-0c9bd274a481.jsonl"},"##,
+                r##"{"room_id":"!a:example.org","title":"#ops:example.org","file":"a_example.org-c372f7da2d38.jsonl"}]}"##,
+                "\n"
+            )
+        );
+        let mut sorted = rooms.clone();
+        sorted.sort();
+        assert_eq!(read_room_pages(dir.path()), sorted);
+        let mut indexed = read_room_index(dir.path());
+        indexed.sort();
+        assert_eq!(indexed, sorted);
     }
 
     #[test]
@@ -1052,7 +1293,7 @@ mod tests {
         assert!(rotated(&l.path).exists());
         assert_eq!(
             rotated(&l.path).file_name().unwrap(),
-            "r_example.org.jsonl.1"
+            "r_example.org-7802310a0a60.jsonl.1"
         );
         assert_eq!(next_seq(&l.path), 7);
     }
@@ -1137,7 +1378,10 @@ mod tests {
         write_cursor(&path, 3).unwrap();
         assert_eq!(read_cursor(&path), 3);
         assert_eq!(fs::read_to_string(&path).unwrap(), "3\n");
-        assert_eq!(path.file_name().unwrap(), "r_example.org.default.cursor");
+        assert_eq!(
+            path.file_name().unwrap(),
+            "r_example.org-7802310a0a60.default.cursor"
+        );
     }
 
     #[test]
@@ -1147,7 +1391,10 @@ mod tests {
         let b = cursor_path(&l.dir, "!r:example.org", "session/B").unwrap();
         write_cursor(&a, 4).unwrap();
         assert_ne!(a, b);
-        assert_eq!(b.file_name().unwrap(), "r_example.org.session_B.cursor");
+        assert_eq!(
+            b.file_name().unwrap(),
+            "r_example.org-7802310a0a60.session_B.cursor"
+        );
         assert_eq!(read_cursor(&b), 0);
     }
 
@@ -1257,8 +1504,16 @@ mod tests {
     #[test]
     fn one_file_per_room_with_the_okf_fields() {
         let dir = bundle();
-        assert!(dir.path().join("b_example.org.md").exists());
-        let text = fs::read_to_string(dir.path().join("a_example.org.md")).unwrap();
+        assert!(
+            dir.path()
+                .join(format!("{}.md", room_file_stem("!b:example.org")))
+                .exists()
+        );
+        let text = fs::read_to_string(
+            dir.path()
+                .join(format!("{}.md", room_file_stem("!a:example.org"))),
+        )
+        .unwrap();
         assert!(text.starts_with("---\n") && text.contains("type: matrix-room"));
         for field in ["title:", "description:", "resource:", "tags:", "timestamp:"] {
             assert!(text.contains(field), "{field}");
@@ -1269,8 +1524,11 @@ mod tests {
     fn index_has_no_frontmatter_and_lists_every_room() {
         let text = fs::read_to_string(bundle().path().join("index.md")).unwrap();
         assert!(!text.starts_with("---"));
-        assert!(text.contains("(a_example.org.md)") && text.contains("(b_example.org.md)"));
-        assert!(text.contains("watched by matrix-watchd"));
+        assert!(
+            text.contains("(a_example.org-c372f7da2d38.md)")
+                && text.contains("(b_example.org-0c9bd274a481.md)")
+        );
+        assert!(text.contains("watched by matrix-e2ee-cli watch-daemon"));
     }
 
     #[test]
@@ -1282,8 +1540,8 @@ mod tests {
         )
         .unwrap();
         let text = fs::read_to_string(dir.path().join("index.md")).unwrap();
-        assert_eq!(text.matches("(a_example.org.md)").count(), 1);
-        assert!(!text.contains("(b_example.org.md)"));
+        assert_eq!(text.matches("(a_example.org-c372f7da2d38.md)").count(), 1);
+        assert!(!text.contains("(b_example.org-0c9bd274a481.md)"));
     }
 
     // --- SelfIsTheDeviceTests ------------------------------------------------
@@ -1588,5 +1846,122 @@ mod tests {
         remember(&mut index, "$c", "4");
         assert_eq!(index.get("$a"), None, "$a was still the oldest entry");
         assert_eq!(index.get("$b"), Some("2"));
+    }
+
+    // --- file names (4712777835) -----------------------------------------------
+
+    #[test]
+    fn rooms_whose_slugs_agree_get_files_of_their_own() {
+        let (plus, underscore) = ("!a+b:example.org", "!a_b:example.org");
+        assert_eq!(room_slug(plus), room_slug(underscore));
+        let dir = tempfile::tempdir().unwrap();
+        assert_ne!(
+            log_path(dir.path(), plus).unwrap(),
+            log_path(dir.path(), underscore).unwrap()
+        );
+        assert_ne!(
+            cursor_path(dir.path(), plus, "default").unwrap(),
+            cursor_path(dir.path(), underscore, "default").unwrap()
+        );
+        // Readable: the slug, then 12 hex digits of SHA-256 over the exact id.
+        assert_eq!(room_file_stem(plus), "a_b_example.org-5bf71c05a203");
+        assert_eq!(room_file_stem(underscore), "a_b_example.org-43b6871733a2");
+        let rooms = vec![
+            (plus.to_owned(), "#plus:example.org".to_owned()),
+            (underscore.to_owned(), "#underscore:example.org".to_owned()),
+        ];
+        write_room_bundle_at(dir.path(), &rooms, "STAMP").unwrap();
+        assert_eq!(
+            read_room_pages(dir.path()).len(),
+            2,
+            "one page overwrote the other"
+        );
+    }
+
+    // --- gap records (4712777805) ----------------------------------------------
+
+    fn gap(after: Option<(&str, i64)>, before: Option<(&str, i64)>) -> GapRecord {
+        build_gap_record_with(
+            7,
+            &Gap {
+                room_id: "!r:example.org".into(),
+                after: after.map(|(id, ts)| (id.to_owned(), ts)),
+                before: before.map(|(id, ts)| (id.to_owned(), ts)),
+                noticed: 1_786_568_100_000,
+            },
+            &utc,
+        )
+    }
+
+    #[test]
+    fn a_gap_record_has_its_own_type_and_one_line() {
+        let rec = gap(
+            Some(("$last", 1_786_560_000_000)),
+            Some(("$next", 1_786_568_040_000)),
+        );
+        assert_eq!(
+            serde_json::to_string(&rec).unwrap(),
+            concat!(
+                r#"{"seq":7,"ts":1786568040000,"room_id":"!r:example.org","type":"gap","#,
+                r#""after_event_id":"$last","after_ts":1786560000000,"#,
+                r#""before_event_id":"$next","before_ts":1786568040000,"#,
+                r#""text":"[20:54] --- gap: events after 18:40 and before 20:54 are missing from this log; the server left them out and they could not be fetched ---"}"#
+            )
+        );
+        let unknown = gap(None, None);
+        assert_eq!(unknown.ts, 1_786_568_100_000);
+        assert_eq!(
+            (unknown.after_event_id, unknown.before_event_id),
+            (None, None)
+        );
+        assert_eq!(
+            unknown.text,
+            "[20:55] --- gap: events are missing from this log; the server left them out and they could not be fetched ---"
+        );
+        assert!(
+            gap(Some(("$l", 1_786_560_000_000)), None)
+                .text
+                .contains("events after 18:40 are")
+        );
+    }
+
+    #[test]
+    fn a_gap_is_no_message_and_makes_the_summary_a_lower_bound() {
+        let l = cursor_log();
+        append_record(&l.path, &gap(Some(("$e5", 0)), None), DEFAULT_MAX_BYTES).unwrap();
+        let s = summarize_since(&l.path, 3);
+        assert_eq!((s.total, s.mentions, s.last_seq), (2, 1, 7));
+        assert!(
+            s.truncated,
+            "a gap after the cursor leaves the count a lower bound"
+        );
+        assert!(!summarize_since(&l.path, 7).truncated);
+    }
+
+    #[test]
+    fn logged_events_skip_notices_gaps_and_corrections() {
+        let l = log();
+        let mut logged = LoggedEvents::default();
+        for (seq, id) in [(1, "$a"), (2, "$daemon-5"), (3, "$b"), (4, "$a")] {
+            let rec = record(
+                seq,
+                Event {
+                    event_id: id.into(),
+                    ts: seq * 10,
+                    ..base_event()
+                },
+            );
+            append_record(&l.path, &rec, DEFAULT_MAX_BYTES).unwrap();
+            logged.remember(&value(&rec));
+        }
+        let gap = gap(None, None);
+        append_record(&l.path, &gap, DEFAULT_MAX_BYTES).unwrap();
+        logged.remember(&serde_json::to_value(&gap).unwrap());
+        for logged in [logged, LoggedEvents::from_log(&l.path)] {
+            assert!(logged.contains("$a") && logged.contains("$b"));
+            assert!(!logged.contains("$daemon-5"));
+            // The correction of $a does not move "last" back to it.
+            assert_eq!(logged.last(), Some(&("$b".to_owned(), 30)));
+        }
     }
 }

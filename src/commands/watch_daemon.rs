@@ -1,9 +1,11 @@
 //! `watch-daemon`: one long-running process that holds this tool's data
 //! directory (and with it the store), syncs, appends every event of the
-//! rooms in config.json's `watch_rooms` to `<data_dir>/rooms/<slug>.jsonl`
-//! and serves send, react, redact and edit on `<data_dir>/daemon.sock`.
-//! A port of the matrix-skill's `matrix-watchd.py`; see
-//! docs/specs/2026-08-13-live-room-awareness.md in that repository.
+//! rooms in config.json's `watch_rooms` to `<data_dir>/rooms/<stem>.jsonl`
+//! (the file names and the record format are in `roomlog.rs`) and serves
+//! send, react, redact and edit on `<data_dir>/daemon.sock`. Started as a
+//! port of the matrix-skill's `matrix-watchd.py` (see
+//! docs/specs/2026-08-13-live-room-awareness.md in that repository); the
+//! logs it writes are no longer readable by that skill's `matrix-watch.py`.
 //!
 //! Unix only: the commands report that the platform is not supported
 //! elsewhere.
@@ -45,10 +47,11 @@ pub mod unix {
     use matrix_sdk::deserialized_responses::{
         AlgorithmInfo, TimelineEvent, TimelineEventKind, UnableToDecryptReason,
     };
+    use matrix_sdk::room::MessagesOptions;
     use matrix_sdk::ruma::api::error::ErrorKind;
     use matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent;
     use matrix_sdk::ruma::serde::Raw;
-    use matrix_sdk::ruma::{OwnedRoomAliasId, RoomId, UserId};
+    use matrix_sdk::ruma::{OwnedRoomAliasId, RoomId, UInt, UserId};
     use matrix_sdk::sync::SyncResponse;
     use matrix_sdk::{Client, Room};
     use serde_json::{Value, json};
@@ -62,8 +65,8 @@ pub mod unix {
     use crate::config::{Config, config_path, load_config, load_watch_rooms};
     use crate::daemon_client::{REQUEST_TIMEOUT, Reply, request_async, running_daemon_pid};
     use crate::roomlog::{
-        DEFAULT_MAX_BYTES, Event, Own, SubjectIndex, append_record, build_record, log_path,
-        next_seq, write_room_bundle,
+        DEFAULT_MAX_BYTES, Event, Gap, LoggedEvents, Own, SubjectIndex, append_record,
+        build_gap_record, build_record, log_path, next_seq, write_room_bundle,
     };
     use crate::session::{
         KeySharing, Paths, close_client, ensure_private_dir, read_existing_session, restore,
@@ -559,7 +562,7 @@ pub mod unix {
             .await;
             match first {
                 Some(Ok(response)) => {
-                    daemon.process(client, &response).await;
+                    daemon.process(client, &response, &stop).await;
                     daemon.last_sync.store(now_ms() / 1000, Ordering::SeqCst);
                 }
                 Some(Err(err)) if !stopped => {
@@ -759,6 +762,20 @@ pub mod unix {
     struct LogState {
         next_seq: HashMap<String, i64>,
         subjects: HashMap<String, SubjectIndex>,
+        logged: HashMap<String, LoggedEvents>,
+    }
+
+    /// What one write appends to a room's log.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Entry {
+        Event(Box<Event>),
+        Gap(Gap),
+    }
+
+    impl From<Event> for Entry {
+        fn from(event: Event) -> Self {
+            Self::Event(Box::new(event))
+        }
     }
 
     /// Writes the room logs: the daemon is their only writer.
@@ -790,11 +807,12 @@ pub mod unix {
             }
         }
 
-        /// Append one event to its room's log. Sequence numbers and subjects
-        /// are read from the log once per room and then kept in memory: the
-        /// daemon is the only writer. True when the record was appended.
-        pub fn record_event(&self, room_id: &str, event: &Event) -> bool {
-            match self.try_record_event(room_id, event) {
+        /// Append one event or gap record to its room's log. Sequence
+        /// numbers, subjects and the logged event ids are read from the log
+        /// once per room and then kept in memory: the daemon is the only
+        /// writer. True when the record was appended.
+        pub fn record_entry(&self, room_id: &str, entry: &Entry) -> bool {
+            match self.try_record_entry(room_id, entry) {
                 Ok(()) => true,
                 Err(err) => {
                     eprintln!("cannot log an event of {room_id}: {err:#}");
@@ -803,7 +821,7 @@ pub mod unix {
             }
         }
 
-        fn try_record_event(&self, room_id: &str, event: &Event) -> Result<()> {
+        fn try_record_entry(&self, room_id: &str, entry: &Entry) -> Result<()> {
             let path = log_path(&self.rooms_dir, room_id)?;
             let mut state = self
                 .log
@@ -813,6 +831,18 @@ pub mod unix {
                 .next_seq
                 .entry(room_id.to_owned())
                 .or_insert_with(|| next_seq(&path));
+            let event = match entry {
+                Entry::Gap(gap) => {
+                    append_record(&path, &build_gap_record(seq, gap), DEFAULT_MAX_BYTES)?;
+                    state.next_seq.insert(room_id.to_owned(), seq + 1);
+                    return Ok(());
+                }
+                Entry::Event(event) => event,
+            };
+            state
+                .logged
+                .entry(room_id.to_owned())
+                .or_insert_with(|| LoggedEvents::from_log(&path));
             let subjects = state
                 .subjects
                 .entry(room_id.to_owned())
@@ -825,14 +855,34 @@ pub mod unix {
             };
             let record = build_record(seq, event, &own, target.and_then(|t| subjects.get(t)));
             append_record(&path, &record, DEFAULT_MAX_BYTES)?;
-            subjects.remember(&serde_json::to_value(&record)?);
+            let value = serde_json::to_value(&record)?;
+            subjects.remember(&value);
+            if let Some(logged) = state.logged.get_mut(room_id) {
+                logged.remember(&value);
+            }
             state.next_seq.insert(room_id.to_owned(), seq + 1);
             Ok(())
         }
+
+        /// The events logged for a room so far; reads the log the first
+        /// time, so call it off the async workers.
+        pub fn logged_events(&self, room_id: &str) -> LoggedEvents {
+            let Ok(path) = log_path(&self.rooms_dir, room_id) else {
+                return LoggedEvents::default();
+            };
+            let Ok(mut state) = self.log.lock() else {
+                return LoggedEvents::default();
+            };
+            state
+                .logged
+                .entry(room_id.to_owned())
+                .or_insert_with(|| LoggedEvents::from_log(&path))
+                .clone()
+        }
     }
 
-    /// The records one write appends, in order: (room id, event).
-    type Records = Vec<(String, Event)>;
+    /// The records one write appends, in order: (room id, entry).
+    type Records = Vec<(String, Entry)>;
 
     struct WriteJob {
         records: Records,
@@ -858,7 +908,7 @@ pub mod unix {
                         let written = job
                             .records
                             .iter()
-                            .map(|(room_id, event)| recorder.record_event(room_id, event))
+                            .map(|(room_id, entry)| recorder.record_entry(room_id, entry))
                             .collect();
                         job.done.send(written).ok();
                     }
@@ -953,21 +1003,39 @@ pub mod unix {
                         body: Some(text.to_owned()),
                         ..Default::default()
                     };
-                    (room_id.clone(), event)
+                    (room_id.clone(), event.into())
                 })
                 .collect();
             self.writer.write(records).await;
         }
 
         /// Log the timeline events a sync delivered for the watched rooms.
-        async fn process(&self, client: &Client, response: &SyncResponse) {
-            let mut batch = Vec::new();
+        /// A limited timeline (the server left events out) is back-filled
+        /// first; what cannot be recovered becomes a gap record.
+        async fn process(
+            &self,
+            client: &Client,
+            response: &SyncResponse,
+            stop: &watch::Receiver<bool>,
+        ) {
+            let mut batch: Records = Vec::new();
             for (room_id, update) in &response.rooms.joined {
                 if !self.watched(room_id.as_str()) {
                     continue;
                 }
                 let room = client.get_room(room_id);
-                for timeline_event in &update.timeline.events {
+                let timeline = &update.timeline;
+                let (recovered, gap) = self
+                    .recover(
+                        timeline.limited,
+                        room.as_ref(),
+                        room_id.as_str(),
+                        timeline.prev_batch.clone(),
+                        stop,
+                    )
+                    .await;
+                let mut events = Vec::new();
+                for timeline_event in recovered.iter().chain(&timeline.events) {
                     if let Some(event) = self
                         .event_of(room.as_ref(), room_id.as_str(), timeline_event)
                         .await
@@ -982,12 +1050,83 @@ pub mod unix {
                                 Instant::now(),
                             );
                         }
-                        batch.push((room_id.to_string(), event));
+                        events.push(event);
                     }
                 }
+                if let Some(after) = gap {
+                    let gap = Gap {
+                        room_id: room_id.to_string(),
+                        after,
+                        before: events.first().map(|e| (e.event_id.clone(), e.ts)),
+                        noticed: now_ms(),
+                    };
+                    batch.push((room_id.to_string(), Entry::Gap(gap)));
+                }
+                batch.extend(events.into_iter().map(|e| (room_id.to_string(), e.into())));
             }
-            // One write per sync, in timeline order, on the writer thread.
+            // One write per sync, in timeline order, on the writer thread:
+            // per room the gap record, the recovered events, the sync's.
             self.writer.write(batch).await;
+        }
+
+        /// For a limited timeline, the events the sync left out (oldest
+        /// first) fetched back from `prev_batch` until an event already
+        /// logged; and `Some(after)`, the last event logged, when they could
+        /// not all be fetched and a gap record goes before them. Nothing for
+        /// a timeline that is not limited or a room with nothing logged yet.
+        /// Bounded by [`BACKFILL_PAGES`] and [`BACKFILL_BUDGET`], and no
+        /// request once the stop has arrived.
+        async fn recover(
+            &self,
+            limited: bool,
+            room: Option<&Room>,
+            room_id: &str,
+            prev_batch: Option<String>,
+            stop: &watch::Receiver<bool>,
+        ) -> (Vec<TimelineEvent>, Option<Option<(String, i64)>>) {
+            let logged = if limited {
+                let recorder = self.recorder.clone();
+                let room_id = room_id.to_owned();
+                tokio::task::spawn_blocking(move || recorder.logged_events(&room_id))
+                    .await
+                    .unwrap_or_default()
+            } else {
+                LoggedEvents::default()
+            };
+            let deadline = tokio::time::Instant::now() + BACKFILL_BUDGET;
+            let fill = fill_gap(
+                limited,
+                logged.last().is_some(),
+                prev_batch,
+                |event: &TimelineEvent| {
+                    event
+                        .event_id()
+                        .is_some_and(|id| logged.contains(id.as_str()))
+                },
+                BACKFILL_PAGES,
+                |from| {
+                    let room = room.cloned();
+                    let mut stop = stop.clone();
+                    async move {
+                        let room = room?;
+                        if *stop.borrow() {
+                            return None;
+                        }
+                        let mut options = MessagesOptions::backward();
+                        options.from = Some(from);
+                        options.limit = UInt::from(BACKFILL_PAGE_SIZE);
+                        let request = tokio::time::timeout_at(deadline, room.messages(options));
+                        let messages = until_stopped(&mut stop, request).await?.ok()?.ok()?;
+                        Some(Page {
+                            events: messages.chunk,
+                            end: messages.end,
+                        })
+                    }
+                },
+            )
+            .await;
+            let gap = fill.gap.then(|| logged.last().cloned());
+            (fill.recovered, gap)
         }
 
         async fn display_name(&self, room: Option<&Room>, sender: &str) -> Option<String> {
@@ -1033,7 +1172,11 @@ pub mod unix {
                 DECRYPTS_PER_ROUND,
                 move |entry| self.attempt(client, entry),
                 |room_id, event| async move {
-                    self.writer.write(vec![(room_id, event)]).await.first() == Some(&true)
+                    self.writer
+                        .write(vec![(room_id, event.into())])
+                        .await
+                        .first()
+                        == Some(&true)
                 },
             )
             .await;
@@ -1225,7 +1368,7 @@ pub mod unix {
                     };
                     let outcome = match result {
                         Ok(response) => {
-                            self.process(client, &response).await;
+                            self.process(client, &response, &stop).await;
                             Ok(())
                         }
                         Err(err) => Err(err),
@@ -1554,6 +1697,79 @@ pub mod unix {
             }
         }
         attempts
+    }
+
+    /// Pages a back-fill fetches at most, [`BACKFILL_PAGE_SIZE`] events each.
+    pub const BACKFILL_PAGES: usize = 5;
+    pub const BACKFILL_PAGE_SIZE: u32 = 100;
+    /// How long one back-fill may take in all.
+    const BACKFILL_BUDGET: Duration = Duration::from_secs(30);
+
+    /// One page of `/messages` backwards: newest first, and the token of
+    /// the page before it (`None` at the start of the room).
+    pub struct Page<E> {
+        pub events: Vec<E>,
+        pub end: Option<String>,
+    }
+
+    /// What a sync's timeline for one room needs before its own events.
+    #[derive(Debug, PartialEq)]
+    pub struct Fill<E> {
+        /// The events the sync left out, oldest first.
+        pub recovered: Vec<E>,
+        /// Not all of them: a gap record goes before `recovered`.
+        pub gap: bool,
+    }
+
+    /// The back-fill decision. A timeline that is not `limited` misses
+    /// nothing, and a room with nothing logged yet (`anchored` false) has
+    /// no place in its log to fill, so neither fetches. Otherwise pages are
+    /// fetched backwards from `prev_batch` until an event `is_logged`: all
+    /// found within `pages` is a complete fill; the bound, the start of the
+    /// room, a failed or refused fetch or no `prev_batch` leave a gap.
+    pub async fn fill_gap<E, L, F, Fut>(
+        limited: bool,
+        anchored: bool,
+        prev_batch: Option<String>,
+        is_logged: L,
+        pages: usize,
+        mut fetch: F,
+    ) -> Fill<E>
+    where
+        L: Fn(&E) -> bool,
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = Option<Page<E>>>,
+    {
+        let mut recovered = Vec::new();
+        if !limited || !anchored {
+            return Fill {
+                recovered,
+                gap: false,
+            };
+        }
+        let mut from = prev_batch;
+        let mut complete = false;
+        'pages: for _ in 0..pages {
+            let Some(token) = from.take() else {
+                break;
+            };
+            let Some(page) = fetch(token).await else {
+                break;
+            };
+            for event in page.events {
+                if is_logged(&event) {
+                    complete = true;
+                    break 'pages;
+                }
+                recovered.push(event);
+            }
+            from = page.end;
+        }
+        recovered.reverse();
+        Fill {
+            recovered,
+            gap: !complete,
+        }
     }
 
     /// What decrypting an undecryptable event again gave.
@@ -2205,6 +2421,190 @@ pub mod unix {
             }
         }
 
+        /// A fetch over canned pages (token -> page), recording the tokens.
+        fn pages_from<'a>(
+            pages: Vec<(&'static str, Vec<&'static str>, Option<&'static str>)>,
+            calls: &'a std::cell::RefCell<Vec<String>>,
+        ) -> impl FnMut(String) -> std::future::Ready<Option<Page<&'static str>>> + 'a {
+            move |from: String| {
+                calls.borrow_mut().push(from.clone());
+                let page =
+                    pages
+                        .iter()
+                        .find(|(token, _, _)| *token == from)
+                        .map(|(_, events, end)| Page {
+                            events: events.clone(),
+                            end: end.map(str::to_owned),
+                        });
+                std::future::ready(page)
+            }
+        }
+
+        #[tokio::test]
+        async fn a_limited_timeline_is_back_filled_up_to_the_last_logged_event() {
+            let calls = std::cell::RefCell::new(Vec::new());
+            // Newest first; $5 is the last event already in the log.
+            let fetch = pages_from(
+                vec![
+                    ("t1", vec!["$9", "$8", "$7"], Some("t2")),
+                    ("t2", vec!["$6", "$5", "$4"], Some("t3")),
+                ],
+                &calls,
+            );
+            let fill = fill_gap(
+                true,
+                true,
+                Some("t1".into()),
+                |e: &&str| *e == "$5",
+                5,
+                fetch,
+            )
+            .await;
+            assert_eq!(
+                fill,
+                Fill {
+                    recovered: vec!["$6", "$7", "$8", "$9"],
+                    gap: false
+                },
+                "back-fill only, oldest first"
+            );
+            assert_eq!(*calls.borrow(), ["t1", "t2"]);
+        }
+
+        #[tokio::test]
+        async fn a_back_fill_that_does_not_reach_the_log_leaves_a_gap() {
+            // The last logged event is not within the bound.
+            let calls = std::cell::RefCell::new(Vec::new());
+            let pages = (1..=9)
+                .map(|n| {
+                    let token: &'static str = Box::leak(format!("t{n}").into_boxed_str());
+                    let next: &'static str = Box::leak(format!("t{}", n + 1).into_boxed_str());
+                    let event: &'static str = Box::leak(format!("$p{n}").into_boxed_str());
+                    (token, vec![event], Some(next))
+                })
+                .collect();
+            let fill = fill_gap(
+                true,
+                true,
+                Some("t1".into()),
+                |e: &&str| *e == "$old",
+                BACKFILL_PAGES,
+                pages_from(pages, &calls),
+            )
+            .await;
+            assert_eq!(
+                fill,
+                Fill {
+                    recovered: vec!["$p5", "$p4", "$p3", "$p2", "$p1"],
+                    gap: true
+                },
+                "back-fill plus a gap record"
+            );
+            assert_eq!(calls.borrow().len(), BACKFILL_PAGES, "the bound");
+
+            // The start of the room, a failed fetch, no prev_batch: a gap too.
+            let calls = std::cell::RefCell::new(Vec::new());
+            let start = pages_from(vec![("t1", vec!["$a"], None)], &calls);
+            let fill = fill_gap(
+                true,
+                true,
+                Some("t1".into()),
+                |e: &&str| *e == "$old",
+                5,
+                start,
+            )
+            .await;
+            assert_eq!((fill.recovered, fill.gap), (vec!["$a"], true));
+            let failed = pages_from(vec![], &calls);
+            let fill = fill_gap(
+                true,
+                true,
+                Some("t1".into()),
+                |e: &&str| *e == "$old",
+                5,
+                failed,
+            )
+            .await;
+            assert_eq!((fill.recovered, fill.gap), (Vec::<&str>::new(), true));
+            let unused = pages_from(vec![], &calls);
+            let fill = fill_gap(true, true, None, |e: &&str| *e == "$old", 5, unused).await;
+            assert!(fill.gap);
+        }
+
+        #[tokio::test]
+        async fn no_back_fill_without_a_limited_timeline_or_a_logged_event() {
+            for (limited, anchored) in [(false, true), (false, false), (true, false)] {
+                let calls = std::cell::RefCell::new(Vec::new());
+                let fetch = pages_from(vec![("t1", vec!["$9"], Some("t2"))], &calls);
+                let fill = fill_gap(
+                    limited,
+                    anchored,
+                    Some("t1".into()),
+                    |_: &&str| false,
+                    5,
+                    fetch,
+                )
+                .await;
+                assert_eq!(
+                    fill,
+                    Fill {
+                        recovered: Vec::new(),
+                        gap: false
+                    },
+                    "limited {limited}, anchored {anchored}"
+                );
+                assert!(
+                    calls.borrow().is_empty(),
+                    "fetched for limited {limited}, anchored {anchored}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn the_writer_appends_a_gap_record_between_events() {
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = Arc::new(Recorder::new(
+                dir.path().to_path_buf(),
+                "@me:e".into(),
+                None,
+                None,
+            ));
+            let writer = LogWriter::start(recorder.clone()).unwrap();
+            let gap = Gap {
+                room_id: "!r:e".into(),
+                after: Some(("$e1".into(), 5)),
+                before: Some(("$e2".into(), 5)),
+                noticed: 9,
+            };
+            assert_eq!(
+                writer
+                    .write(vec![
+                        ("!r:e".into(), text_event(1).into()),
+                        ("!r:e".into(), Entry::Gap(gap)),
+                        ("!r:e".into(), text_event(2).into()),
+                    ])
+                    .await,
+                vec![true, true, true]
+            );
+            writer.close().await;
+            let records = crate::roomlog::read_records(&log_path(dir.path(), "!r:e").unwrap());
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|r| (r["seq"].clone(), r["type"].clone()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (json!(1), json!("m.text")),
+                    (json!(2), json!("gap")),
+                    (json!(3), json!("m.text"))
+                ]
+            );
+            assert_eq!(records[1]["after_event_id"], "$e1");
+            assert_eq!(records[1]["before_event_id"], "$e2");
+            let logged = recorder.logged_events("!r:e");
+            assert_eq!(logged.last(), Some(&("$e2".to_owned(), 5)));
+        }
+
         #[tokio::test]
         async fn the_writer_keeps_the_order_and_finishes_before_close_returns() {
             let dir = tempfile::tempdir().unwrap();
@@ -2220,7 +2620,7 @@ pub mod unix {
                 // Queued, and the wait dropped at once, as a stop does to a
                 // retry round.
                 let waiting = futures_util::FutureExt::now_or_never(
-                    writer.write(vec![("!r:e".into(), text_event(i))]),
+                    writer.write(vec![("!r:e".into(), text_event(i).into())]),
                 );
                 assert!(waiting.is_none() || waiting == Some(vec![true]));
             }
@@ -2236,7 +2636,9 @@ pub mod unix {
                 assert_eq!(record["seq"], json!(i + 1));
             }
             assert_eq!(
-                writer.write(vec![("!r:e".into(), text_event(0))]).await,
+                writer
+                    .write(vec![("!r:e".into(), text_event(0).into())])
+                    .await,
                 vec![false],
                 "a write after close"
             );
@@ -2256,7 +2658,9 @@ pub mod unix {
             )))
             .unwrap();
             assert_eq!(
-                writer.write(vec![("!r:e".into(), text_event(1))]).await,
+                writer
+                    .write(vec![("!r:e".into(), text_event(1).into())])
+                    .await,
                 vec![false]
             );
             writer.close().await;
@@ -2603,7 +3007,7 @@ pub mod unix {
                 true,
             )
             .unwrap();
-            recorder.record_event("!r:e", &utd);
+            recorder.record_entry("!r:e", &utd.clone().into());
             let decrypted = timeline(
                 json!({"event_id": "$e", "sender": "@a:e", "origin_server_ts": 5,
                 "type": "m.room.message", "content": {"msgtype": "m.text", "body": "hallo"}}),
@@ -2611,7 +3015,7 @@ pub mod unix {
             let RetryOutcome::Decrypted(corrected) = retry_outcome(&decrypted) else {
                 panic!("no correction");
             };
-            recorder.record_event("!r:e", &corrected);
+            recorder.record_entry("!r:e", &Entry::Event(corrected.clone()));
             let records = crate::roomlog::read_records(&log_path(dir.path(), "!r:e").unwrap());
             assert_eq!(records.len(), 2);
             assert_eq!(
