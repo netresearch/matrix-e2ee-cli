@@ -88,6 +88,33 @@ pub fn generate_passphrase() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Windows: refuse a data directory outside %USERPROFILE%.
+#[cfg(not(unix))]
+fn check_inside_profile(dir: &Path) -> Result<()> {
+    let profile = std::env::var("USERPROFILE").context("USERPROFILE is not set")?;
+    if !is_inside(dir, Path::new(&profile)) {
+        bail!(
+            "{} is outside {}; on Windows the session must live in the user profile, whose ACL keeps the access token private (unset XDG_DATA_HOME or point it into the profile)",
+            dir.display(),
+            profile
+        );
+    }
+    Ok(())
+}
+
+/// Whether `dir` is `base` or below it, compared component by component and
+/// without case, as Windows paths are.
+#[cfg_attr(unix, allow(dead_code))]
+fn is_inside(dir: &Path, base: &Path) -> bool {
+    let lower = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    let (dir, base) = (lower(dir), lower(base));
+    dir.len() >= base.len() && dir[..base.len()] == base[..]
+}
+
 /// HOME, or USERPROFILE on Windows, where HOME is usually not set.
 pub fn home_dir() -> Option<String> {
     std::env::var("HOME")
@@ -97,8 +124,12 @@ pub fn home_dir() -> Option<String> {
 }
 
 /// Create `dir` (and parents) and restrict it to the owner. On Windows the
-/// directory keeps the ACL it inherits from the user's profile directory.
+/// directory keeps the ACL it inherits from the user's profile directory, so
+/// a directory outside the profile is refused: its ACL may let others read
+/// the access token.
 pub fn ensure_private_dir(dir: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    check_inside_profile(dir)?;
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     #[cfg(unix)]
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
@@ -570,6 +601,20 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         let err = read_session(&path).unwrap_err().to_string();
         assert!(err.contains("chmod 600"), "{err}");
+    }
+
+    #[test]
+    fn is_inside_compares_components_without_case() {
+        assert!(is_inside(
+            Path::new("/Users/Ann/x/y"),
+            Path::new("/users/ann")
+        ));
+        assert!(is_inside(Path::new("/users/ann"), Path::new("/users/ann")));
+        assert!(!is_inside(
+            Path::new("/users/annette/x"),
+            Path::new("/users/ann")
+        ));
+        assert!(!is_inside(Path::new("/tmp/x"), Path::new("/users/ann")));
     }
 
     #[test]
