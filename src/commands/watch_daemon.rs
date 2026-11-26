@@ -154,29 +154,72 @@ pub mod unix {
     /// Stop the daemon that answers on the socket: SIGTERM to the pid its
     /// status answer names, never the pid file's (it may be stale).
     async fn stop_daemon(paths: &Paths) -> Result<()> {
-        let status = status_answer(paths).await?;
+        stop_at(
+            &paths.daemon_socket(),
+            &paths.daemon_pid_file(),
+            &paths.daemon_log(),
+            STOP_WAIT,
+        )
+        .await
+    }
+
+    /// [`stop_daemon`] with one deadline, `limit` from now, for the status
+    /// probe and the wait for the exit. A probe without an answer is no
+    /// answer: the pid file can then still show the daemon exiting, but its
+    /// pid is never signalled.
+    async fn stop_at(socket: &Path, pid_file: &Path, log: &Path, limit: Duration) -> Result<()> {
+        let deadline = Instant::now() + limit;
+        let left = || deadline.saturating_duration_since(Instant::now());
+        // Read before the probe: a stopping daemon may exit, and remove its
+        // pid file, while the probe waits.
+        let before_probe = live_pid_in(pid_file);
+        let mut unanswered = None;
+        let status = match request_async(socket, json!({"op": "status"}), limit).await {
+            Ok(Reply::Answer(answer))
+                if answer.get("ok").and_then(Value::as_bool) == Some(true) =>
+            {
+                Some(answer)
+            }
+            Ok(_) => None,
+            Err(err) => {
+                unanswered = Some(err);
+                None
+            }
+        };
         let Some(pid) = running_daemon_pid(status.as_ref()) else {
-            return match unanswered_pid_file(&paths.daemon_pid_file(), pid_alive) {
-                PidFile::Missing => {
+            return match (unanswered_pid_file(pid_file, pid_alive), unanswered) {
+                (PidFile::Missing | PidFile::Removed, Some(err)) => match before_probe {
+                    Some(pid)
+                        if wait_for_exit(|| pid_alive(pid), left(), Duration::from_millis(100))
+                            .await =>
+                    {
+                        println!("The watch daemon (pid {pid}) was stopping and has exited.");
+                        Ok(())
+                    }
+                    _ => bail!(
+                        "{} took the status request but did not answer ({err:#}), and the pid file names no live process",
+                        socket.display()
+                    ),
+                },
+                (PidFile::Missing, None) => {
                     println!("{NO_DAEMON}");
                     Ok(())
                 }
-                PidFile::Removed => {
+                (PidFile::Removed, None) => {
                     println!("No daemon running (stale pid file removed).");
                     Ok(())
                 }
                 // A daemon that is stopping no longer answers; its pid file
                 // stays until it is gone (it removes the file itself).
-                PidFile::Running(pid) => {
-                    if wait_for_exit(|| pid_alive(pid), STOP_WAIT, Duration::from_millis(100)).await
-                    {
+                (PidFile::Running(pid), _) => {
+                    if wait_for_exit(|| pid_alive(pid), left(), Duration::from_millis(100)).await {
                         println!("The watch daemon (pid {pid}) was stopping and has exited.");
                         return Ok(());
                     }
                     bail!(
                         "pid {pid} from {} is running but does not answer on the socket; the pid file is kept (see {})",
-                        paths.daemon_pid_file().display(),
-                        paths.daemon_log().display()
+                        pid_file.display(),
+                        log.display()
                     )
                 }
             };
@@ -190,22 +233,25 @@ pub mod unix {
             }
             return Err(err).with_context(|| format!("cannot stop the watch daemon (pid {pid})"));
         }
-        // The daemon finishes the operation in flight and its answers first.
-        if !wait_for_exit(|| pid_alive(pid), STOP_WAIT, Duration::from_millis(100)).await {
+        // The daemon finishes the sync and the operation in flight and its
+        // answers first.
+        if !wait_for_exit(|| pid_alive(pid), left(), Duration::from_millis(100)).await {
             bail!(
                 "sent SIGTERM to the watch daemon (pid {pid}), but it has not exited after {} s; it may still be finishing an operation (see {})",
-                STOP_WAIT.as_secs(),
-                paths.daemon_log().display()
+                limit.as_secs(),
+                log.display()
             );
         }
         println!("Stopped the watch daemon (pid {pid}).");
         Ok(())
     }
 
-    /// How long `--stop` waits for the daemon to exit: its shutdown waits
+    /// How long `--stop` waits, the status probe included: the daemon's
+    /// stop waits [`SYNC_DRAIN`] for the sync in flight, then its shutdown
     /// [`OP_WAIT`] for the operation in flight and [`ANSWER_WAIT`] for the
     /// answers.
-    const STOP_WAIT: Duration = Duration::from_secs(OP_WAIT.as_secs() + ANSWER_WAIT.as_secs() + 5);
+    const STOP_WAIT: Duration =
+        Duration::from_secs(SYNC_DRAIN.as_secs() + OP_WAIT.as_secs() + ANSWER_WAIT.as_secs() + 5);
 
     /// The pid file when no daemon answers on the socket.
     #[derive(Debug, PartialEq, Eq)]
@@ -215,6 +261,16 @@ pub mod unix {
         Removed,
         /// Its process exists (`alive`): kept.
         Running(i32),
+    }
+
+    /// The live process the pid file names; the file is left as it is.
+    fn live_pid_in(pid_file: &Path) -> Option<i32> {
+        fs::read_to_string(pid_file)
+            .ok()?
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|pid| *pid > 0 && pid_alive(*pid))
     }
 
     /// Remove the pid file only when `alive` says its process is gone.
@@ -412,22 +468,32 @@ pub mod unix {
             .try_lock()
             .await
             .context("the watch daemon needs the store to itself")?;
+        // From here on a signal stops start-up as well; each early return
+        // still runs the cleanup and releases the lock.
+        let mut stop = stop_on_signals();
         let mut cleanup = Cleanup(vec![paths.daemon_pid_file()]);
         let pid_file = paths.daemon_pid_file();
         tokio::task::spawn_blocking(move || fs::write(pid_file, std::process::id().to_string()))
             .await
             .context("the pid-file task failed")?
             .context("cannot write the pid file")?;
-        let stop = stop_on_signals();
 
+        // Opening the store is not dropped midway.
         let client = restore(&config, &paths, KeySharing::VerifiedOnly)
             .await?
             .client;
+        if *stop.borrow() {
+            return Ok(());
+        }
         let own_user = client
             .user_id()
             .context("the client has no user id")?
             .to_string();
-        let own_display = client.account().get_display_name().await.ok().flatten();
+        let Some(own_display) = until_stopped(&mut stop, client.account().get_display_name()).await
+        else {
+            return Ok(());
+        };
+        let own_display = own_display.ok().flatten();
         // This device's curve25519 key: the only way to tell our own events
         // from those of the person on the same account.
         let own_key = client
@@ -436,37 +502,76 @@ pub mod unix {
             .await
             .map(|k| k.to_base64());
 
-        let rooms = resolve_rooms(&client, &watch_rooms).await;
+        let Some(rooms) = resolve_rooms(&client, &watch_rooms, &mut stop).await else {
+            return Ok(());
+        };
         write_room_bundle(&paths.rooms_dir(), &rooms)?;
 
+        let recorder = Arc::new(Recorder::new(
+            paths.rooms_dir(),
+            own_user,
+            own_display,
+            own_key,
+        ));
         let daemon = Arc::new(Daemon {
             paths: paths.clone(),
             config,
             slot: RwLock::new(Some(client)),
             ops: Mutex::new(()),
             stopping: AtomicBool::new(false),
-            recorder: Recorder::new(paths.rooms_dir(), own_user, own_display, own_key),
+            writer: LogWriter::start(recorder.clone())?,
+            recorder,
             pending: std::sync::Mutex::new(PendingUtds::default()),
             rooms,
             started: Instant::now(),
             last_sync: AtomicI64::new(0),
         });
+        let result = serve_and_sync(&daemon, &paths, stop, &mut cleanup).await;
+        // Every queued log write is done before the lock and the pid file go.
+        daemon.writer.close().await;
+        drop(cleanup);
+        result
+    }
 
+    /// The first sync, then serving the socket beside the sync loop until
+    /// the stop (or until the sync loop ends on an error), then [`shutdown`].
+    async fn serve_and_sync(
+        daemon: &Arc<Daemon>,
+        paths: &Paths,
+        mut stop: watch::Receiver<bool>,
+        cleanup: &mut Cleanup,
+    ) -> Result<()> {
         // One state-carrying sync before anything is served, so the room
-        // list is complete when the first request names a room.
+        // list is complete when the first request names a room. A stop does
+        // not drop it (see [`finish_on_stop`]).
         {
             let guard = daemon.slot.read().await;
             let client = guard.as_ref().context("no client")?;
-            let response = client
-                .sync_once(
+            let (first, stopped) = finish_on_stop(
+                client.sync_once(
                     SyncSettings::default()
                         .full_state(true)
                         .timeout(Duration::from_secs(10)),
-                )
-                .await
-                .context("the first sync failed")?;
-            daemon.process(client, &response).await;
-            daemon.last_sync.store(now_ms() / 1000, Ordering::SeqCst);
+                ),
+                &mut stop,
+                SYNC_DRAIN,
+            )
+            .await;
+            match first {
+                Some(Ok(response)) => {
+                    daemon.process(client, &response).await;
+                    daemon.last_sync.store(now_ms() / 1000, Ordering::SeqCst);
+                }
+                Some(Err(err)) if !stopped => {
+                    return Err(err).context("the first sync failed");
+                }
+                Some(Err(_)) => {}
+                None => eprintln!("{SYNC_ABANDONED}"),
+            }
+        }
+        // Stopped during start-up: the socket is never published.
+        if *stop.borrow() {
+            return Ok(());
         }
 
         let socket = paths.daemon_socket();
@@ -509,7 +614,6 @@ pub mod unix {
         let server = tokio::spawn(serve(listener, handler, shutdown_rx));
         let result = daemon.sync_loop(stop).await;
         shutdown(&daemon.ops, &daemon.stopping, &shutdown_tx, server, OP_WAIT).await;
-        drop(cleanup);
         result
     }
 
@@ -564,15 +668,20 @@ pub mod unix {
 
     /// (room id, label) per `watch_rooms` entry: an alias is resolved and
     /// labelled with itself, a room id with itself; an alias that does not
-    /// resolve is kept as it is (matrix-watchd.py does the same).
-    async fn resolve_rooms(client: &Client, entries: &[String]) -> Vec<(String, String)> {
+    /// resolve is kept as it is (matrix-watchd.py does the same). `None` when
+    /// the stop arrives first.
+    async fn resolve_rooms(
+        client: &Client,
+        entries: &[String],
+        stop: &mut watch::Receiver<bool>,
+    ) -> Option<Vec<(String, String)>> {
         let mut rooms: Vec<(String, String)> = Vec::new();
         for entry in entries {
             let mut room_id = entry.clone();
             if entry.starts_with('#')
                 && let Ok(alias) = OwnedRoomAliasId::try_from(entry.as_str())
             {
-                match client.resolve_room_alias(&alias).await {
+                match until_stopped(stop, client.resolve_room_alias(&alias)).await? {
                     Ok(found) => room_id = found.room_id.to_string(),
                     Err(err) => eprintln!("cannot resolve {entry}: {err}"),
                 }
@@ -587,7 +696,7 @@ pub mod unix {
                 None => rooms.push((room_id, label)),
             }
         }
-        rooms
+        Some(rooms)
     }
 
     /// The handler a connection's request goes to.
@@ -629,9 +738,16 @@ pub mod unix {
         if reader.read_until(b'\n', &mut line).await.is_err() || line.is_empty() {
             return;
         }
-        let response = match serde_json::from_slice::<Value>(&line) {
-            Ok(request) if request.is_object() => handler(request).await,
-            _ => json!({"ok": false, "error": "malformed request"}),
+        let response = if line.last() != Some(&b'\n') {
+            // The end of the stream or MAX_REQUEST came before the newline.
+            // A client whose write failed takes the direct path
+            // (`Reply::NoDaemon`), so carrying this out could do it twice.
+            json!({"ok": false, "error": "incomplete request"})
+        } else {
+            match serde_json::from_slice::<Value>(&line) {
+                Ok(request) if request.is_object() => handler(request).await,
+                _ => json!({"ok": false, "error": "malformed request"}),
+            }
         };
         let mut out = serde_json::to_vec(&response).unwrap_or_default();
         out.push(b'\n');
@@ -643,14 +759,15 @@ pub mod unix {
     struct LogState {
         next_seq: HashMap<String, i64>,
         subjects: HashMap<String, SubjectIndex>,
-        /// Display names seen so far: member state arrives lazily in large rooms.
-        known_names: HashMap<String, String>,
     }
 
     /// Writes the room logs: the daemon is their only writer.
     pub struct Recorder {
         rooms_dir: PathBuf,
         log: std::sync::Mutex<LogState>,
+        /// Display names seen so far: member state arrives lazily in large
+        /// rooms. Apart from `log`, which the writer holds during file I/O.
+        known_names: std::sync::Mutex<HashMap<String, String>>,
         own_user: String,
         own_display: Option<String>,
         own_key: Option<String>,
@@ -666,6 +783,7 @@ pub mod unix {
             Self {
                 rooms_dir,
                 log: std::sync::Mutex::new(LogState::default()),
+                known_names: std::sync::Mutex::new(HashMap::new()),
                 own_user,
                 own_display,
                 own_key,
@@ -674,10 +792,14 @@ pub mod unix {
 
         /// Append one event to its room's log. Sequence numbers and subjects
         /// are read from the log once per room and then kept in memory: the
-        /// daemon is the only writer.
-        pub fn record_event(&self, room_id: &str, event: &Event) {
-            if let Err(err) = self.try_record_event(room_id, event) {
-                eprintln!("cannot log an event of {room_id}: {err:#}");
+        /// daemon is the only writer. True when the record was appended.
+        pub fn record_event(&self, room_id: &str, event: &Event) -> bool {
+            match self.try_record_event(room_id, event) {
+                Ok(()) => true,
+                Err(err) => {
+                    eprintln!("cannot log an event of {room_id}: {err:#}");
+                    false
+                }
             }
         }
 
@@ -709,6 +831,84 @@ pub mod unix {
         }
     }
 
+    /// The records one write appends, in order: (room id, event).
+    type Records = Vec<(String, Event)>;
+
+    struct WriteJob {
+        records: Records,
+        done: tokio::sync::oneshot::Sender<Vec<bool>>,
+    }
+
+    /// The room logs' writer: a thread that appends records in the order
+    /// they were queued. The log I/O (reading the retained generations for a
+    /// room's first event, then an append per event) never runs on an async
+    /// worker, and [`LogWriter::close`] waits for every queued write.
+    pub struct LogWriter {
+        queue: std::sync::Mutex<Option<std::sync::mpsc::Sender<WriteJob>>>,
+        thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    }
+
+    impl LogWriter {
+        pub fn start(recorder: Arc<Recorder>) -> Result<Self> {
+            let (tx, rx) = std::sync::mpsc::channel::<WriteJob>();
+            let thread = std::thread::Builder::new()
+                .name("room-log-writer".into())
+                .spawn(move || {
+                    for job in rx {
+                        let written = job
+                            .records
+                            .iter()
+                            .map(|(room_id, event)| recorder.record_event(room_id, event))
+                            .collect();
+                        job.done.send(written).ok();
+                    }
+                })
+                .context("cannot start the room-log writer")?;
+            Ok(Self {
+                queue: std::sync::Mutex::new(Some(tx)),
+                thread: std::sync::Mutex::new(Some(thread)),
+            })
+        }
+
+        /// Append `records` in order; per record whether it was appended.
+        /// Dropping this future does not cancel the write once it is queued.
+        pub async fn write(&self, records: Records) -> Vec<bool> {
+            let count = records.len();
+            if count == 0 {
+                return Vec::new();
+            }
+            let (done, written) = tokio::sync::oneshot::channel();
+            let queued = self.queue.lock().ok().is_some_and(|queue| {
+                queue
+                    .as_ref()
+                    .is_some_and(|tx| tx.send(WriteJob { records, done }).is_ok())
+            });
+            if !queued {
+                eprintln!("the room-log writer is closed; {count} record(s) not logged");
+                return vec![false; count];
+            }
+            written.await.unwrap_or_else(|_| vec![false; count])
+        }
+
+        /// Take no more writes and wait until every queued one is done. Not
+        /// bounded: releasing the data-dir lock while a write runs would let
+        /// the next daemon append to the same log beside it.
+        pub async fn close(&self) {
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.take();
+            }
+            let thread = self.thread.lock().ok().and_then(|mut thread| thread.take());
+            if let Some(thread) = thread
+                && !matches!(
+                    tokio::task::spawn_blocking(move || thread.join()).await,
+                    Ok(Ok(()))
+                )
+            {
+                eprintln!("the room-log writer failed");
+            }
+        }
+    }
+
     struct Daemon {
         paths: Paths,
         config: Config,
@@ -719,7 +919,9 @@ pub mod unix {
         ops: Mutex<()>,
         /// Set by [`shutdown`]: an operation still queued on `ops` refuses.
         stopping: AtomicBool,
-        recorder: Recorder,
+        recorder: Arc<Recorder>,
+        /// The only way to the room logs.
+        writer: LogWriter,
         /// Events logged as undecryptable, retried for a correction record.
         pending: std::sync::Mutex<PendingUtds>,
         rooms: Vec<(String, String)>,
@@ -733,18 +935,15 @@ pub mod unix {
             self.rooms.iter().any(|(id, _)| id == room_id)
         }
 
-        fn record_event(&self, room_id: &str, event: &Event) {
-            self.recorder.record_event(room_id, event);
-        }
-
         /// A daemon-level message into every watched log: a daemon that dies
         /// quietly looks like a quiet room.
-        fn announce(&self, text: &str) {
-            for (room_id, _) in &self.rooms {
-                let ts = now_ms();
-                self.record_event(
-                    room_id,
-                    &Event {
+        async fn announce(&self, text: &str) {
+            let records = self
+                .rooms
+                .iter()
+                .map(|(room_id, _)| {
+                    let ts = now_ms();
+                    let event = Event {
                         event_id: format!("$daemon-{ts}"),
                         sender: self.recorder.own_user.clone(),
                         sender_display: Some("watch-daemon".into()),
@@ -753,13 +952,16 @@ pub mod unix {
                         kind: "m.notice".into(),
                         body: Some(text.to_owned()),
                         ..Default::default()
-                    },
-                );
-            }
+                    };
+                    (room_id.clone(), event)
+                })
+                .collect();
+            self.writer.write(records).await;
         }
 
         /// Log the timeline events a sync delivered for the watched rooms.
         async fn process(&self, client: &Client, response: &SyncResponse) {
+            let mut batch = Vec::new();
             for (room_id, update) in &response.rooms.joined {
                 if !self.watched(room_id.as_str()) {
                     continue;
@@ -770,7 +972,8 @@ pub mod unix {
                         .event_of(room.as_ref(), room_id.as_str(), timeline_event)
                         .await
                     {
-                        self.record_event(room_id.as_str(), &event);
+                        // In memory only; a retry round runs after this
+                        // batch is written.
                         if let Ok(mut pending) = self.pending.lock() {
                             pending.track(
                                 room_id.as_str(),
@@ -779,9 +982,12 @@ pub mod unix {
                                 Instant::now(),
                             );
                         }
+                        batch.push((room_id.to_string(), event));
                     }
                 }
             }
+            // One write per sync, in timeline order, on the writer thread.
+            self.writer.write(batch).await;
         }
 
         async fn display_name(&self, room: Option<&Room>, sender: &str) -> Option<String> {
@@ -790,13 +996,13 @@ pub mod unix {
                 _ => None,
             };
             let name = member.and_then(|m| m.display_name().map(str::to_owned));
-            let mut state = self.recorder.log.lock().ok()?;
+            let mut known = self.recorder.known_names.lock().ok()?;
             match name {
                 Some(name) => {
-                    state.known_names.insert(sender.to_owned(), name.clone());
+                    known.insert(sender.to_owned(), name.clone());
                     Some(name)
                 }
-                None => state.known_names.get(sender).cloned(),
+                None => known.get(sender).cloned(),
             }
         }
 
@@ -826,7 +1032,9 @@ pub mod unix {
                 Instant::now(),
                 DECRYPTS_PER_ROUND,
                 move |entry| self.attempt(client, entry),
-                |room_id, event| self.record_event(room_id, &event),
+                |room_id, event| async move {
+                    self.writer.write(vec![(room_id, event)]).await.first() == Some(&true)
+                },
             )
             .await;
         }
@@ -999,7 +1207,7 @@ pub mod unix {
                         _ = stop.changed() => return Ok(()),
                     };
                     let Some(client) = guard.as_ref() else {
-                        self.announce("the watch daemon stopped: it could not reopen its store; see daemon.log");
+                        self.announce("the watch daemon stopped: it could not reopen its store; see daemon.log").await;
                         bail!("the store could not be reopened");
                     };
                     // Before each sync, so the first round (for what the
@@ -1009,16 +1217,26 @@ pub mod unix {
                         _ = stop.changed() => return Ok(()),
                     }
                     let settings = SyncSettings::default().timeout(SYNC_TIMEOUT);
-                    tokio::select! {
-                        result = client.sync_once(settings) => match result {
-                            Ok(response) => {
-                                self.process(client, &response).await;
-                                Ok(())
-                            }
-                            Err(err) => Err(err),
-                        },
-                        _ = stop.changed() => return Ok(()),
+                    let (result, stopped) =
+                        finish_on_stop(client.sync_once(settings), &mut stop, SYNC_DRAIN).await;
+                    let Some(result) = result else {
+                        eprintln!("{SYNC_ABANDONED}");
+                        return Ok(());
+                    };
+                    let outcome = match result {
+                        Ok(response) => {
+                            self.process(client, &response).await;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    };
+                    if stopped {
+                        if outcome.is_ok() {
+                            self.last_sync.store(now_ms() / 1000, Ordering::SeqCst);
+                        }
+                        return Ok(());
                     }
+                    outcome
                 };
                 match outcome {
                     Ok(()) => {
@@ -1033,7 +1251,8 @@ pub mod unix {
                     {
                         self.announce(
                             "the watch daemon stopped: the access token was rejected (M_UNKNOWN_TOKEN). Run matrix-e2ee-cli login to create a new device.",
-                        );
+                        )
+                        .await;
                         bail!("access token rejected, stopping");
                     }
                     Err(err) => {
@@ -1046,6 +1265,54 @@ pub mod unix {
                     }
                 }
             }
+        }
+    }
+
+    /// How long a sync in flight may still take once the stop has arrived:
+    /// the SDK's limit for one sync request, its default request timeout
+    /// (30 s) plus the long-poll timeout.
+    const SYNC_DRAIN: Duration = Duration::from_secs(30 + SYNC_TIMEOUT.as_secs());
+
+    const SYNC_ABANDONED: &str = "the sync in flight did not finish in time after the stop and was abandoned; if the SDK had already saved its sync token, the events of that batch are missing from the room logs";
+
+    /// Await `sync` to its end, also when the stop arrives meanwhile: the SDK
+    /// saves the new sync token before `sync_once` returns, so a response
+    /// dropped after that is never fetched again and its events never reach
+    /// the log. After the stop the sync gets at most `drain` more. The
+    /// result (`None`: the drain ran out), and whether the stop arrived.
+    pub async fn finish_on_stop<T>(
+        sync: impl Future<Output = T>,
+        stop: &mut watch::Receiver<bool>,
+        drain: Duration,
+    ) -> (Option<T>, bool) {
+        tokio::pin!(sync);
+        let finished = tokio::select! {
+            biased;
+            out = &mut sync => Some(out),
+            () = stop_requested(stop) => None,
+        };
+        if let Some(out) = finished {
+            return (Some(out), *stop.borrow());
+        }
+        (tokio::time::timeout(drain, sync).await.ok(), true)
+    }
+
+    /// Resolves once the stop has arrived (at once when it already has), or
+    /// when its sender is gone.
+    async fn stop_requested(stop: &mut watch::Receiver<bool>) {
+        let _ = stop.wait_for(|stopped| *stopped).await;
+    }
+
+    /// `work`'s output, or `None` when the stop arrives first; for work that
+    /// may be dropped midway (a request that changes nothing).
+    async fn until_stopped<T>(
+        stop: &mut watch::Receiver<bool>,
+        work: impl Future<Output = T>,
+    ) -> Option<T> {
+        tokio::select! {
+            biased;
+            () = stop_requested(stop) => None,
+            out = work => Some(out),
         }
     }
 
@@ -1224,19 +1491,23 @@ pub mod unix {
     }
 
     /// One retry round: try the due events, at most `budget` attempts, and
-    /// settle each that decrypts (`record` writes its correction first, with
-    /// no await before it is removed). A session without a key is not tried
-    /// further in this round. Returns the number of attempts.
-    pub async fn retry_round<F, Fut>(
+    /// settle each that decrypts once `record` has appended its correction
+    /// (it gives whether the append worked). A correction that was not
+    /// appended (a full volume) stays pending and waits like a failed
+    /// decryption, so the round goes on with the others. A session without a
+    /// key is not tried further in this round. Returns the number of attempts.
+    pub async fn retry_round<F, Fut, R, RFut>(
         pending: &std::sync::Mutex<PendingUtds>,
         now: Instant,
         budget: usize,
         mut attempt: F,
-        mut record: impl FnMut(&str, Event),
+        mut record: R,
     ) -> usize
     where
         F: FnMut(PendingUtd) -> Fut,
         Fut: Future<Output = Attempt>,
+        R: FnMut(String, Event) -> RFut,
+        RFut: Future<Output = bool>,
     {
         let mut without_key: HashSet<(String, String)> = HashSet::new();
         let mut attempts = 0;
@@ -1259,9 +1530,13 @@ pub mod unix {
                 let (room_id, event_id) = (entry.room_id.clone(), entry.event_id.clone());
                 let outcome = attempt(entry).await;
                 if let Attempt::Decrypted(Some(correction)) = outcome {
-                    record(&room_id, *correction);
+                    let appended = record(room_id, *correction).await;
                     if let Ok(mut pending) = pending.lock() {
-                        pending.remove(&event_id);
+                        if appended {
+                            pending.remove(&event_id);
+                        } else {
+                            pending.failed(&event_id, now);
+                        }
                     }
                     continue;
                 }
@@ -1492,6 +1767,75 @@ pub mod unix {
             );
         }
 
+        #[tokio::test]
+        async fn only_a_request_line_with_its_newline_is_carried_out() {
+            use std::sync::atomic::AtomicUsize;
+            let dir = short_tempdir();
+            let path = dir.path().join("d.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler: Handler = {
+                let calls = calls.clone();
+                Arc::new(move |_request: Value| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { json!({"ok": true}) })
+                })
+            };
+            let (_stop_tx, stop_rx) = watch::channel(false);
+            tokio::spawn(serve(listener, handler, stop_rx));
+            // Writes `bytes`, ends its side and reads what comes back (an
+            // error or nothing counts as no answer).
+            // `tail` may not get through: the daemon stops reading at the
+            // size limit.
+            let send = |bytes: Vec<u8>, tail: &'static [u8]| {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    use std::io::{Read, Write};
+                    let mut stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream.write_all(&bytes).unwrap();
+                    stream.write_all(tail).ok();
+                    stream.shutdown(std::net::Shutdown::Write).ok();
+                    let mut answer = String::new();
+                    stream.read_to_string(&mut answer).ok();
+                    answer
+                })
+            };
+            // A whole JSON object, but the stream ends before its newline.
+            let answer = send(br#"{"op": "send", "body": "hi"}"#.to_vec(), b"")
+                .await
+                .unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a cut-off frame was carried out"
+            );
+            assert!(answer.contains("incomplete request"), "{answer:?}");
+            // A JSON object of exactly MAX_REQUEST bytes: the newline is past the limit.
+            let limit = usize::try_from(MAX_REQUEST).unwrap();
+            let head = r#"{"op": "status", "pad": ""#;
+            let mut big = head.as_bytes().to_vec();
+            big.resize(limit - 2, b'x');
+            big.extend_from_slice(b"\"}");
+            assert_eq!(big.len(), limit);
+            assert!(serde_json::from_slice::<Value>(&big).is_ok());
+            send(big, b"\n").await.unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a frame cut at the size limit was carried out"
+            );
+            // A complete line is still served.
+            let answer = send(b"{\"op\": \"status\"}\n".to_vec(), b"").await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                serde_json::from_str::<Value>(&answer).unwrap(),
+                json!({"ok": true})
+            );
+        }
+
         /// A handler that holds `ops` like run_op, says when it started and
         /// answers only after a while.
         fn slow_handler(ops: Arc<Mutex<()>>, started: Arc<tokio::sync::Notify>) -> Handler {
@@ -1715,7 +2059,10 @@ pub mod unix {
                     tried.lock().unwrap().push(entry.event_id.clone());
                     std::future::ready(outcome(&entry.event_id))
                 },
-                |_, event| written.push(event.event_id),
+                |_, event| {
+                    written.push(event.event_id);
+                    std::future::ready(true)
+                },
             ))
             .unwrap();
             let tried = tried.into_inner().unwrap();
@@ -1796,6 +2143,260 @@ pub mod unix {
             assert!(written.is_empty(), "nothing to write for an unlogged type");
             assert_eq!(pending.lock().unwrap().len(), 3);
             assert!(round(&pending, now, 50, outcome).0.is_empty());
+        }
+
+        #[test]
+        fn a_correction_whose_append_fails_stays_pending() {
+            let now = t0();
+            let pending = std::sync::Mutex::new(PendingUtds::default());
+            pending.lock().unwrap().add("!r", "S", "$e", RAW, now);
+            pending.lock().unwrap().add("!r", "S", "$f", RAW, now);
+            let attempt = |e: PendingUtd| {
+                std::future::ready(Attempt::Decrypted(Some(Box::new(decrypted(&e.event_id)))))
+            };
+            // The volume is full for $e only.
+            let mut appended = Vec::new();
+            let tried = futures_util::FutureExt::now_or_never(retry_round(
+                &pending,
+                now,
+                50,
+                attempt,
+                |_, event: Event| {
+                    let ok = event.event_id != "$e";
+                    appended.push((event.event_id, ok));
+                    std::future::ready(ok)
+                },
+            ))
+            .unwrap();
+            assert_eq!(tried, 2, "the round goes on after a failed append");
+            assert_eq!(
+                appended,
+                vec![("$e".to_owned(), false), ("$f".to_owned(), true)]
+            );
+            assert_eq!(
+                ids(&pending.lock().unwrap().due(now + RETRY_FIRST, 10)),
+                vec!["$e"],
+                "a correction that was not appended was dropped"
+            );
+            assert!(
+                pending.lock().unwrap().due(now, 10).is_empty(),
+                "no backoff after a failed append"
+            );
+            // Once the append works, it settles.
+            futures_util::FutureExt::now_or_never(retry_round(
+                &pending,
+                now + RETRY_FIRST,
+                50,
+                attempt,
+                |_, _| std::future::ready(true),
+            ))
+            .unwrap();
+            assert_eq!(pending.lock().unwrap().len(), 0);
+        }
+
+        fn text_event(i: usize) -> Event {
+            Event {
+                event_id: format!("$e{i}"),
+                sender: "@a:e".into(),
+                ts: 5,
+                kind: "m.text".into(),
+                body: Some(format!("nachricht {i}")),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test]
+        async fn the_writer_keeps_the_order_and_finishes_before_close_returns() {
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = Arc::new(Recorder::new(
+                dir.path().to_path_buf(),
+                "@me:e".into(),
+                None,
+                None,
+            ));
+            let writer = LogWriter::start(recorder).unwrap();
+            const COUNT: usize = 2000;
+            for i in 0..COUNT {
+                // Queued, and the wait dropped at once, as a stop does to a
+                // retry round.
+                let waiting = futures_util::FutureExt::now_or_never(
+                    writer.write(vec![("!r:e".into(), text_event(i))]),
+                );
+                assert!(waiting.is_none() || waiting == Some(vec![true]));
+            }
+            writer.close().await;
+            let records = crate::roomlog::read_records(&log_path(dir.path(), "!r:e").unwrap());
+            assert_eq!(
+                records.len(),
+                COUNT,
+                "close returned before the queued writes were done"
+            );
+            for (i, record) in records.iter().enumerate() {
+                assert_eq!(record["event_id"], format!("$e{i}"));
+                assert_eq!(record["seq"], json!(i + 1));
+            }
+            assert_eq!(
+                writer.write(vec![("!r:e".into(), text_event(0))]).await,
+                vec![false],
+                "a write after close"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_writer_reports_a_failed_append() {
+            let dir = tempfile::tempdir().unwrap();
+            // The rooms directory is a file: no log can be created in it.
+            let not_a_dir = dir.path().join("rooms");
+            fs::write(&not_a_dir, "").unwrap();
+            let writer = LogWriter::start(Arc::new(Recorder::new(
+                not_a_dir,
+                "@me:e".into(),
+                None,
+                None,
+            )))
+            .unwrap();
+            assert_eq!(
+                writer.write(vec![("!r:e".into(), text_event(1))]).await,
+                vec![false]
+            );
+            writer.close().await;
+        }
+
+        #[tokio::test]
+        async fn a_stop_lets_the_sync_in_flight_finish() {
+            let (stop_tx, mut stop_rx) = watch::channel(false);
+            let sync = async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                "response"
+            };
+            let stopper = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                stop_tx.send(true).unwrap();
+            };
+            let ((response, stopped), ()) = tokio::join!(
+                finish_on_stop(sync, &mut stop_rx, Duration::from_secs(5)),
+                stopper
+            );
+            assert_eq!(
+                response,
+                Some("response"),
+                "the stop dropped the sync response"
+            );
+            assert!(stopped);
+            // Without a stop, the result comes back as it is.
+            let (_keep, mut quiet) = watch::channel(false);
+            assert_eq!(
+                finish_on_stop(async { 7 }, &mut quiet, Duration::from_secs(5)).await,
+                (Some(7), false)
+            );
+        }
+
+        #[tokio::test]
+        async fn the_wait_for_the_sync_in_flight_is_bounded() {
+            let (_stop_tx, mut stop_rx) = watch::channel(true);
+            let started = Instant::now();
+            let (response, stopped) = finish_on_stop(
+                std::future::pending::<()>(),
+                &mut stop_rx,
+                Duration::from_millis(100),
+            )
+            .await;
+            assert_eq!(response, None);
+            assert!(stopped);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        #[tokio::test]
+        async fn a_stop_during_alias_resolution_ends_start_up() {
+            // A homeserver that takes the connection and never answers.
+            let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = Client::builder()
+                .homeserver_url(format!("http://{}", server.local_addr().unwrap()))
+                .build()
+                .await
+                .unwrap();
+            let (stop_tx, mut stop_rx) = watch::channel(false);
+            let entries = vec!["#a:e".to_owned(), "#b:e".to_owned()];
+            let stopper = async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                stop_tx.send(true).unwrap();
+            };
+            let (rooms, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(resolve_rooms(&client, &entries, &mut stop_rx), stopper)
+            })
+            .await
+            .expect("alias resolution did not see the stop");
+            assert_eq!(rooms, None);
+            // Already stopped: not even the first alias is asked for.
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    resolve_rooms(&client, &entries, &mut stop_rx)
+                )
+                .await
+                .expect("an earlier stop was not seen"),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unanswered_probe_does_not_end_stop_early() {
+            let dir = short_tempdir();
+            let socket = dir.path().join("d.sock");
+            // The backlog takes the status request; nobody answers it.
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let pid_file = dir.path().join("p");
+            let mut child = std::process::Command::new("sleep")
+                .arg("1")
+                .spawn()
+                .unwrap();
+            fs::write(&pid_file, child.id().to_string()).unwrap();
+            // Reaped when it exits: without /proc a zombie counts as alive.
+            let reaper = std::thread::spawn(move || child.wait());
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                stop_at(
+                    &socket,
+                    &pid_file,
+                    &dir.path().join("l"),
+                    Duration::from_secs(3),
+                ),
+            )
+            .await
+            .expect("--stop waited past its deadline");
+            reaper.join().unwrap().unwrap();
+            outcome.expect("the exit of the pid in the pid file was not observed");
+
+            // A process that does not exit: an error at the deadline, not
+            // later, and it is not signalled.
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            fs::write(&pid_file, child.id().to_string()).unwrap();
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                stop_at(
+                    &socket,
+                    &pid_file,
+                    &dir.path().join("l"),
+                    Duration::from_secs(1),
+                ),
+            )
+            .await
+            .expect("--stop waited past its deadline");
+            let still_running = child.try_wait().unwrap().is_none();
+            child.kill().ok();
+            child.wait().ok();
+            assert!(outcome.is_err());
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "{:?}",
+                started.elapsed()
+            );
+            assert!(still_running, "the pid from the pid file was signalled");
+            assert!(pid_file.exists());
         }
 
         #[test]
@@ -1903,6 +2504,7 @@ pub mod unix {
             let paths = Paths {
                 data_dir: dir.path().to_owned(),
             };
+            let recorder = Arc::new(Recorder::new(paths.rooms_dir(), "@me:e".into(), None, None));
             // No session and nothing listening: every sync fails at once.
             let client = Client::builder()
                 .homeserver_url("http://127.0.0.1:9")
@@ -1918,7 +2520,8 @@ pub mod unix {
                 slot: RwLock::new(Some(client)),
                 ops: Mutex::new(()),
                 stopping: AtomicBool::new(false),
-                recorder: Recorder::new(paths.rooms_dir(), "@me:e".into(), None, None),
+                recorder: recorder.clone(),
+                writer: LogWriter::start(recorder).unwrap(),
                 pending: std::sync::Mutex::new(PendingUtds::default()),
                 rooms: vec![("!r:e".into(), "!r:e".into())],
                 started: Instant::now(),

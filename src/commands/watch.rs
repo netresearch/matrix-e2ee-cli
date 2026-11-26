@@ -82,24 +82,8 @@ fn follow_room(paths: &Paths, args: &WatchArgs) -> Result<()> {
     let log = log_path(&rooms_dir, &room_id)?;
     let cursor = cursor_path(&rooms_dir, &room_id, &args.cursor)?;
 
-    if !log.exists() {
-        // Two very different causes; naming the wrong one sends people to
-        // restart a daemon that is already running.
-        match status() {
-            Some(answer) if watches(&answer, &room_id) => {
-                eprintln!(
-                    "Watching {}, nothing logged yet. The log starts at the first event after the daemon began watching; a sync does not replay history.",
-                    term(&room_id)
-                );
-                return Ok(());
-            }
-            Some(_) => bail!(
-                "the watch daemon is running but not watching {room_id}; add it to \"watch_rooms\" in config.json and restart the daemon"
-            ),
-            None => bail!(
-                "no log for {room_id}, and no watch daemon is running: matrix-e2ee-cli watch-daemon --start"
-            ),
-        }
+    if !log.exists() && without_log(status().as_ref(), &room_id, args.once)? == NoLog::Finish {
+        return Ok(());
     }
 
     let seen = read_cursor(&cursor);
@@ -120,6 +104,36 @@ fn follow_room(paths: &Paths, args: &WatchArgs) -> Result<()> {
         std::thread::sleep(POLL);
         follower.poll(&mut out)?;
         out.flush()?;
+    }
+}
+
+/// What `watch` does about a room without a log yet.
+#[derive(Debug, PartialEq, Eq)]
+enum NoLog {
+    /// `--once`: nothing to print.
+    Finish,
+    /// Follow: the follower picks the log up once it appears.
+    Follow,
+}
+
+/// The room has no log yet. Fine when the daemon (`status`, its answer)
+/// watches the room; two very different causes otherwise, and naming the
+/// wrong one sends people to restart a daemon that is already running.
+fn without_log(status: Option<&Value>, room_id: &str, once: bool) -> Result<NoLog> {
+    match status {
+        Some(answer) if watches(answer, room_id) => {
+            eprintln!(
+                "Watching {}, nothing logged yet. The log starts at the first event after the daemon began watching; a sync does not replay history.",
+                term(room_id)
+            );
+            Ok(if once { NoLog::Finish } else { NoLog::Follow })
+        }
+        Some(_) => bail!(
+            "the watch daemon is running but not watching {room_id}; add it to \"watch_rooms\" in config.json and restart the daemon"
+        ),
+        None => bail!(
+            "no log for {room_id}, and no watch daemon is running: matrix-e2ee-cli watch-daemon --start"
+        ),
     }
 }
 
@@ -374,6 +388,24 @@ mod tests {
         assert_eq!(read_cursor(&s.cursor), 4);
         append(&s.log, 5, "fünf", DEFAULT_MAX_BYTES);
         assert_eq!(printed(&mut f), vec!["fünf"]);
+    }
+
+    #[test]
+    fn a_watched_room_without_a_log_is_followed_unless_once() {
+        let status = json!({"ok": true, "rooms": ["!r:example.org"]});
+        assert_eq!(
+            without_log(Some(&status), "!r:example.org", false).unwrap(),
+            NoLog::Follow,
+            "watch without --once ended before the first event"
+        );
+        assert_eq!(
+            without_log(Some(&status), "!r:example.org", true).unwrap(),
+            NoLog::Finish
+        );
+        let other = without_log(Some(&status), "!x:example.org", false).unwrap_err();
+        assert!(other.to_string().contains("not watching"), "{other}");
+        let none = without_log(None, "!r:example.org", false).unwrap_err();
+        assert!(none.to_string().contains("no watch daemon"), "{none}");
     }
 
     #[test]
