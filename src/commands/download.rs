@@ -127,10 +127,35 @@ fn clean_name(name: &str) -> Option<String> {
         }
         cleaned = cleaned[..end].trim_end();
     }
-    if cleaned.chars().all(|c| c == '.') {
+    // Windows drops trailing dots and spaces from a name.
+    let cleaned = cleaned.trim_end_matches(['.', ' ']);
+    if cleaned.is_empty() {
         return None;
     }
-    Some(cleaned.to_owned())
+    // No hidden file from someone else's message: a leading dot becomes "_".
+    let mut out = match cleaned.strip_prefix('.') {
+        Some(rest) => format!("_{rest}"),
+        None => cleaned.to_owned(),
+    };
+    // Windows device names (CON, NUL, COM1, ...) with any extension would
+    // open the device instead of a file; prefix them on every platform.
+    if is_reserved_device_name(&out) {
+        out.insert(0, '_');
+    }
+    Some(out)
+}
+
+fn is_reserved_device_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or_default().trim_end();
+    let upper = base.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+        && upper.len() == 4
+        && upper[3..].chars().all(|c| c.is_ascii_digit()))
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(&base[3..], "¹" | "²" | "³"))
 }
 
 /// Write `data` to a new file (never replacing one, never following a
@@ -162,10 +187,23 @@ mod tests {
     const EV: &str = "$abc123:example.org";
 
     #[test]
+    fn hidden_and_windows_device_names_are_defused() {
+        assert_eq!(sanitize_file_name(".bashrc", EV), "_bashrc");
+        assert_eq!(sanitize_file_name("..profile", EV), "_.profile");
+        assert_eq!(sanitize_file_name("report.pdf. . ", EV), "report.pdf");
+        assert_eq!(sanitize_file_name("CON", EV), "_CON");
+        assert_eq!(sanitize_file_name("nul.txt", EV), "_nul.txt");
+        assert_eq!(sanitize_file_name("Com7.tar.gz", EV), "_Com7.tar.gz");
+        assert_eq!(sanitize_file_name("lpt¹", EV), "_lpt¹");
+        assert_eq!(sanitize_file_name("console.log", EV), "console.log");
+        assert_eq!(sanitize_file_name("COM10", EV), "COM10");
+    }
+
+    #[test]
     fn plain_names_are_kept() {
         assert_eq!(sanitize_file_name("report.pdf", EV), "report.pdf");
         assert_eq!(sanitize_file_name("Grüße 🙂.png", EV), "Grüße 🙂.png");
-        assert_eq!(sanitize_file_name(".hidden", EV), ".hidden");
+        assert_eq!(sanitize_file_name(".hidden", EV), "_hidden");
         assert_eq!(sanitize_file_name("a..b.txt", EV), "a..b.txt");
     }
 
