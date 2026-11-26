@@ -48,15 +48,9 @@ pub async fn run(args: DownloadArgs) -> Result<()> {
     let (source, name) = media_of(&event)?;
     let name = sanitize_file_name(args.filename.as_deref().unwrap_or(&name), event_id.as_str());
     let dir = args.output.unwrap_or_else(|| PathBuf::from("."));
-    fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let path = dir.join(&name);
-    // Checked before the download to fail early; create_new below decides.
-    if fs::symlink_metadata(&path).is_ok() {
-        bail!(
-            "{} exists; choose another name with --filename or another directory with --output",
-            path.display()
-        );
-    }
+    let path = tokio::task::spawn_blocking(move || target_path(&dir, &name))
+        .await
+        .context("preparing the output directory did not finish")??;
 
     let data = client
         .media()
@@ -70,7 +64,9 @@ pub async fn run(args: DownloadArgs) -> Result<()> {
         )
         .await
         .context("downloading the attachment failed")?;
-    write_new(&path, &data)?;
+    let path = tokio::task::spawn_blocking(move || write_new(&path, &data).map(|()| path))
+        .await
+        .context("writing the attachment did not finish")??;
     println!("{}", term(&path.display().to_string()));
     Ok(())
 }
@@ -161,6 +157,21 @@ fn is_reserved_device_name(name: &str) -> bool {
             && matches!(&base[3..], "¹" | "²" | "³"))
 }
 
+/// `dir` (created if missing) joined with `name`; an error if something
+/// exists there already. Checked before the download to fail early;
+/// [`write_new`]'s `create_new` decides.
+pub fn target_path(dir: &Path, name: &str) -> Result<PathBuf> {
+    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let path = dir.join(name);
+    if fs::symlink_metadata(&path).is_ok() {
+        bail!(
+            "{} exists; choose another name with --filename or another directory with --output",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
 /// Write `data` to a new file (never replacing one, never following a
 /// symlink at `path`), mode 0600 on Unix. A partly written file is removed.
 pub fn write_new(path: &Path, data: &[u8]) -> Result<()> {
@@ -244,6 +255,26 @@ mod tests {
         let name = sanitize_file_name(&"ü".repeat(300), EV);
         assert!(name.len() <= MAX_NAME, "{}", name.len());
         assert_eq!(name, "ü".repeat(MAX_NAME / 2));
+    }
+
+    #[test]
+    fn the_target_directory_is_created_and_existing_names_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("a").join("b");
+        let path = target_path(&dir, "f.txt").unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(path, dir.join("f.txt"));
+        fs::write(&path, b"x").unwrap();
+        let err = target_path(&dir, "f.txt").unwrap_err().to_string();
+        assert!(err.contains("exists"), "{err}");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.path().join("nowhere"), dir.join("link")).unwrap();
+            assert!(
+                target_path(&dir, "link").is_err(),
+                "a dangling symlink was not seen"
+            );
+        }
     }
 
     #[test]

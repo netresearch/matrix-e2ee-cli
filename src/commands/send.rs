@@ -40,7 +40,14 @@ pub async fn run(args: SendArgs) -> Result<()> {
     let Sent {
         event_id,
         encrypted,
-    } = send_guarded(&room, content, args.trust_unverified_devices, "message").await?;
+    } = send_guarded(
+        &room,
+        content,
+        args.trust_unverified_devices,
+        "message",
+        |_| Ok(()),
+    )
+    .await?;
 
     if args.json {
         // json_line escapes DEL and C1, which a hostile server can put into a
@@ -85,11 +92,14 @@ pub struct Sent {
 ///   (also after a failed one), so the opt-in covers this event only.
 ///
 /// `what` names the event in the refusal ("message", "edit").
+/// `check_encryption` gets whether the event will be sent encrypted and may
+/// refuse before anything is sent.
 pub async fn send_guarded(
     room: &Room,
     content: impl MessageLikeEventContent,
     trust_unverified_devices: bool,
     what: &str,
+    check_encryption: impl FnOnce(bool) -> Result<()>,
 ) -> Result<Sent> {
     let encrypted = match room
         .latest_encryption_state()
@@ -104,6 +114,7 @@ pub async fn send_guarded(
             room.room_id()
         ),
     };
+    check_encryption(encrypted)?;
 
     if encrypted && !trust_unverified_devices {
         let untrusted = untrusted_devices(room).await?;

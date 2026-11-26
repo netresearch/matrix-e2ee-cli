@@ -8,7 +8,8 @@
 //!
 //! The user's own reactions are looked up on the server
 //! (`/relations/{event}/m.annotation`), so the caller never needs a
-//! reaction's event id.
+//! reaction's event id. Only events known to be `m.reaction` are listed or
+//! removed; an annotation this device cannot decrypt is skipped and counted.
 
 use std::collections::BTreeSet;
 
@@ -22,7 +23,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::ReactArgs;
-use crate::commands::{parse_event_id, resolve_room, sync_once};
+use crate::commands::{fetch_event, parse_event_id, resolve_room, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
 use crate::text::{json_line, term};
@@ -113,76 +114,49 @@ pub async fn run(args: ReactArgs) -> Result<()> {
         .to_owned();
 
     if args.list {
-        let found = own_reactions(&annotations(&room, &event_id).await?, own.as_str(), None);
-        if args.json {
-            println!("{}", json_line(&json!({ "reactions": found }))?);
-        } else {
-            for reaction in &found {
-                println!("{}\t{}", term(&reaction.key), term(&reaction.event_id));
-            }
-        }
-        return Ok(());
+        return list(&room, &event_id, own.as_str(), args.json).await;
     }
 
-    // clap requires KEY unless --list is given.
-    let key = args.key.context("KEY is required unless --list is given")?;
-    check_key(&key)?;
-    let mode = if args.remove {
-        Mode::Remove
-    } else if let Some(old) = args.replace {
-        for k in &old {
-            check_key(k)?;
-        }
-        Mode::Replace(old)
-    } else {
-        Mode::Add
-    };
+    let (key, mode) = parse_mode(args.key, args.remove, args.replace)?;
     let plan = Plan::new(&key, &mode);
+    if plan.add {
+        let (_, target) = fetch_event(&room, &event_id).await?;
+        check_reactable(&target)?;
+    }
     let wanted = plan.lookup(&key);
-    let found = own_reactions(
+    let lookup = own_reactions(
         &annotations(&room, &event_id).await?,
         own.as_str(),
         Some(&wanted),
     );
 
-    let mut reaction_id: Option<String> = None;
-    if plan.add {
-        if let Some(existing) = found.iter().find(|r| r.key == key) {
-            // A second identical annotation is rejected or duplicated; keep the first.
-            reaction_id = Some(existing.event_id.clone());
-        } else {
-            let content = ReactionEventContent::new(Annotation::new(event_id.clone(), key.clone()));
-            let sent = room
-                .send(content)
-                .await
-                .context("sending the reaction failed")?;
-            reaction_id = Some(sent.response.event_id.to_string());
-        }
-    }
-
-    let mut removed: Vec<OwnReaction> = Vec::new();
-    for reaction in found.iter().filter(|r| plan.drop.contains(&r.key)) {
-        let target = EventId::parse(&reaction.event_id)
-            .with_context(|| format!("invalid reaction event id {:?}", reaction.event_id))?;
-        if let Err(err) = room.redact(&target, None, None).await {
-            // Say what already happened before the error.
-            if let Some(id) = &reaction_id {
-                eprintln!("set: {} ({})", term(&key), term(id));
-            }
-            for done in &removed {
-                eprintln!("removed: {} ({})", term(&done.key), term(&done.event_id));
-            }
-            return Err(anyhow::Error::new(err)).with_context(|| {
-                format!("could not remove {} ({})", reaction.key, reaction.event_id)
-            });
-        }
-        removed.push(reaction.clone());
+    let reaction_id = if plan.add {
+        Some(set_key(&room, &event_id, &key, &lookup.found).await?)
+    } else {
+        None
+    };
+    let removed = remove_reactions(
+        &room,
+        &key,
+        reaction_id.as_deref(),
+        &lookup.found,
+        &plan.drop,
+    )
+    .await?;
+    let skipped = lookup.unconfirmed_among(&plan.drop);
+    if skipped > 0 {
+        eprintln!("{}", skipped_note(skipped));
     }
 
     if args.json {
         println!(
             "{}",
-            json_line(&json!({"event_id": reaction_id, "key": key, "removed": removed}))?
+            json_line(&json!({
+                "event_id": reaction_id,
+                "key": key,
+                "removed": removed,
+                "skipped_unconfirmed": skipped,
+            }))?
         );
     } else {
         if let Some(id) = &reaction_id {
@@ -196,6 +170,124 @@ pub async fn run(args: ReactArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `--list`: the user's own confirmed reactions on the event.
+async fn list(room: &Room, event_id: &EventId, own: &str, json: bool) -> Result<()> {
+    let lookup = own_reactions(&annotations(room, event_id).await?, own, None);
+    if !lookup.unconfirmed.is_empty() {
+        eprintln!("{}", skipped_note(lookup.unconfirmed.len()));
+    }
+    if json {
+        println!(
+            "{}",
+            json_line(&json!({
+                "reactions": lookup.found,
+                "skipped_unconfirmed": lookup.unconfirmed.len(),
+            }))?
+        );
+    } else {
+        for reaction in &lookup.found {
+            println!("{}\t{}", term(&reaction.key), term(&reaction.event_id));
+        }
+    }
+    Ok(())
+}
+
+/// KEY and the mode from the arguments. Only a key this command sends (a
+/// new KEY, also the one `--replace` sets) must pass [`check_key`]; the key
+/// of `--remove` and the OLD keys of `--replace` name existing reactions,
+/// which another client may have set with any string, and are matched
+/// exactly.
+pub fn parse_mode(
+    key: Option<String>,
+    remove: bool,
+    replace: Option<Vec<String>>,
+) -> Result<(String, Mode)> {
+    // clap requires KEY unless --list is given.
+    let key = key.context("KEY is required unless --list is given")?;
+    if remove {
+        return Ok((key, Mode::Remove));
+    }
+    check_key(&key)?;
+    Ok((key, replace.map_or(Mode::Add, Mode::Replace)))
+}
+
+/// Refuse a reaction target that is an edit (`m.replace`) or itself a
+/// reaction (`m.reaction`, or any `m.annotation`): clients ignore
+/// annotations on them. The relation is clear text also on an encrypted
+/// event, so an undecryptable target is checked too.
+pub fn check_reactable(event: &Value) -> Result<()> {
+    let relation = event
+        .get("content")
+        .and_then(|c| c.get("m.relates_to"))
+        .and_then(|r| r.get("rel_type"))
+        .and_then(Value::as_str);
+    if relation == Some("m.replace") {
+        bail!("the event is an edit; pass the event id of the original message instead");
+    }
+    if relation == Some("m.annotation")
+        || event.get("type").and_then(Value::as_str) == Some("m.reaction")
+    {
+        bail!("the event is itself a reaction; pass the event id of the original message instead");
+    }
+    Ok(())
+}
+
+/// Set KEY unless the user already reacted with it; the reaction's event id.
+async fn set_key(
+    room: &Room,
+    event_id: &EventId,
+    key: &str,
+    found: &[OwnReaction],
+) -> Result<String> {
+    if let Some(existing) = found.iter().find(|r| r.key == key) {
+        // A second identical annotation is rejected or duplicated; keep the first.
+        return Ok(existing.event_id.clone());
+    }
+    let content = ReactionEventContent::new(Annotation::new(event_id.to_owned(), key.to_owned()));
+    let sent = room
+        .send(content)
+        .await
+        .context("sending the reaction failed")?;
+    Ok(sent.response.event_id.to_string())
+}
+
+/// Redact the found reactions whose key is in `drop`. On a failure, say
+/// on stderr what already happened (`reaction_id`: KEY was set) first.
+async fn remove_reactions(
+    room: &Room,
+    key: &str,
+    reaction_id: Option<&str>,
+    found: &[OwnReaction],
+    drop: &BTreeSet<String>,
+) -> Result<Vec<OwnReaction>> {
+    let mut removed: Vec<OwnReaction> = Vec::new();
+    for reaction in found.iter().filter(|r| drop.contains(&r.key)) {
+        let target = EventId::parse(&reaction.event_id)
+            .with_context(|| format!("invalid reaction event id {:?}", reaction.event_id))?;
+        if let Err(err) = room.redact(&target, None, None).await {
+            // Say what already happened before the error.
+            if let Some(id) = reaction_id {
+                eprintln!("set: {} ({})", term(key), term(id));
+            }
+            for done in &removed {
+                eprintln!("removed: {} ({})", term(&done.key), term(&done.event_id));
+            }
+            return Err(anyhow::Error::new(err)).with_context(|| {
+                format!("could not remove {} ({})", reaction.key, reaction.event_id)
+            });
+        }
+        removed.push(reaction.clone());
+    }
+    Ok(removed)
+}
+
+/// The stderr note for annotations left alone because their type is unknown.
+fn skipped_note(count: usize) -> String {
+    format!(
+        "skipped {count} encrypted annotation(s) of yours that this device cannot decrypt: they may not be reactions, so they are neither listed nor removed (run backup-restore to import the room key)"
+    )
 }
 
 /// Every annotation on `event_id` as JSON, following pagination. A failed
@@ -228,48 +320,72 @@ async fn annotations(room: &Room, event_id: &EventId) -> Result<Vec<Value>> {
     bail!("more than {MAX_PAGES} pages of reactions on {event_id}")
 }
 
-/// The live reactions `user_id` set on the event, from the annotation events
-/// the server lists; only the given keys when `keys` is `Some`. An
-/// encrypted reaction (`m.room.encrypted`, sent by other clients) carries
-/// `m.relates_to` in clear text and counts too. A redacted reaction does not:
-/// redacting it again would only produce a useless event.
-pub fn own_reactions(
-    events: &[Value],
-    user_id: &str,
-    keys: Option<&BTreeSet<String>>,
-) -> Vec<OwnReaction> {
-    events
-        .iter()
-        .filter_map(|event| {
-            if event.get("sender").and_then(Value::as_str) != Some(user_id) {
-                return None;
-            }
-            let event_type = event.get("type").and_then(Value::as_str)?;
-            if event_type != "m.reaction" && event_type != "m.room.encrypted" {
-                return None;
-            }
-            if event
-                .get("unsigned")
-                .and_then(|u| u.get("redacted_because"))
-                .is_some()
-            {
-                return None;
-            }
-            let relation = event.get("content")?.get("m.relates_to")?;
-            if relation.get("rel_type").and_then(Value::as_str) != Some("m.annotation") {
-                return None;
-            }
-            let key = relation.get("key").and_then(Value::as_str)?;
-            if keys.is_some_and(|keys| !keys.contains(key)) {
-                return None;
-            }
-            let event_id = event.get("event_id").and_then(Value::as_str)?;
-            Some(OwnReaction {
+/// The user's annotations on the event, split by what this device knows of
+/// their type.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Lookup {
+    /// Live `m.reaction` events (sent in clear text, or decrypted).
+    pub found: Vec<OwnReaction>,
+    /// The keys of live annotations this device cannot decrypt
+    /// (`m.room.encrypted`): their type is unknown, so they may be other
+    /// events and are never redacted.
+    pub unconfirmed: Vec<String>,
+}
+
+impl Lookup {
+    /// How many unconfirmed annotations carry one of `keys`.
+    pub fn unconfirmed_among(&self, keys: &BTreeSet<String>) -> usize {
+        self.unconfirmed
+            .iter()
+            .filter(|k| keys.contains(*k))
+            .count()
+    }
+}
+
+/// The live annotations `user_id` set on the event, from the events the
+/// server lists (decrypted where this device can); only the given keys when
+/// `keys` is `Some`. Only an `m.reaction` is a reaction; an annotation this
+/// device cannot decrypt is listed as unconfirmed. A redacted annotation
+/// counts nowhere: redacting it again would only produce a useless event.
+pub fn own_reactions(events: &[Value], user_id: &str, keys: Option<&BTreeSet<String>>) -> Lookup {
+    let mut lookup = Lookup::default();
+    for event in events {
+        if event.get("sender").and_then(Value::as_str) != Some(user_id) {
+            continue;
+        }
+        let confirmed = match event.get("type").and_then(Value::as_str) {
+            Some("m.reaction") => true,
+            Some("m.room.encrypted") => false,
+            _ => continue,
+        };
+        if super::is_redacted(event) {
+            continue;
+        }
+        let Some(relation) = event.get("content").and_then(|c| c.get("m.relates_to")) else {
+            continue;
+        };
+        if relation.get("rel_type").and_then(Value::as_str) != Some("m.annotation") {
+            continue;
+        }
+        let Some(key) = relation.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        if keys.is_some_and(|keys| !keys.contains(key)) {
+            continue;
+        }
+        let Some(event_id) = event.get("event_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if confirmed {
+            lookup.found.push(OwnReaction {
                 key: key.to_owned(),
                 event_id: event_id.to_owned(),
-            })
-        })
-        .collect()
+            });
+        } else {
+            lookup.unconfirmed.push(key.to_owned());
+        }
+    }
+    lookup
 }
 
 #[cfg(test)]
@@ -310,34 +426,43 @@ mod tests {
             encrypted,
             message,
         ];
+        // The undecryptable annotation $r5 may be no reaction: never found,
+        // only counted as unconfirmed.
         assert_eq!(
             own_reactions(&events, ME, None),
-            vec![
-                OwnReaction {
+            Lookup {
+                found: vec![OwnReaction {
                     key: "✅".into(),
                     event_id: "$r1".into()
-                },
-                OwnReaction {
-                    key: "▶️".into(),
-                    event_id: "$r5".into()
-                },
-            ]
+                }],
+                unconfirmed: vec!["▶️".into()],
+            }
         );
+        let only_play = own_reactions(&events, ME, Some(&keys(&["▶️"])));
+        assert!(only_play.found.is_empty(), "{only_play:?}");
+        assert_eq!(only_play.unconfirmed_among(&keys(&["▶️"])), 1);
+        assert_eq!(only_play.unconfirmed_among(&keys(&["✅"])), 0);
         assert_eq!(
-            own_reactions(&events, ME, Some(&keys(&["▶️"]))),
-            vec![OwnReaction {
-                key: "▶️".into(),
-                event_id: "$r5".into()
-            }]
+            own_reactions(&events, ME, Some(&keys(&["🩹"]))),
+            Lookup::default()
         );
-        assert!(own_reactions(&events, ME, Some(&keys(&["🩹"]))).is_empty());
+    }
+
+    #[test]
+    fn a_decrypted_reaction_counts() {
+        // relations() decrypts what it can; a decrypted reaction reads m.reaction.
+        let events = vec![reaction("$r1", ME, "▶️")];
+        assert_eq!(own_reactions(&events, ME, None).found.len(), 1);
     }
 
     #[test]
     fn keys_are_compared_exactly() {
         // "✅" with and without a variation selector are different keys.
         let events = vec![reaction("$r1", ME, "✔\u{fe0f}")];
-        assert!(own_reactions(&events, ME, Some(&keys(&["✔"]))).is_empty());
+        assert_eq!(
+            own_reactions(&events, ME, Some(&keys(&["✔"]))),
+            Lookup::default()
+        );
     }
 
     #[test]
@@ -370,6 +495,59 @@ mod tests {
         );
         assert_eq!(swap.lookup("✅"), keys(&["▶️", "✅", "🩹"]));
         assert_eq!(Plan::new("✅", &Mode::Remove).lookup("✅"), keys(&["✅"]));
+    }
+
+    #[test]
+    fn only_keys_that_are_sent_are_checked() {
+        let odd = || Some("a\nb".to_owned());
+        // --remove names an existing reaction: matched exactly, never checked.
+        assert_eq!(
+            parse_mode(odd(), true, None).unwrap(),
+            ("a\nb".to_owned(), Mode::Remove)
+        );
+        // OLD keys of --replace are existing reactions too.
+        assert_eq!(
+            parse_mode(Some("✅".into()), false, Some(vec!["a\nb".into()])).unwrap(),
+            ("✅".to_owned(), Mode::Replace(vec!["a\nb".into()]))
+        );
+        // A new KEY is sent, in both add and replace mode.
+        assert!(parse_mode(odd(), false, None).is_err());
+        assert!(parse_mode(odd(), false, Some(vec!["✅".into()])).is_err());
+        assert!(parse_mode(None, false, None).is_err());
+        assert_eq!(
+            parse_mode(Some("✅".into()), false, None).unwrap(),
+            ("✅".to_owned(), Mode::Add)
+        );
+    }
+
+    #[test]
+    fn edits_and_reactions_are_no_reaction_targets() {
+        let message =
+            json!({"type": "m.room.message", "content": {"msgtype": "m.text", "body": "hi"}});
+        assert!(check_reactable(&message).is_ok());
+        let thread_reply = json!({"type": "m.room.message", "content": {"msgtype": "m.text", "body": "hi",
+            "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"}}});
+        assert!(check_reactable(&thread_reply).is_ok());
+        let undecryptable = json!({"type": "m.room.encrypted", "content": {"ciphertext": "x"}});
+        assert!(check_reactable(&undecryptable).is_ok());
+
+        let edit = json!({"type": "m.room.message", "content": {"msgtype": "m.text", "body": "* hi",
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$o"}}});
+        let err = check_reactable(&edit).unwrap_err().to_string();
+        assert!(err.contains("edit") && err.contains("original"), "{err}");
+        let encrypted_edit = json!({"type": "m.room.encrypted", "content": {"ciphertext": "x",
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$o"}}});
+        assert!(check_reactable(&encrypted_edit).is_err());
+        let err = check_reactable(&reaction("$r", ME, "✅"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("reaction") && err.contains("original"),
+            "{err}"
+        );
+        let encrypted_annotation = json!({"type": "m.room.encrypted", "content": {"ciphertext": "x",
+            "m.relates_to": {"rel_type": "m.annotation", "event_id": "$o", "key": "✅"}}});
+        assert!(check_reactable(&encrypted_annotation).is_err());
     }
 
     #[test]

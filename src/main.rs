@@ -154,7 +154,8 @@ pub struct ReactArgs {
     pub room: String,
     /// The event to react to ($...).
     pub event_id: String,
-    /// The reaction key, usually an emoji.
+    /// The reaction key, usually an emoji. Sent unencrypted, also in an
+    /// encrypted room (matrix-sdk 0.20.0): the homeserver can read it.
     #[arg(required_unless_present = "list", conflicts_with = "list")]
     pub key: Option<String>,
     /// Remove your own KEY reaction instead of adding one.
@@ -317,6 +318,21 @@ mod tests {
         };
         assert_eq!(args.key.as_deref(), Some("✅"));
         assert_eq!(args.replace, Some(vec!["▶️".to_owned(), "🩹".to_owned()]));
+    }
+
+    #[test]
+    fn react_key_help_warns_that_it_is_unencrypted() {
+        let cli = Cli::command();
+        let react = cli.find_subcommand("react").expect("react subcommand");
+        let key = react
+            .get_arguments()
+            .find(|a| a.get_id() == "key")
+            .expect("KEY argument");
+        let help = key.get_help().expect("KEY help").to_string();
+        assert!(
+            help.contains("unencrypted") && help.contains("encrypted room"),
+            "{help}"
+        );
     }
 
     #[test]
