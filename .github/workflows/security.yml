@@ -60,7 +60,9 @@ jobs:
       security-events: write
       actions: read
     with:
-      languages: auto
+      # Explicit list: the reusable's `auto` detects go, javascript-typescript
+      # and python only, so it would scan the workflows and not the Rust code.
+      languages: actions,rust
 
   # One stable check name for this workflow, so a branch rule has something it
   # can require on EVERY event (same gate as templates/typo3-extension's
