@@ -191,8 +191,9 @@ mod tests {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                // `as _`: libc declares these *const on Linux, *mut on macOS.
+                std::ptr::null_mut::<libc::termios>() as _,
+                std::ptr::null_mut::<libc::winsize>() as _,
             )
         };
         assert_eq!(rc, 0, "openpty failed");
