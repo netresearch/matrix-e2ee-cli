@@ -8,3 +8,28 @@ repository = "https://github.com/netresearch/matrix-e2ee-cli"
 publish = false
 
 [dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+matrix-sdk = { version = "=0.20.0", default-features = false, features = [
+    "e2e-encryption",
+    "automatic-room-key-forwarding",
+    "bundled-sqlite",
+    "rustls-aws-lc-rs",
+] }
+# CollectStrategy (the room-key recipient strategy) is not re-exported by matrix-sdk.
+matrix-sdk-base = { version = "=0.20.0", default-features = false, features = ["e2e-encryption"] }
+rand = "0.9"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-std", "io-util"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3"
