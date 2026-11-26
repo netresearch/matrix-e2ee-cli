@@ -6,6 +6,8 @@
 //! sessions and the Megolm inbound group sessions converted from libolm
 //! pickles to vodozemac. The device keeps its identity keys, so the
 //! server-side signatures that verified it stay valid, and its room keys.
+//! The other devices nio knew are carried over with nio's local trust
+//! (verified, blacklisted, ignored) from DefaultStore's trust files.
 //!
 //! The conversion follows `migrate()` in matrix-rust-sdk's
 //! `bindings/matrix-sdk-crypto-ffi/src/lib.rs` (tag matrix-sdk-0.20.0), with the
@@ -25,7 +27,7 @@ use futures_util::FutureExt;
 use matrix_sdk::SqliteCryptoStore;
 use matrix_sdk::ruma::{
     DeviceKeyAlgorithm, DeviceKeyId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId,
-    RoomId, SecondsSinceUnixEpoch, UInt,
+    RoomId, SecondsSinceUnixEpoch, UInt, UserId,
 };
 use matrix_sdk_base::crypto::olm::{
     Account, IdentityKeys, InboundGroupSession, PickledAccount, PickledInboundGroupSession,
@@ -107,6 +109,46 @@ struct NioMegolmSession {
     forwarded: bool,
 }
 
+/// A device of another user or of this user that nio learnt from a key
+/// query (devicekeys and keys tables).
+struct NioDevice {
+    user_id: String,
+    device_id: String,
+    display_name: String,
+    deleted: bool,
+    /// key_type ("ed25519", "curve25519") to the base64 public key.
+    keys: BTreeMap<String, String>,
+}
+
+/// (user id, device id, ed25519 key): an entry of a DefaultStore trust file.
+type TrustEntry = (String, String, String);
+
+/// The local trust DefaultStore keeps next to its database, one file per
+/// state (store/database.py DefaultStore, store/file_trustdb.py KeyStore).
+#[derive(Default)]
+struct NioTrust {
+    verified: BTreeSet<TrustEntry>,
+    blacklisted: BTreeSet<TrustEntry>,
+    ignored: BTreeSet<TrustEntry>,
+}
+
+impl NioTrust {
+    /// nio matches user, device and ed25519 key (Ed25519Key.__eq__) and asks
+    /// verified before blacklisted before ignored.
+    fn of(&self, user_id: &str, device_id: &str, ed25519: &str) -> LocalTrust {
+        let entry = (user_id.to_owned(), device_id.to_owned(), ed25519.to_owned());
+        if self.verified.contains(&entry) {
+            LocalTrust::Verified
+        } else if self.blacklisted.contains(&entry) {
+            LocalTrust::BlackListed
+        } else if self.ignored.contains(&entry) {
+            LocalTrust::Ignored
+        } else {
+            LocalTrust::Unset
+        }
+    }
+}
+
 /// Everything read from the nio store. Holds the access token and the
 /// pickles, hence no Debug.
 pub struct NioStore {
@@ -118,10 +160,14 @@ pub struct NioStore {
     account_shared: bool,
     olm_sessions: Vec<NioOlmSession>,
     megolm_sessions: Vec<NioMegolmSession>,
+    devices: Vec<NioDevice>,
+    trust: NioTrust,
 }
 
-/// A shared flock on `<store>/.daemon.lock`, held while the store is read. Taken
-/// on a read-only descriptor; a missing lock file is not created.
+/// A shared flock on `<store>/.daemon.lock`, held from before the store is read
+/// until the new state is written or rolled back, so the matrix-skill cannot
+/// take the store (and move its Olm state on) in between. Taken on a read-only
+/// descriptor; a missing lock file is not created, and then nothing is held.
 struct DaemonLockCheck {
     _file: Option<File>,
 }
@@ -167,11 +213,39 @@ fn blob_text(bytes: Vec<u8>, what: &str) -> Result<String> {
     String::from_utf8(bytes).with_context(|| format!("{what} is not text"))
 }
 
-/// Read credentials.json and the device's nio database. Writes nothing: the
-/// database is opened read-only, the lock only checked.
-pub fn read_nio_store(store: &Path) -> Result<NioStore> {
-    let _lock = check_daemon_lock(store)?;
+/// Read the trust file of one state; a missing file is an empty one (KeyStore._load).
+fn read_trust_file(path: &Path) -> Result<BTreeSet<TrustEntry>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+    };
+    // KeyStore._load and Key.from_line: strip, skip blank and "#" lines, split
+    // on single spaces, keep "matrix-ed25519" entries.
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let fields: Vec<&str> = line.split(' ').collect();
+            match fields[..] {
+                [user_id, device_id, "matrix-ed25519", key, ..] => Some((
+                    user_id.trim().to_owned(),
+                    device_id.trim().to_owned(),
+                    key.trim().to_owned(),
+                )),
+                _ => None,
+            }
+        })
+        .collect())
+}
 
+/// Read credentials.json, the device's nio database and its trust files.
+/// Writes nothing: the database is opened read-only. The caller holds the
+/// daemon lock (`check_daemon_lock`).
+pub fn read_nio_store(store: &Path, configured_user: &str) -> Result<NioStore> {
     let creds_path = store.join(CREDENTIALS);
     let text = std::fs::read_to_string(&creds_path)
         .with_context(|| format!("cannot read {}", creds_path.display()))?;
@@ -187,13 +261,43 @@ pub fn read_nio_store(store: &Path) -> Result<NioStore> {
         "{} lacks user_id, device_id or access_token",
         creds_path.display()
     );
-    // nio names the database after the device (MatrixStore.__post_init__).
-    let db_path = store.join(format!("{}_{}.db", creds.user_id, creds.device_id));
-    ensure!(
-        db_path.is_file(),
-        "no nio database {} for the device in credentials.json",
-        db_path.display()
-    );
+    let configured = parse_user_id(configured_user, "config.json")?;
+    let stored = parse_user_id(&creds.user_id, "credentials.json")?;
+    if compare_user_ids(&configured, &stored) == UserIdMatch::Different {
+        bail!(
+            "the matrix-skill store belongs to {} but config.json names {}",
+            creds.user_id,
+            configured_user
+        );
+    }
+    // nio names the database and the trust files after the client's user and
+    // device (MatrixStore.__post_init__, DefaultStore.__post_init__). The
+    // skill builds the client with config.json's user_id, while
+    // credentials.json holds the server's spelling, which may differ in case.
+    let mut spellings = vec![creds.user_id.as_str()];
+    if configured_user != creds.user_id {
+        spellings.push(configured_user);
+    }
+    let Some((store_user, db_path)) = spellings.iter().find_map(|user| {
+        let path = store.join(format!("{user}_{}.db", creds.device_id));
+        path.is_file().then(|| (user.to_string(), path))
+    }) else {
+        bail!(
+            "no nio database for the device in credentials.json: none of {} in {}",
+            spellings
+                .iter()
+                .map(|user| format!("{user}_{}.db", creds.device_id))
+                .collect::<Vec<_>>()
+                .join(", "),
+            store.display()
+        );
+    };
+    let prefix = format!("{store_user}_{}", creds.device_id);
+    let trust = NioTrust {
+        verified: read_trust_file(&store.join(format!("{prefix}.trusted_devices")))?,
+        blacklisted: read_trust_file(&store.join(format!("{prefix}.blacklisted_devices")))?,
+        ignored: read_trust_file(&store.join(format!("{prefix}.ignored_devices")))?,
+    };
     let conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -201,12 +305,19 @@ pub fn read_nio_store(store: &Path) -> Result<NioStore> {
     .with_context(|| format!("cannot open {} read-only", db_path.display()))?;
     // One read transaction: a consistent snapshot of all tables.
     let tx = conn.unchecked_transaction()?;
-    let read = read_tables(&tx, creds).with_context(|| format!("in {}", db_path.display()));
+    let read = read_tables(&tx, creds, &store_user, trust)
+        .with_context(|| format!("in {}", db_path.display()));
     tx.finish()?;
     read
 }
 
-fn read_tables(conn: &Connection, creds: Credentials) -> Result<NioStore> {
+/// `store_user`: the spelling of the user id the store was created with.
+fn read_tables(
+    conn: &Connection,
+    creds: Credentials,
+    store_user: &str,
+    trust: NioTrust,
+) -> Result<NioStore> {
     let version: Option<i64> = conn
         .query_row("SELECT version FROM storeversion", [], |r| r.get(0))
         .optional()
@@ -219,14 +330,14 @@ fn read_tables(conn: &Connection, creds: Credentials) -> Result<NioStore> {
     let (account_id, account_pickle, account_shared): (i64, Vec<u8>, bool) = conn
         .query_row(
             "SELECT id, account, shared FROM accounts WHERE user_id = ?1 AND device_id = ?2",
-            [&creds.user_id, &creds.device_id],
+            [store_user, creds.device_id.as_str()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?
         .with_context(|| {
             format!(
                 "the store has no Olm account for {} / {}",
-                creds.user_id, creds.device_id
+                store_user, creds.device_id
             )
         })?;
     let account_pickle = blob_text(account_pickle, "the account")?;
@@ -286,6 +397,38 @@ fn read_tables(conn: &Connection, creds: Credentials) -> Result<NioStore> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let mut stmt = conn.prepare(
+        "SELECT id, user_id, device_id, display_name, deleted FROM devicekeys
+         WHERE account_id = ?1 ORDER BY user_id, device_id",
+    )?;
+    let rows = stmt
+        .query_map([account_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut keys_stmt = conn.prepare("SELECT key_type, key FROM keys WHERE device_id = ?1")?;
+    let devices = rows
+        .into_iter()
+        .map(|(id, user_id, device_id, display_name, deleted)| {
+            let keys = keys_stmt
+                .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<BTreeMap<String, String>>>()?;
+            Ok(NioDevice {
+                user_id,
+                device_id,
+                display_name,
+                deleted,
+                keys,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(NioStore {
         user_id: creds.user_id,
         device_id: creds.device_id,
@@ -295,6 +438,8 @@ fn read_tables(conn: &Connection, creds: Credentials) -> Result<NioStore> {
         account_shared,
         olm_sessions,
         megolm_sessions,
+        devices,
+        trust,
     })
 }
 
@@ -319,10 +464,61 @@ struct Converted {
     identity: IdentityKeys,
     sessions: Vec<Session>,
     inbound_group_sessions: Vec<InboundGroupSession>,
+    /// The other devices nio knew, with nio's local trust.
+    devices: Vec<DeviceData>,
+    /// devicekeys rows not migrated: deleted, our own, or without both keys.
+    skipped_devices: usize,
+}
+
+/// A device of nio's devicekeys/keys tables as matrix-sdk-crypto's DeviceData,
+/// with nio's local trust; None for a row that cannot become one. The keys
+/// carry no signatures (nio does not store them): DeviceData::new takes them
+/// unchecked, and the first key query replaces them with the signed ones
+/// after checking that the ed25519 key is the same (DeviceData::update_device),
+/// keeping the local trust.
+fn convert_device(d: &NioDevice, trust: &NioTrust) -> Option<DeviceData> {
+    if d.deleted {
+        return None;
+    }
+    let user_id = UserId::parse(&d.user_id).ok()?;
+    let ed25519 = d.keys.get("ed25519")?;
+    let curve25519 = d.keys.get("curve25519")?;
+    let ed25519_key = vodozemac::Ed25519PublicKey::from_base64(ed25519).ok()?;
+    let curve25519_key = vodozemac::Curve25519PublicKey::from_base64(curve25519).ok()?;
+    let device_id: OwnedDeviceId = d.device_id.as_str().into();
+    let mut keys = DeviceKeys::new(
+        user_id,
+        device_id.clone(),
+        // nio does not store them; these two are what it supports itself.
+        // Without Olm, supports_olm() would be false until the first key query.
+        vec![
+            EventEncryptionAlgorithm::OlmV1Curve25519AesSha2,
+            EventEncryptionAlgorithm::MegolmV1AesSha2,
+        ],
+        BTreeMap::from([
+            (
+                DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, &device_id),
+                DeviceKey::Ed25519(ed25519_key),
+            ),
+            (
+                DeviceKeyId::from_parts(DeviceKeyAlgorithm::Curve25519, &device_id),
+                DeviceKey::Curve25519(curve25519_key),
+            ),
+        ]),
+        Default::default(),
+    );
+    if !d.display_name.is_empty() {
+        keys.unsigned.device_display_name = Some(d.display_name.clone());
+    }
+    Some(DeviceData::new(
+        keys,
+        trust.of(&d.user_id, &d.device_id, ed25519),
+    ))
 }
 
 fn convert(nio: &NioStore) -> Result<Converted> {
     let user_id: OwnedUserId = parse_user_id(&nio.user_id, "credentials.json")?;
+    let own_user = user_id.clone();
     let device_id: OwnedDeviceId = nio.device_id.as_str().into();
 
     let libolm = vodozemac::olm::Account::from_libolm_pickle(&nio.account_pickle, NIO_PICKLE_KEY)
@@ -339,7 +535,10 @@ fn convert(nio: &NioStore) -> Result<Converted> {
         dehydrated: false,
         uploaded_signed_key_count: 0,
         creation_local_time: now,
-        fallback_key_creation_timestamp: Some(now),
+        // nio never had a fallback key. None lets matrix-sdk create and
+        // upload one on the first key-count update; a timestamp would claim
+        // one exists.
+        fallback_key_creation_timestamp: None,
     })
     .context("cannot convert the Olm account")?;
     drop(libolm);
@@ -430,11 +629,27 @@ fn convert(nio: &NioStore) -> Result<Converted> {
         inbound_group_sessions.push(session);
     }
 
+    let mut devices = Vec::new();
+    let mut skipped_devices = 0;
+    for row in &nio.devices {
+        // nio never stores its own device (_handle_key_query skips it); the
+        // own record written by write_store must not be overwritten.
+        let own = row.device_id == nio.device_id
+            && UserId::parse(&row.user_id)
+                .is_ok_and(|u| compare_user_ids(&u, &own_user) != UserIdMatch::Different);
+        match convert_device(row, &nio.trust).filter(|_| !own) {
+            Some(device) => devices.push(device),
+            None => skipped_devices += 1,
+        }
+    }
+
     Ok(Converted {
         account,
         identity,
         sessions,
         inbound_group_sessions,
+        devices,
+        skipped_devices,
     })
 }
 
@@ -446,6 +661,7 @@ struct Expected {
     ed25519: String,
     olm: BTreeMap<String, BTreeSet<String>>,
     megolm: BTreeSet<String>,
+    devices: BTreeMap<(OwnedUserId, OwnedDeviceId), LocalTrust>,
 }
 
 fn expected(nio: &NioStore, converted: &Converted) -> Expected {
@@ -463,6 +679,16 @@ fn expected(nio: &NioStore, converted: &Converted) -> Expected {
             .megolm_sessions
             .iter()
             .map(|row| row.session_id.clone())
+            .collect(),
+        devices: converted
+            .devices
+            .iter()
+            .map(|d| {
+                (
+                    (d.user_id().to_owned(), d.device_id().to_owned()),
+                    d.local_trust_state(),
+                )
+            })
             .collect(),
     }
 }
@@ -497,16 +723,19 @@ async fn write_store(paths: &Paths, passphrase: &str, converted: Converted) -> R
     // panics in get_own_device ("We should be able to find our own device"),
     // so every Olm session lookup would.
     let own_device = DeviceData::new(converted.account.device_keys(), LocalTrust::Verified);
+    let mut devices = vec![own_device];
+    // The other devices nio knew, with nio's local trust.
+    devices.extend(converted.devices);
     store
         .save_changes(Changes {
             devices: DeviceChanges {
-                new: vec![own_device],
+                new: devices,
                 ..Default::default()
             },
             ..Default::default()
         })
         .await
-        .context("cannot save the own device")?;
+        .context("cannot save the devices")?;
     store
         .save_pending_changes(PendingChanges {
             account: Some(converted.account),
@@ -565,6 +794,17 @@ async fn check_store(paths: &Paths, passphrase: &str, expected: &Expected) -> Re
         got.len(),
         expected.megolm.len()
     );
+    for ((user_id, device_id), want) in &expected.devices {
+        let got = store
+            .get_device(user_id, device_id)
+            .await?
+            .with_context(|| format!("the new store lacks device {device_id} of {user_id}"))?
+            .local_trust_state();
+        ensure!(
+            got == *want,
+            "device {device_id} of {user_id} has local trust {got:?} in the new store, expected {want:?}"
+        );
+    }
     Ok(())
 }
 
@@ -606,17 +846,11 @@ pub async fn migrate(
     out: &mut dyn Write,
 ) -> Result<()> {
     refuse_existing_state(paths)?;
-    let nio = read_nio_store(&opts.nio_store)?;
-
-    let configured = parse_user_id(&opts.configured_user, "config.json")?;
-    let stored = parse_user_id(&nio.user_id, "credentials.json")?;
-    if compare_user_ids(&configured, &stored) == UserIdMatch::Different {
-        bail!(
-            "the matrix-skill store belongs to {} but config.json names {}",
-            nio.user_id,
-            opts.configured_user
-        );
-    }
+    // Held until write_or_roll_back returns: a matrix-skill process that took
+    // the store between the read and the write could advance the Olm state
+    // this copies.
+    let lock = check_daemon_lock(&opts.nio_store)?;
+    let nio = read_nio_store(&opts.nio_store, &opts.configured_user)?;
 
     writeln!(out, "matrix-skill store: {}", opts.nio_store.display())?;
     writeln!(out, "  User:            {}", term(&nio.user_id))?;
@@ -628,6 +862,25 @@ pub async fn migrate(
 
     let converted = convert(&nio)?;
     let expected = expected(&nio, &converted);
+    let count = |trust: LocalTrust| {
+        converted
+            .devices
+            .iter()
+            .filter(|d| d.local_trust_state() == trust)
+            .count()
+    };
+    let (verified, blacklisted, ignored) = (
+        count(LocalTrust::Verified),
+        count(LocalTrust::BlackListed),
+        count(LocalTrust::Ignored),
+    );
+    writeln!(
+        out,
+        "  Other devices:   {} ({verified} verified, {blacklisted} blacklisted, {ignored} ignored); {} not taken over (deleted, own or without keys)",
+        converted.devices.len(),
+        converted.skipped_devices
+    )?;
+    out.flush()?;
 
     if !confirm(&format!(
         "Take over device {} in this tool? The matrix-skill E2EE scripts must not use it afterwards.",
@@ -645,7 +898,7 @@ pub async fn migrate(
         access_token: nio.access_token.clone(),
         store_passphrase: generate_passphrase(),
     };
-    let client = write_or_roll_back(paths, &session, converted, &expected).await?;
+    let client = write_or_roll_back(paths, &session, converted, &expected, lock).await?;
 
     writeln!(
         out,
@@ -660,17 +913,32 @@ pub async fn migrate(
         out,
         "Do not use the matrix-skill E2EE scripts or matrix-watchd with this device any more: both copies would advance the same Olm sessions and one-time keys and break each other's decryption. The nio store was not changed."
     )?;
-    if opts.check_online {
+    writeln!(
+        out,
+        "Local trust: {verified} verified, {blacklisted} blacklisted and {ignored} ignored devices taken over from nio."
+    )?;
+    let retire_when = if opts.check_online {
         sync_once(&client).await.context(
             "migrated, but the online check (one sync) failed; the new session was kept",
         )?;
         writeln!(out, "Online check: one sync succeeded.")?;
+        "now that the online check succeeded"
     } else {
         writeln!(
             out,
             "The access token was not checked against the server (use --check-online)."
         )?;
-    }
+        "once `matrix-e2ee-cli status` (one sync with the new session) succeeds"
+    };
+    writeln!(out, "Next steps:")?;
+    writeln!(
+        out,
+        "  1. Run `matrix-e2ee-cli backup-restore`: it imports the cross-signing keys, which makes your own cross-signed devices trusted, and the room keys of the key backup."
+    )?;
+    writeln!(
+        out,
+        "  2. Retire the matrix-skill's copy of this device, {retire_when}: stop the daemon (`matrix-watchd.py --stop`), then run `matrix-e2ee-setup.py --logout`. It deletes credentials.json and this device's nio store files only; it does not log the device out on the server, which would end the migrated device too."
+    )?;
     Ok(())
 }
 
@@ -681,6 +949,8 @@ async fn write_or_roll_back(
     session: &SessionFile,
     converted: Converted,
     expected: &Expected,
+    // Held to the end of the write or the rollback; see migrate().
+    _lock: DaemonLockCheck,
 ) -> Result<matrix_sdk::Client> {
     ensure_private_dir(&paths.data_dir)?;
     ensure_private_dir(&paths.store_dir())?;
@@ -772,6 +1042,16 @@ mod tests {
         olm_sessions: Vec<FixtureOlm>,
         megolm_sessions: Vec<FixtureMegolm>,
         olm_message: FixtureOlmMessage,
+        devices: Vec<FixtureDevice>,
+    }
+    /// A device nio knows from a key query, with the skill's trust decision.
+    #[derive(Deserialize)]
+    struct FixtureDevice {
+        user_id: String,
+        device_id: String,
+        ed25519: String,
+        curve25519: String,
+        trust: String,
     }
     #[derive(Deserialize)]
     struct FixtureOlm {
@@ -814,15 +1094,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let nio = tmp.path().join("nio-store");
         std::fs::create_dir(&nio).unwrap();
-        // The fixture database is stored as nio-store.db (no ":" in a file name
-        // in the repository); nio names it "<user_id>_<device_id>.db".
+        // The fixture database and trust files are stored as nio-store.<suffix>
+        // (no ":" in a file name in the repository); nio names them
+        // "<user_id>_<device_id>.<suffix>".
         let fx = fixture();
         for entry in std::fs::read_dir(fixture_dir().join("store")).unwrap() {
             let entry = entry.unwrap();
-            let name = if entry.file_name() == "nio-store.db" {
-                format!("{}_{}.db", fx.user_id, fx.device_id).into()
-            } else {
-                entry.file_name()
+            let file_name = entry.file_name();
+            let name = match file_name
+                .to_str()
+                .and_then(|n| n.strip_prefix("nio-store."))
+            {
+                Some(suffix) => format!("{}_{}.{suffix}", fx.user_id, fx.device_id).into(),
+                None => file_name,
             };
             std::fs::copy(entry.path(), nio.join(name)).unwrap();
         }
@@ -874,7 +1158,7 @@ mod tests {
         let fx = fixture();
         let setup = setup();
         let before = snapshot(&setup.opts.nio_store);
-        let nio = read_nio_store(&setup.opts.nio_store).unwrap();
+        let nio = read_nio_store(&setup.opts.nio_store, USER).unwrap();
 
         let (result, out) = run(&setup).await;
         result.unwrap();
@@ -1012,7 +1296,7 @@ mod tests {
     async fn identity_mismatch_deletes_the_new_session_and_store() {
         let fx = fixture();
         let setup = setup();
-        let nio = read_nio_store(&setup.opts.nio_store).unwrap();
+        let nio = read_nio_store(&setup.opts.nio_store, USER).unwrap();
         let converted = convert(&nio).unwrap();
         let mut want = expected(&nio, &converted);
         assert_eq!(want.curve25519, fx.curve25519);
@@ -1028,9 +1312,15 @@ mod tests {
 
         let err = format!(
             "{:#}",
-            write_or_roll_back(&setup.paths, &session, converted, &want)
-                .await
-                .expect_err("a mismatch must fail")
+            write_or_roll_back(
+                &setup.paths,
+                &session,
+                converted,
+                &want,
+                check_daemon_lock(&setup.opts.nio_store).unwrap()
+            )
+            .await
+            .expect_err("a mismatch must fail")
         );
         assert!(
             err.contains("curve25519 identity key") && err.contains("were deleted"),
@@ -1092,6 +1382,158 @@ mod tests {
         let err = run(&setup).await.0.unwrap_err().to_string();
         assert!(err.contains("config.json"), "{err}");
         assert_nothing_created(&setup);
+    }
+
+    async fn open_store(setup: &Setup) -> SqliteCryptoStore {
+        let session = read_session(&setup.paths.session_file()).unwrap().unwrap();
+        SqliteCryptoStore::open(setup.paths.store_dir(), Some(&session.store_passphrase))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migrates_nio_local_trust_of_other_devices() {
+        let fx = fixture();
+        // The fixture holds both decisions: an own device nio trusts, and a
+        // device of another user nio blacklists.
+        assert!(
+            fx.devices
+                .iter()
+                .any(|d| d.user_id == fx.user_id && d.trust == "verified")
+        );
+        assert!(
+            fx.devices
+                .iter()
+                .any(|d| d.user_id != fx.user_id && d.trust == "blacklisted")
+        );
+        let setup = setup();
+        let (result, out) = run(&setup).await;
+        result.unwrap();
+        let store = open_store(&setup).await;
+        for want in &fx.devices {
+            let user_id = UserId::parse(&want.user_id).unwrap();
+            let device_id: OwnedDeviceId = want.device_id.as_str().into();
+            let got = store
+                .get_device(&user_id, &device_id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("device {} missing", want.device_id));
+            let trust = match want.trust.as_str() {
+                "verified" => LocalTrust::Verified,
+                "blacklisted" => LocalTrust::BlackListed,
+                "ignored" => LocalTrust::Ignored,
+                _ => LocalTrust::Unset,
+            };
+            assert_eq!(got.local_trust_state(), trust, "{}", want.device_id);
+            assert_eq!(
+                got.ed25519_key().map(|k| k.to_base64()),
+                Some(want.ed25519.clone())
+            );
+            assert_eq!(
+                got.curve25519_key().map(|k| k.to_base64()),
+                Some(want.curve25519.clone())
+            );
+            assert!(got.supports_olm(), "{}", want.device_id);
+        }
+        assert!(
+            out.contains("Other devices:   3 (1 verified, 1 blacklisted, 0 ignored)"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn holds_the_store_lock_from_read_to_write() {
+        let setup = setup();
+        let lock_path = setup.opts.nio_store.join(DAEMON_LOCK);
+        std::fs::write(&lock_path, "").unwrap();
+        // What _lib/e2ee.py store_lock() would try: LOCK_EX on its own descriptor.
+        let exclusive_possible = || {
+            let file = File::open(&lock_path).unwrap();
+            // SAFETY: flock on a valid descriptor; closing it releases the lock.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+        };
+        let mut at_question = None;
+        let mut out = Vec::new();
+        migrate(
+            &setup.paths,
+            &setup.opts,
+            &mut |_| {
+                // Between reading the nio store and writing the new state.
+                at_question = Some(exclusive_possible());
+                Ok(true)
+            },
+            &mut out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            at_question,
+            Some(false),
+            "the matrix-skill could take the store between read and write"
+        );
+        assert!(exclusive_possible(), "the lock outlived the migration");
+    }
+
+    #[tokio::test]
+    async fn migrated_account_has_no_fallback_key_yet() {
+        let setup = setup();
+        run(&setup).await.0.unwrap();
+        let account = open_store(&setup)
+            .await
+            .load_account()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.pickle().fallback_key_creation_timestamp, None);
+    }
+
+    #[tokio::test]
+    async fn finds_the_database_named_after_config_jsons_spelling() {
+        let fx = fixture();
+        let setup = setup();
+        // The skill names its files after config.json's user_id (setup()
+        // copies them under fx.user_id, which is USER); credentials.json holds
+        // the server's spelling.
+        const SERVER_SPELLING: &str = "@Test:example.org";
+        assert_eq!(setup.opts.configured_user, fx.user_id);
+        let creds_path = setup.opts.nio_store.join(CREDENTIALS);
+        let mut creds: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+        creds["user_id"] = SERVER_SPELLING.into();
+        std::fs::write(&creds_path, creds.to_string()).unwrap();
+
+        let (result, _) = run(&setup).await;
+        result.unwrap();
+        let session = read_session(&setup.paths.session_file()).unwrap().unwrap();
+        assert_eq!(session.user_id, SERVER_SPELLING);
+        let store = open_store(&setup).await;
+        let keys = store.load_account().await.unwrap().unwrap().identity_keys();
+        assert_eq!(keys.curve25519.to_base64(), fx.curve25519);
+        // The trust files carry the same spelling as the database.
+        let trusted = fx.devices.iter().find(|d| d.trust == "verified").unwrap();
+        let device_id: OwnedDeviceId = trusted.device_id.as_str().into();
+        let got = store
+            .get_device(&UserId::parse(&trusted.user_id).unwrap(), &device_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.local_trust_state(), LocalTrust::Verified);
+    }
+
+    #[tokio::test]
+    async fn success_output_names_the_next_steps() {
+        let setup = setup();
+        let (result, out) = run(&setup).await;
+        result.unwrap();
+        assert!(out.contains("`matrix-e2ee-cli backup-restore`"), "{out}");
+        assert!(
+            out.contains("`matrix-watchd.py --stop`")
+                && out.contains("`matrix-e2ee-setup.py --logout`")
+                && out.contains("does not log the device out on the server"),
+            "{out}"
+        );
+        // Without --check-online, retiring waits for a successful sync.
+        assert!(out.contains("once `matrix-e2ee-cli status`"), "{out}");
     }
 
     #[test]

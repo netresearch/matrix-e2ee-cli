@@ -12,7 +12,12 @@ same way the matrix-skill scripts create theirs, with:
 - one Olm session from our account to a second local account (PEER),
 - one Megolm session of PEER imported the way matrix-key-backup.py
   --import-keys imports a backed-up key (InboundGroupSession.import_session,
-  empty forwarding chain, save_inbound_group_session).
+  empty forwarding chain, save_inbound_group_session),
+- three devices nio knows from key queries (devicekeys/keys tables), with
+  the local trust DefaultStore keeps in its .trusted_devices,
+  .blacklisted_devices and .ignored_devices files: a second device of
+  @test:example.org that nio trusts, a device of @other:example.org that
+  nio blacklists, and one of @other:example.org without a trust decision.
 
 Next to the store it writes credentials.json in the layout of
 matrix-skill's _lib/e2ee.py, and expected.json with what the migration has
@@ -36,10 +41,15 @@ from importlib.metadata import version
 
 import olm
 from nio import AsyncClient, AsyncClientConfig
-from nio.crypto import InboundGroupSession
+from nio.crypto import InboundGroupSession, OlmDevice
 
 USER_ID = "@test:example.org"
 DEVICE_ID = "TESTDEVICE"
+OTHER_USER_ID = "@other:example.org"
+TRUSTED_DEVICE_ID = "TRUSTEDDEV"
+BLOCKED_DEVICE_ID = "BLOCKEDDEV"
+UNSET_DEVICE_ID = "UNSETDEV"
+TRUST_FILES = ("trusted_devices", "blacklisted_devices", "ignored_devices")
 ROOM_ID = "!room:example.org"
 IMPORTED_ROOM_ID = "!imported:example.org"
 ACCESS_TOKEN = "fixture-access-token-not-a-secret"
@@ -100,6 +110,32 @@ async def main(out_dir: str) -> None:
     machine.store.save_inbound_group_session(imported)
     imported_ciphertext = remote.encrypt(IMPORTED_PLAINTEXT)
 
+    # Devices of key queries and the skill's trust decisions about them.
+    devices = []
+    for user_id, device_id, trust in (
+        (USER_ID, TRUSTED_DEVICE_ID, "verified"),
+        (OTHER_USER_ID, BLOCKED_DEVICE_ID, "blacklisted"),
+        (OTHER_USER_ID, UNSET_DEVICE_ID, "unset"),
+    ):
+        keys = olm.Account().identity_keys
+        device = OlmDevice(
+            user_id,
+            device_id,
+            {"ed25519": keys["ed25519"], "curve25519": keys["curve25519"]},
+        )
+        devices.append((device, trust))
+    machine.store.save_device_keys(
+        {
+            user_id: {d.device_id: d for d, _ in devices if d.user_id == user_id}
+            for user_id in (USER_ID, OTHER_USER_ID)
+        }
+    )
+    for device, trust in devices:
+        if trust == "verified":
+            assert machine.store.verify_device(device)
+        elif trust == "blacklisted":
+            assert machine.store.blacklist_device(device)
+
     await client.close()
 
     # nio names the database "<user_id>_<device_id>.db". A ":" cannot be part of
@@ -109,6 +145,10 @@ async def main(out_dir: str) -> None:
         os.path.join(store, f"{USER_ID}_{DEVICE_ID}.db"),
         os.path.join(store, "nio-store.db"),
     )
+    for suffix in TRUST_FILES:
+        name = os.path.join(store, f"{USER_ID}_{DEVICE_ID}.{suffix}")
+        if os.path.exists(name):
+            os.rename(name, os.path.join(store, f"nio-store.{suffix}"))
 
     creds = os.path.join(store, "credentials.json")
     fd = os.open(creds, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -140,6 +180,16 @@ async def main(out_dir: str) -> None:
                 "ciphertext": imported_ciphertext,
                 "plaintext": IMPORTED_PLAINTEXT,
             },
+        ],
+        "devices": [
+            {
+                "user_id": device.user_id,
+                "device_id": device.device_id,
+                "ed25519": device.ed25519,
+                "curve25519": device.curve25519,
+                "trust": trust,
+            }
+            for device, trust in devices
         ],
         "olm_message": {
             "message_type": reply.message_type,
