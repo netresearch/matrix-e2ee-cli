@@ -30,6 +30,17 @@ pub struct FakeDaemon {
 
 impl FakeDaemon {
     pub fn start(response: Option<Value>) -> Self {
+        let raw = response.map(|r| {
+            let mut out = serde_json::to_vec(&r).unwrap();
+            out.push(b'\n');
+            out
+        });
+        Self::start_raw(raw, false)
+    }
+
+    /// Answer with these bytes (none: close without answering); with
+    /// `reset`, close with unread input pending, which resets the connection.
+    pub fn start_raw(response: Option<Vec<u8>>, reset: bool) -> Self {
         let dir = short_tempdir();
         let path = dir.path().join("d.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -38,13 +49,18 @@ impl FakeDaemon {
             let Ok((mut conn, _)) = listener.accept() else {
                 return;
             };
+            if reset {
+                // Close before reading: the unread request makes the kernel
+                // reset the connection instead of a clean end of stream.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                drop(conn);
+                return;
+            }
             let mut line = Vec::new();
             BufReader::new(&conn).read_until(b'\n', &mut line).unwrap();
             tx.send(serde_json::from_slice(&line).unwrap()).ok();
             if let Some(response) = response {
-                let mut out = serde_json::to_vec(&response).unwrap();
-                out.push(b'\n');
-                conn.write_all(&out).unwrap();
+                conn.write_all(&response).unwrap();
             }
         });
         Self {

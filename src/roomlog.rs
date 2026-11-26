@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -422,6 +422,11 @@ pub fn next_seq(path: &Path) -> i64 {
 }
 
 /// Append one record, rotating first once the log has reached `max_bytes`.
+///
+/// A log that does not end in a newline holds a torn record (a writer killed
+/// mid-line): the new record starts on a line of its own, so the torn one
+/// does not swallow it. roomlog.py has no such guard; for a log that ends in
+/// a newline the bytes written are the same.
 pub fn append_record(path: &Path, record: &Record, max_bytes: u64) -> Result<()> {
     if fs::metadata(path).is_ok_and(|m| m.len() >= max_bytes) {
         fs::rename(path, rotated(path))
@@ -431,11 +436,27 @@ pub fn append_record(path: &Path, record: &Record, max_bytes: u64) -> Result<()>
     line.push('\n');
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .with_context(|| format!("cannot open {}", path.display()))?;
+    if ends_torn(&mut file).with_context(|| format!("cannot read {}", path.display()))? {
+        line.insert(0, '\n');
+    }
+    // One write, so the separator and the record land together.
     file.write_all(line.as_bytes())
         .with_context(|| format!("cannot append to {}", path.display()))
+}
+
+/// Is the file non-empty without a final newline?
+fn ends_torn(file: &mut fs::File) -> std::io::Result<bool> {
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 /// Where one reader's position in a room log is kept.
@@ -1024,6 +1045,32 @@ mod tests {
             "r_example.org.jsonl.1"
         );
         assert_eq!(next_seq(&l.path), 7);
+    }
+
+    #[test]
+    fn a_torn_record_does_not_swallow_the_next() {
+        let l = log();
+        append_record(&l.path, &rec_body(1, "eins"), DEFAULT_MAX_BYTES).unwrap();
+        // A writer killed mid-line left a fragment without a newline.
+        let mut f = OpenOptions::new().append(true).open(&l.path).unwrap();
+        f.write_all(br#"{"seq":2,"type":"m.te"#).unwrap();
+        drop(f);
+        append_record(&l.path, &rec_body(3, "drei"), DEFAULT_MAX_BYTES).unwrap();
+        let seqs: Vec<i64> = read_records(&l.path).iter().map(seq_of).collect();
+        assert_eq!(seqs, vec![1, 3]);
+        let text = fs::read_to_string(&l.path).unwrap();
+        assert!(text.ends_with("\n"), "{text}");
+        assert_eq!(text.lines().count(), 3, "{text}");
+    }
+
+    #[test]
+    fn a_clean_log_gets_no_extra_newline() {
+        let l = log();
+        append_record(&l.path, &rec_body(1, "eins"), DEFAULT_MAX_BYTES).unwrap();
+        append_record(&l.path, &rec_body(2, "zwei"), DEFAULT_MAX_BYTES).unwrap();
+        let text = fs::read_to_string(&l.path).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(!text.contains("\n\n"), "{text}");
     }
 
     #[test]

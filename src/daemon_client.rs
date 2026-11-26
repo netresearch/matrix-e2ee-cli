@@ -19,8 +19,9 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// What came back from the socket.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
-    /// Nothing serves the socket (no file, refused, a stale file, or the
-    /// connection closed without an answer): use the direct path.
+    /// Nothing serves the socket (no socket file, the connection refused, or
+    /// the request could not be written): use the direct path. Nothing was
+    /// handed to a daemon, so nothing can happen twice.
     NoDaemon,
     /// The daemon answered; an `"ok": false` answer is an answer too and
     /// must never lead to the direct path (the operation could happen twice).
@@ -29,10 +30,11 @@ pub enum Reply {
 
 /// Send one request and read one response line.
 ///
-/// Differs from daemon_client.py in one case: a daemon that accepted the
-/// request but does not answer within `timeout` is an error, not "no
-/// daemon". It may still carry out the request, so falling back to the
-/// direct path could send the message twice.
+/// Differs from daemon_client.py: once the whole request line is written,
+/// every outcome other than an answer is an error, not "no daemon": a
+/// timeout, the connection closed or reset, an empty or unreadable answer.
+/// The daemon may have carried out the request (or may still), so falling
+/// back to the direct path could send the message twice.
 #[cfg(unix)]
 pub fn request(socket: &Path, payload: &Value, timeout: Duration) -> Result<Reply> {
     use std::io::{BufRead, BufReader, ErrorKind, Write};
@@ -42,7 +44,8 @@ pub fn request(socket: &Path, payload: &Value, timeout: Duration) -> Result<Repl
         return Ok(Reply::NoDaemon);
     }
     let Ok(mut stream) = UnixStream::connect(socket) else {
-        // A stale socket from a crashed daemon, or none at all.
+        // A stale socket from a crashed daemon (refused), or none at all.
+        // Nothing was sent.
         return Ok(Reply::NoDaemon);
     };
     stream.set_write_timeout(Some(timeout)).ok();
@@ -52,6 +55,8 @@ pub fn request(socket: &Path, payload: &Value, timeout: Duration) -> Result<Repl
     if stream.write_all(&line).is_err() {
         return Ok(Reply::NoDaemon);
     }
+    // From here on the daemon holds the request: no outcome but an answer
+    // may lead to the direct path.
     let mut answer = Vec::new();
     match BufReader::new(&stream).read_until(b'\n', &mut answer) {
         Ok(_) => {}
@@ -59,16 +64,22 @@ pub fn request(socket: &Path, payload: &Value, timeout: Duration) -> Result<Repl
             "the watch daemon did not answer within {} s; the request may still be carried out, so it is not retried directly",
             timeout.as_secs()
         ),
-        Err(_) => return Ok(Reply::NoDaemon),
+        Err(e) => anyhow::bail!("{CLOSED_WITHOUT_ANSWER} ({e})"),
     }
     if answer.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Reply::NoDaemon);
+        anyhow::bail!("{CLOSED_WITHOUT_ANSWER}");
     }
     match serde_json::from_slice::<Value>(&answer) {
         Ok(value) if value.is_object() => Ok(Reply::Answer(value)),
-        _ => Ok(Reply::NoDaemon),
+        _ => anyhow::bail!(
+            "the watch daemon's answer is not a JSON object; the request may have been carried out, so it is not retried directly"
+        ),
     }
 }
+
+/// Why a request that reached the daemon has no answer.
+#[cfg(unix)]
+const CLOSED_WITHOUT_ANSWER: &str = "the daemon closed the connection without answering; the request may have been carried out, so it is not retried directly";
 
 /// No Unix sockets here, so never a daemon.
 #[cfg(not(unix))]
@@ -212,12 +223,37 @@ mod tests {
         }
 
         #[test]
-        fn daemon_closing_without_answering_reads_as_no_daemon() {
+        fn daemon_closing_without_answering_is_an_error_not_a_fallback() {
             let fake = FakeDaemon::start(None);
-            assert_eq!(
-                request(&fake.path, &json!({"op": "status"}), REQUEST_TIMEOUT).unwrap(),
-                Reply::NoDaemon
+            let err = request(&fake.path, &json!({"op": "send"}), REQUEST_TIMEOUT).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("closed the connection without answering"),
+                "{err}"
             );
+            assert_eq!(fake.received()["op"], "send");
+        }
+
+        #[test]
+        fn a_reset_connection_is_an_error_not_a_fallback() {
+            let fake = FakeDaemon::start_raw(Some(Vec::new()), true);
+            let err = request(&fake.path, &json!({"op": "send"}), REQUEST_TIMEOUT).unwrap_err();
+            assert!(
+                err.to_string().contains("may have been carried out"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn an_unreadable_answer_is_an_error_not_a_fallback() {
+            for raw in [b"\n".to_vec(), b"not json\n".to_vec(), b"[1]\n".to_vec()] {
+                let fake = FakeDaemon::start_raw(Some(raw.clone()), false);
+                let err = request(&fake.path, &json!({"op": "send"}), REQUEST_TIMEOUT).unwrap_err();
+                assert!(
+                    err.to_string().contains("may have been carried out"),
+                    "{raw:?}: {err}"
+                );
+            }
         }
 
         #[test]

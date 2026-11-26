@@ -28,7 +28,7 @@ pub async fn run(args: WatchDaemonArgs) -> Result<()> {
 
 #[cfg(unix)]
 pub mod unix {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::fs::{self, OpenOptions};
     use std::future::Future;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -51,6 +51,7 @@ pub mod unix {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::{Mutex, RwLock, watch};
+    use tokio::task::{JoinHandle, JoinSet};
 
     use crate::WatchDaemonArgs;
     use crate::commands::{edit, react, redact, send};
@@ -169,8 +170,46 @@ pub mod unix {
             }
             return Err(err).with_context(|| format!("cannot stop the watch daemon (pid {pid})"));
         }
+        // The daemon finishes the operation in flight and its answers first.
+        if !wait_for_exit(|| pid_alive(pid), STOP_WAIT, Duration::from_millis(100)).await {
+            bail!(
+                "sent SIGTERM to the watch daemon (pid {pid}), but it has not exited after {} s; it may still be finishing an operation (see {})",
+                STOP_WAIT.as_secs(),
+                paths.daemon_log().display()
+            );
+        }
         println!("Stopped the watch daemon (pid {pid}).");
         Ok(())
+    }
+
+    /// How long `--stop` waits for the daemon to exit.
+    const STOP_WAIT: Duration = Duration::from_secs(30);
+
+    /// Does `pid` still exist? EPERM means it does, owned by someone else.
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 checks only whether the process exists.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    /// Poll `alive` until it reports false (true) or `limit` passes (false).
+    pub async fn wait_for_exit(
+        mut alive: impl FnMut() -> bool,
+        limit: Duration,
+        interval: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            if !alive() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(interval).await;
+        }
     }
 
     /// Start `watch-daemon --foreground` in a new session, output appended to
@@ -322,13 +361,12 @@ pub mod unix {
             config,
             slot: RwLock::new(Some(client)),
             ops: Mutex::new(()),
-            log: std::sync::Mutex::new(LogState::default()),
+            stopping: AtomicBool::new(false),
+            recorder: Recorder::new(paths.rooms_dir(), own_user, own_display, own_key),
+            pending: std::sync::Mutex::new(PendingUtds::default()),
             rooms,
             started: Instant::now(),
             last_sync: AtomicI64::new(0),
-            own_user,
-            own_display,
-            own_key,
         });
 
         // One state-carrying sync before anything is served, so the room
@@ -345,6 +383,7 @@ pub mod unix {
                 .await
                 .context("the first sync failed")?;
             daemon.process(client, &response).await;
+            daemon.retry_undecryptable(client).await;
             daemon.last_sync.store(now_ms() / 1000, Ordering::SeqCst);
         }
 
@@ -375,11 +414,48 @@ pub mod unix {
                 Box::pin(async move { daemon.dispatch(request).await })
             })
         };
-        let server = tokio::spawn(serve(listener, handler, stop.clone()));
+        // Its own stop: the sync loop also ends on errors, not only on signals.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(serve(listener, handler, shutdown_rx));
         let result = daemon.sync_loop(stop).await;
-        server.abort();
+        shutdown(&daemon.ops, &daemon.stopping, &shutdown_tx, server).await;
         drop(cleanup);
         result
+    }
+
+    /// How long the connections may take to write their answers once the
+    /// operation in flight has finished.
+    const ANSWER_WAIT: Duration = Duration::from_secs(5);
+
+    /// End serving without dropping an answer: stop accepting, let the
+    /// operation in flight finish (later ones see `stopping` and refuse),
+    /// then give the connections [`ANSWER_WAIT`] to answer. Only then may the
+    /// process exit (main ends with `process::exit`, which kills every task).
+    pub async fn shutdown(
+        ops: &Mutex<()>,
+        stopping: &AtomicBool,
+        shutdown_tx: &watch::Sender<bool>,
+        server: JoinHandle<JoinSet<()>>,
+    ) {
+        stopping.store(true, Ordering::SeqCst);
+        shutdown_tx.send(true).ok();
+        let connections = server.await.unwrap_or_default();
+        drop(ops.lock().await);
+        if !drain(connections, ANSWER_WAIT).await {
+            eprintln!(
+                "some connections did not finish within {} s",
+                ANSWER_WAIT.as_secs()
+            );
+        }
+    }
+
+    /// Wait for every connection task, at most `limit`; true when all ended.
+    async fn drain(mut connections: JoinSet<()>, limit: Duration) -> bool {
+        tokio::time::timeout(limit, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await
+        .is_ok()
     }
 
     /// (room id, label) per `watch_rooms` entry: an alias is resolved and
@@ -415,19 +491,31 @@ pub mod unix {
         Arc<dyn Fn(Value) -> Pin<Box<dyn Future<Output = Value> + Send>> + Send + Sync>;
 
     /// Serve the socket until `stop`: one request line, one response line per
-    /// connection, connections handled concurrently.
-    pub async fn serve(listener: UnixListener, handler: Handler, mut stop: watch::Receiver<bool>) {
+    /// connection, connections handled concurrently. Returns the connections
+    /// still running, for [`shutdown`] to wait for; dropping the set aborts
+    /// them. The listener is closed on return, so a new client is refused at
+    /// once instead of waiting for an answer that never comes.
+    pub async fn serve(
+        listener: UnixListener,
+        handler: Handler,
+        mut stop: watch::Receiver<bool>,
+    ) -> JoinSet<()> {
+        let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => {
-                        tokio::spawn(handle_connection(stream, handler.clone()));
+                        connections.spawn(handle_connection(stream, handler.clone()));
                     }
                     Err(err) => eprintln!("socket accept failed: {err}"),
                 },
-                _ = stop.changed() => return,
+                // Reap finished connections, or the set grows per request.
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                _ = stop.changed() => break,
             }
         }
+        drop(listener);
+        connections
     }
 
     async fn handle_connection(stream: UnixStream, handler: Handler) {
@@ -455,40 +543,42 @@ pub mod unix {
         known_names: HashMap<String, String>,
     }
 
-    struct Daemon {
-        paths: Paths,
-        config: Config,
-        /// The one client. A request with `trust_unverified_devices` replaces
-        /// it for its duration (see [`Daemon::run_op`]).
-        slot: RwLock<Option<Client>>,
-        /// One operation at a time, like matrix-watchd.py's send lock.
-        ops: Mutex<()>,
+    /// Writes the room logs: the daemon is their only writer.
+    pub struct Recorder {
+        rooms_dir: PathBuf,
         log: std::sync::Mutex<LogState>,
-        rooms: Vec<(String, String)>,
-        started: Instant,
-        /// Unix seconds of the last successful sync, 0 for never.
-        last_sync: AtomicI64,
         own_user: String,
         own_display: Option<String>,
         own_key: Option<String>,
     }
 
-    impl Daemon {
-        fn watched(&self, room_id: &str) -> bool {
-            self.rooms.iter().any(|(id, _)| id == room_id)
+    impl Recorder {
+        pub fn new(
+            rooms_dir: PathBuf,
+            own_user: String,
+            own_display: Option<String>,
+            own_key: Option<String>,
+        ) -> Self {
+            Self {
+                rooms_dir,
+                log: std::sync::Mutex::new(LogState::default()),
+                own_user,
+                own_display,
+                own_key,
+            }
         }
 
         /// Append one event to its room's log. Sequence numbers and subjects
         /// are read from the log once per room and then kept in memory: the
         /// daemon is the only writer.
-        fn record_event(&self, room_id: &str, event: &Event) {
+        pub fn record_event(&self, room_id: &str, event: &Event) {
             if let Err(err) = self.try_record_event(room_id, event) {
                 eprintln!("cannot log an event of {room_id}: {err:#}");
             }
         }
 
         fn try_record_event(&self, room_id: &str, event: &Event) -> Result<()> {
-            let path = log_path(&self.paths.rooms_dir(), room_id)?;
+            let path = log_path(&self.rooms_dir, room_id)?;
             let mut state = self
                 .log
                 .lock()
@@ -513,6 +603,35 @@ pub mod unix {
             state.next_seq.insert(room_id.to_owned(), seq + 1);
             Ok(())
         }
+    }
+
+    struct Daemon {
+        paths: Paths,
+        config: Config,
+        /// The one client. A request with `trust_unverified_devices` replaces
+        /// it for its duration (see [`Daemon::run_op`]).
+        slot: RwLock<Option<Client>>,
+        /// One operation at a time, like matrix-watchd.py's send lock.
+        ops: Mutex<()>,
+        /// Set by [`shutdown`]: an operation still queued on `ops` refuses.
+        stopping: AtomicBool,
+        recorder: Recorder,
+        /// Events logged as undecryptable, retried for a correction record.
+        pending: std::sync::Mutex<PendingUtds>,
+        rooms: Vec<(String, String)>,
+        started: Instant,
+        /// Unix seconds of the last successful sync, 0 for never.
+        last_sync: AtomicI64,
+    }
+
+    impl Daemon {
+        fn watched(&self, room_id: &str) -> bool {
+            self.rooms.iter().any(|(id, _)| id == room_id)
+        }
+
+        fn record_event(&self, room_id: &str, event: &Event) {
+            self.recorder.record_event(room_id, event);
+        }
 
         /// A daemon-level message into every watched log: a daemon that dies
         /// quietly looks like a quiet room.
@@ -523,7 +642,7 @@ pub mod unix {
                     room_id,
                     &Event {
                         event_id: format!("$daemon-{ts}"),
-                        sender: self.own_user.clone(),
+                        sender: self.recorder.own_user.clone(),
                         sender_display: Some("watch-daemon".into()),
                         ts,
                         room_id: Some(room_id.clone()),
@@ -546,6 +665,17 @@ pub mod unix {
                     if let Some(event) = self.event_of(room.as_ref(), room_id.as_str(), event).await
                     {
                         self.record_event(room_id.as_str(), &event);
+                        if event.kind == "encrypted"
+                            && let Some(session_id) = &event.session_id
+                            && let Ok(mut pending) = self.pending.lock()
+                        {
+                            pending.add(
+                                room_id.as_str(),
+                                session_id,
+                                &event.event_id,
+                                Instant::now(),
+                            );
+                        }
                     }
                 }
             }
@@ -557,7 +687,7 @@ pub mod unix {
                 _ => None,
             };
             let name = member.and_then(|m| m.display_name().map(str::to_owned));
-            let mut state = self.log.lock().ok()?;
+            let mut state = self.recorder.log.lock().ok()?;
             match name {
                 Some(name) => {
                     state.known_names.insert(sender.to_owned(), name.clone());
@@ -573,25 +703,77 @@ pub mod unix {
             room_id: &str,
             event: &TimelineEvent,
         ) -> Option<Event> {
-            let raw: Value = serde_json::from_str(event.raw().json().get()).ok()?;
-            let sender_key = event
-                .encryption_info()
-                .map(|info| match &info.algorithm_info {
-                    AlgorithmInfo::MegolmV1AesSha2 { curve25519_key, .. } => curve25519_key.clone(),
-                    AlgorithmInfo::OlmV1Curve25519AesSha2 {
-                        curve25519_public_key_base64,
-                    } => curve25519_public_key_base64.clone(),
-                });
-            let undecryptable = matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. })
-                || raw.get("type").and_then(Value::as_str) == Some("m.room.encrypted");
-            let mut mapped = event_from_json(&raw, undecryptable)?;
+            let mut mapped = map_timeline_event(event)?;
             mapped.room_id = Some(room_id.to_owned());
-            mapped.sender_key = sender_key.or(mapped.sender_key);
             if mapped.ts == 0 {
                 mapped.ts = now_ms();
             }
             mapped.sender_display = self.display_name(room, &mapped.sender).await;
             Some(mapped)
+        }
+
+        /// Retry the undecryptable events whose session is due: fetching an
+        /// event again decrypts it with the keys now in the store (and asks
+        /// the key backup for a missing one). One event per session is
+        /// probed; only when it decrypts are the session's others fetched.
+        async fn retry_undecryptable(&self, client: &Client) {
+            let probes = match self.pending.lock() {
+                Ok(mut pending) => pending.probes(Instant::now()),
+                Err(_) => return,
+            };
+            for (room_id, session_id, event_id) in probes {
+                let room = matrix_sdk::ruma::RoomId::parse(&room_id)
+                    .ok()
+                    .and_then(|id| client.get_room(&id));
+                let Some(room) = room else {
+                    continue;
+                };
+                if !self.retry_one(&room, &room_id, &event_id).await {
+                    if let Ok(mut pending) = self.pending.lock() {
+                        pending.not_yet(&room_id, &session_id, Instant::now());
+                    }
+                    continue;
+                }
+                let rest = match self.pending.lock() {
+                    Ok(pending) => pending.events_of(&room_id, &session_id),
+                    Err(_) => continue,
+                };
+                for event_id in rest {
+                    self.retry_one(&room, &room_id, &event_id).await;
+                }
+            }
+        }
+
+        /// Fetch one pending event again; false while it stays undecryptable
+        /// (or the fetch fails), true once it is settled: a correction record
+        /// written, or nothing to write for its decrypted type.
+        async fn retry_one(&self, room: &Room, room_id: &str, event_id: &str) -> bool {
+            let Ok(id) = matrix_sdk::ruma::EventId::parse(event_id) else {
+                return self.settle(event_id, None);
+            };
+            let Ok(event) = room.event(&id, None).await else {
+                return false;
+            };
+            match retry_outcome(&event) {
+                RetryOutcome::StillUndecryptable => false,
+                RetryOutcome::NotLogged => self.settle(event_id, None),
+                RetryOutcome::Decrypted(_) => {
+                    let corrected = self.event_of(Some(room), room_id, &event).await;
+                    self.settle(event_id, corrected.map(|e| (room_id, e)))
+                }
+            }
+        }
+
+        /// Write the correction (if any) and drop the pending entry, with no
+        /// await in between.
+        fn settle(&self, event_id: &str, correction: Option<(&str, Event)>) -> bool {
+            if let Some((room_id, event)) = correction {
+                self.record_event(room_id, &event);
+            }
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(event_id);
+            }
+            true
         }
 
         async fn dispatch(self: Arc<Self>, request: Value) -> Value {
@@ -673,6 +855,9 @@ pub mod unix {
             Fut: Future<Output = Result<Value>>,
         {
             let _one_at_a_time = self.ops.lock().await;
+            if self.stopping.load(Ordering::SeqCst) {
+                bail!("the watch daemon is stopping; the request was not carried out");
+            }
             if !trust_unverified {
                 let client = self
                     .slot
@@ -726,13 +911,18 @@ pub mod unix {
                     return Ok(());
                 }
                 let outcome = {
-                    let guard = self.slot.read().await;
+                    // An operation may hold the slot (a send to unverified
+                    // devices); stop must not wait for it here, shutdown does.
+                    let guard = tokio::select! {
+                        guard = self.slot.read() => guard,
+                        _ = stop.changed() => return Ok(()),
+                    };
                     let Some(client) = guard.as_ref() else {
                         self.announce("the watch daemon stopped: it could not reopen its store; see daemon.log");
                         bail!("the store could not be reopened");
                     };
                     let settings = SyncSettings::default().timeout(SYNC_TIMEOUT);
-                    tokio::select! {
+                    let outcome = tokio::select! {
                         result = client.sync_once(settings) => match result {
                             Ok(response) => {
                                 self.process(client, &response).await;
@@ -741,7 +931,14 @@ pub mod unix {
                             Err(err) => Err(err),
                         },
                         _ = stop.changed() => return Ok(()),
+                    };
+                    if outcome.is_ok() {
+                        tokio::select! {
+                            () = self.retry_undecryptable(client) => {}
+                            _ = stop.changed() => return Ok(()),
+                        }
                     }
+                    outcome
                 };
                 match outcome {
                     Ok(()) => {
@@ -770,6 +967,155 @@ pub mod unix {
                 }
             }
         }
+    }
+
+    /// Undecryptable events kept for a retry at most.
+    const PENDING_MAX: usize = 1000;
+    /// An undecryptable event is given up on after this long.
+    const PENDING_GIVE_UP: Duration = Duration::from_secs(24 * 60 * 60);
+    /// The first wait before a session is probed again; doubled per failed
+    /// probe up to [`RETRY_MAX`].
+    const RETRY_FIRST: Duration = Duration::from_secs(30);
+    const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
+    /// Sessions probed per round at most (one fetch each).
+    const PROBES_PER_ROUND: usize = 20;
+
+    /// One event logged as undecryptable.
+    #[derive(Debug, Clone, PartialEq)]
+    struct PendingUtd {
+        room_id: String,
+        session_id: String,
+        event_id: String,
+        since: Instant,
+    }
+
+    /// The undecryptable events waiting for their room key, oldest first,
+    /// and when each session is probed next. In memory only: a restarted
+    /// daemon does not correct what an earlier one logged.
+    #[derive(Debug, Default)]
+    pub struct PendingUtds {
+        entries: VecDeque<PendingUtd>,
+        /// (room id, session id) -> (next probe, current wait).
+        schedule: HashMap<(String, String), (Instant, Duration)>,
+    }
+
+    impl PendingUtds {
+        pub fn add(&mut self, room_id: &str, session_id: &str, event_id: &str, now: Instant) {
+            if self.entries.iter().any(|e| e.event_id == event_id) {
+                return;
+            }
+            self.entries.push_back(PendingUtd {
+                room_id: room_id.to_owned(),
+                session_id: session_id.to_owned(),
+                event_id: event_id.to_owned(),
+                since: now,
+            });
+            // A new session is probed at the next round: its key often
+            // arrives right after the event.
+            self.schedule
+                .entry((room_id.to_owned(), session_id.to_owned()))
+                .or_insert((now, RETRY_FIRST));
+            while self.entries.len() > PENDING_MAX {
+                self.entries.pop_front();
+            }
+            self.forget_empty_sessions();
+        }
+
+        /// Drop what is past [`PENDING_GIVE_UP`], then name one event per
+        /// session that is due, oldest session first.
+        pub fn probes(&mut self, now: Instant) -> Vec<(String, String, String)> {
+            self.entries
+                .retain(|e| now.saturating_duration_since(e.since) < PENDING_GIVE_UP);
+            self.forget_empty_sessions();
+            let mut seen = std::collections::HashSet::new();
+            let mut probes = Vec::new();
+            for e in &self.entries {
+                let key = (e.room_id.clone(), e.session_id.clone());
+                let due = self.schedule.get(&key).is_none_or(|(next, _)| *next <= now);
+                if due && seen.insert(key) {
+                    probes.push((e.room_id.clone(), e.session_id.clone(), e.event_id.clone()));
+                    if probes.len() == PROBES_PER_ROUND {
+                        break;
+                    }
+                }
+            }
+            probes
+        }
+
+        /// A probe of this session stayed undecryptable: wait longer.
+        pub fn not_yet(&mut self, room_id: &str, session_id: &str, now: Instant) {
+            let slot = self
+                .schedule
+                .entry((room_id.to_owned(), session_id.to_owned()))
+                .or_insert((now, RETRY_FIRST));
+            *slot = (now + slot.1, (slot.1 * 2).min(RETRY_MAX));
+        }
+
+        /// The pending event ids of one session.
+        pub fn events_of(&self, room_id: &str, session_id: &str) -> Vec<String> {
+            self.entries
+                .iter()
+                .filter(|e| e.room_id == room_id && e.session_id == session_id)
+                .map(|e| e.event_id.clone())
+                .collect()
+        }
+
+        pub fn remove(&mut self, event_id: &str) {
+            self.entries.retain(|e| e.event_id != event_id);
+            self.forget_empty_sessions();
+        }
+
+        #[cfg(test)]
+        pub fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        fn forget_empty_sessions(&mut self) {
+            let entries = &self.entries;
+            self.schedule.retain(|(room, session), _| {
+                entries
+                    .iter()
+                    .any(|e| &e.room_id == room && &e.session_id == session)
+            });
+        }
+    }
+
+    /// What fetching an undecryptable event again gave.
+    #[derive(Debug, PartialEq)]
+    pub enum RetryOutcome {
+        StillUndecryptable,
+        /// Decrypted, but of a type the log does not carry.
+        NotLogged,
+        Decrypted(Box<Event>),
+    }
+
+    pub fn retry_outcome(event: &TimelineEvent) -> RetryOutcome {
+        match map_timeline_event(event) {
+            None => RetryOutcome::NotLogged,
+            Some(mapped) if mapped.kind == "encrypted" => RetryOutcome::StillUndecryptable,
+            Some(mapped) => RetryOutcome::Decrypted(Box::new(mapped)),
+        }
+    }
+
+    /// [`event_from_json`] for a timeline event: undecryptable when the SDK
+    /// says so or when the event is still `m.room.encrypted` (a decryption
+    /// that failed with an error), and the sender key of the device that
+    /// encrypted it when it was decrypted.
+    pub fn map_timeline_event(event: &TimelineEvent) -> Option<Event> {
+        let raw: Value = serde_json::from_str(event.raw().json().get()).ok()?;
+        let sender_key = event
+            .encryption_info()
+            .map(|info| match &info.algorithm_info {
+                AlgorithmInfo::MegolmV1AesSha2 { curve25519_key, .. } => curve25519_key.clone(),
+                AlgorithmInfo::OlmV1Curve25519AesSha2 {
+                    curve25519_public_key_base64,
+                } => curve25519_public_key_base64.clone(),
+            });
+        let undecryptable = matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. })
+            || raw.get("type").and_then(Value::as_str) == Some("m.room.encrypted");
+        let mut mapped = event_from_json(&raw, undecryptable)?;
+        mapped.sender_key = sender_key.or(mapped.sender_key);
+        Some(mapped)
     }
 
     /// `{"ok": true}` plus the outcome's fields.
@@ -933,6 +1279,238 @@ pub mod unix {
                 serde_json::from_str::<Value>(&answer).unwrap(),
                 json!({"ok": false, "error": "malformed request"})
             );
+        }
+
+        /// A handler that holds `ops` like run_op, says when it started and
+        /// answers only after a while.
+        fn slow_handler(ops: Arc<Mutex<()>>, started: Arc<tokio::sync::Notify>) -> Handler {
+            Arc::new(move |request: Value| {
+                let ops = ops.clone();
+                let started = started.clone();
+                Box::pin(async move {
+                    let _op = ops.lock().await;
+                    started.notify_one();
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    json!({"ok": true, "event_id": "$sent", "echo": request})
+                })
+            })
+        }
+
+        #[test]
+        fn an_operation_in_flight_is_answered_when_the_daemon_stops() {
+            let dir = short_tempdir();
+            let path = dir.path().join("d.sock");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let client = runtime.block_on(async {
+                let listener = UnixListener::bind(&path).unwrap();
+                let ops = Arc::new(Mutex::new(()));
+                let started = Arc::new(tokio::sync::Notify::new());
+                let stopping = AtomicBool::new(false);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let server = tokio::spawn(serve(
+                    listener,
+                    slow_handler(ops.clone(), started.clone()),
+                    shutdown_rx,
+                ));
+                let socket = path.clone();
+                let client = std::thread::spawn(move || {
+                    request(
+                        &socket,
+                        &json!({"op": "send", "body": "hi"}),
+                        REQUEST_TIMEOUT,
+                    )
+                });
+                started.notified().await;
+                // The stop arrives while the send is being carried out.
+                shutdown(&ops, &stopping, &shutdown_tx, server).await;
+                assert!(stopping.load(Ordering::SeqCst));
+                client
+            });
+            // What process::exit does to every task still running.
+            runtime.shutdown_background();
+            let reply = client.join().unwrap();
+            let Ok(Reply::Answer(answer)) = reply else {
+                panic!("the send was carried out but not answered: {reply:?}");
+            };
+            assert_eq!(answer["event_id"], "$sent");
+            assert!(!path.exists() || std::os::unix::net::UnixStream::connect(&path).is_err());
+        }
+
+        fn t0() -> Instant {
+            Instant::now()
+        }
+
+        #[test]
+        fn pending_probes_one_event_per_session() {
+            let now = t0();
+            let mut p = PendingUtds::default();
+            p.add("!r", "S1", "$a", now);
+            p.add("!r", "S1", "$b", now);
+            p.add("!r", "S2", "$c", now);
+            p.add("!r", "S1", "$a", now);
+            assert_eq!(p.len(), 3, "an event is kept once");
+            assert_eq!(
+                p.probes(now),
+                vec![
+                    ("!r".into(), "S1".into(), "$a".into()),
+                    ("!r".into(), "S2".into(), "$c".into())
+                ]
+            );
+            assert_eq!(p.events_of("!r", "S1"), vec!["$a", "$b"]);
+            p.remove("$a");
+            assert_eq!(p.events_of("!r", "S1"), vec!["$b"]);
+        }
+
+        #[test]
+        fn a_session_that_stays_undecryptable_is_probed_less_often() {
+            let now = t0();
+            let mut p = PendingUtds::default();
+            p.add("!r", "S", "$a", now);
+            p.not_yet("!r", "S", now);
+            assert!(p.probes(now + Duration::from_secs(29)).is_empty());
+            assert_eq!(p.probes(now + RETRY_FIRST).len(), 1);
+            p.not_yet("!r", "S", now + RETRY_FIRST);
+            assert!(
+                p.probes(now + RETRY_FIRST * 2).is_empty(),
+                "the wait doubles"
+            );
+            assert_eq!(p.probes(now + RETRY_FIRST * 3).len(), 1);
+        }
+
+        #[test]
+        fn pending_is_bounded_and_drops_the_oldest() {
+            let now = t0();
+            let mut p = PendingUtds::default();
+            for i in 0..PENDING_MAX + 5 {
+                p.add("!r", &format!("S{i}"), &format!("$e{i}"), now);
+            }
+            assert_eq!(p.len(), PENDING_MAX);
+            assert!(p.events_of("!r", "S0").is_empty());
+            assert!(p.events_of("!r", "S4").is_empty());
+            assert_eq!(p.events_of("!r", "S5"), vec!["$e5"]);
+            assert_eq!(
+                p.schedule.len(),
+                PENDING_MAX,
+                "no schedule for dropped sessions"
+            );
+        }
+
+        #[test]
+        fn pending_gives_up_after_a_day() {
+            let now = t0();
+            let mut p = PendingUtds::default();
+            p.add("!r", "S", "$old", now);
+            p.add("!r", "T", "$new", now + Duration::from_secs(3600));
+            let probes = p.probes(now + PENDING_GIVE_UP);
+            assert_eq!(probes, vec![("!r".into(), "T".into(), "$new".into())]);
+            assert_eq!(p.len(), 1);
+        }
+
+        fn timeline(value: Value) -> TimelineEvent {
+            TimelineEvent::from_plaintext(
+                matrix_sdk::ruma::serde::Raw::from_json_string(value.to_string()).unwrap(),
+            )
+        }
+
+        #[test]
+        fn a_retry_tells_decrypted_from_still_undecryptable() {
+            let base = json!({"event_id": "$e", "sender": "@a:e", "origin_server_ts": 5});
+            let with = |extra: Value| {
+                let mut v = base.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            let still = timeline(with(json!({"type": "m.room.encrypted", "content": {
+                "algorithm": "m.megolm.v1.aes-sha2", "session_id": "S", "ciphertext": "x"}})));
+            assert_eq!(retry_outcome(&still), RetryOutcome::StillUndecryptable);
+            let image = timeline(with(
+                json!({"type": "m.room.message", "content": {"msgtype": "m.image", "body": "x"}}),
+            ));
+            assert_eq!(retry_outcome(&image), RetryOutcome::NotLogged);
+            let text = timeline(with(
+                json!({"type": "m.room.message", "content": {"msgtype": "m.text", "body": "hallo"}}),
+            ));
+            let RetryOutcome::Decrypted(event) = retry_outcome(&text) else {
+                panic!("a decrypted message must give a correction");
+            };
+            assert_eq!(
+                (event.event_id.as_str(), event.body.as_deref()),
+                ("$e", Some("hallo"))
+            );
+        }
+
+        #[test]
+        fn a_correction_record_has_the_same_event_id_and_a_new_seq() {
+            let dir = tempfile::tempdir().unwrap();
+            let recorder = Recorder::new(dir.path().to_path_buf(), "@me:e".into(), None, None);
+            let utd = event_from_json(
+                &json!({"event_id": "$e", "sender": "@a:e", "origin_server_ts": 5,
+                    "type": "m.room.encrypted", "content": {"session_id": "S"}}),
+                true,
+            )
+            .unwrap();
+            recorder.record_event("!r:e", &utd);
+            let decrypted = timeline(
+                json!({"event_id": "$e", "sender": "@a:e", "origin_server_ts": 5,
+                "type": "m.room.message", "content": {"msgtype": "m.text", "body": "hallo"}}),
+            );
+            let RetryOutcome::Decrypted(corrected) = retry_outcome(&decrypted) else {
+                panic!("no correction");
+            };
+            recorder.record_event("!r:e", &corrected);
+            let records = crate::roomlog::read_records(&log_path(dir.path(), "!r:e").unwrap());
+            assert_eq!(records.len(), 2);
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|r| (r["event_id"].clone(), r["seq"].clone(), r["type"].clone()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (json!("$e"), json!(1), json!("encrypted")),
+                    (json!("$e"), json!(2), json!("m.text")),
+                ]
+            );
+            assert_eq!(records[1]["body"], "hallo");
+            assert_eq!(records[0]["session_id"], "S");
+        }
+
+        #[tokio::test]
+        async fn stop_waits_until_the_process_is_gone() {
+            let mut probes = 0;
+            let gone = wait_for_exit(
+                || {
+                    probes += 1;
+                    probes < 4
+                },
+                Duration::from_secs(5),
+                Duration::from_millis(1),
+            )
+            .await;
+            assert!(gone);
+            assert_eq!(probes, 4, "returned before the process was gone");
+        }
+
+        #[tokio::test]
+        async fn stop_reports_a_process_that_does_not_exit() {
+            let started = Instant::now();
+            let gone =
+                wait_for_exit(|| true, Duration::from_millis(50), Duration::from_millis(5)).await;
+            assert!(!gone);
+            assert!(started.elapsed() >= Duration::from_millis(50));
+        }
+
+        #[test]
+        fn a_live_and_a_gone_pid() {
+            assert!(pid_alive(i32::try_from(std::process::id()).unwrap()));
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = i32::try_from(child.id()).unwrap();
+            child.wait().unwrap();
+            assert!(!pid_alive(pid));
         }
 
         #[test]
