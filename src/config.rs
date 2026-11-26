@@ -72,6 +72,33 @@ pub fn load_config() -> Result<Config> {
     parse_config(&text).with_context(|| format!("in {}", path.display()))
 }
 
+/// `watch_rooms` of config.json: the rooms the watch daemon logs (room ids
+/// or aliases). Read only by the daemon, so a malformed value cannot break
+/// the other commands.
+pub fn parse_watch_rooms(text: &str) -> Result<Vec<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).context("config.json is not valid JSON")?;
+    match value.get("watch_rooms") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .context("watch_rooms must list room ids or aliases as strings")
+            })
+            .collect(),
+        Some(_) => bail!("watch_rooms must be a list of room ids or aliases"),
+    }
+}
+
+pub fn load_watch_rooms() -> Result<Vec<String>> {
+    let path = config_path()?;
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read config file {}", path.display()))?;
+    parse_watch_rooms(&text).with_context(|| format!("in {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +148,17 @@ mod tests {
             err.contains("user_id") && !err.contains("homeserver"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn watch_rooms_are_optional_strings() {
+        assert!(parse_watch_rooms("{}").unwrap().is_empty());
+        assert_eq!(
+            parse_watch_rooms(r##"{"watch_rooms":["#it:example.org","!r:example.org"]}"##).unwrap(),
+            vec!["#it:example.org".to_owned(), "!r:example.org".to_owned()]
+        );
+        assert!(parse_watch_rooms(r##"{"watch_rooms":"#it:example.org"}"##).is_err());
+        assert!(parse_watch_rooms(r#"{"watch_rooms":[1]}"#).is_err());
     }
 
     #[test]

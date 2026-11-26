@@ -81,6 +81,33 @@ impl Paths {
         self.lock_within(LOCK_WAIT).await
     }
 
+    /// Hold the data directory, or fail at once when another process holds
+    /// it (the watch daemon refuses instead of waiting).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub async fn try_lock(&self) -> Result<DataDirLock> {
+        self.lock_within(Duration::ZERO).await
+    }
+
+    /// The watch daemon's room logs and room pages.
+    pub fn rooms_dir(&self) -> PathBuf {
+        self.data_dir.join("rooms")
+    }
+
+    /// The watch daemon's Unix socket.
+    pub fn daemon_socket(&self) -> PathBuf {
+        self.data_dir.join("daemon.sock")
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn daemon_pid_file(&self) -> PathBuf {
+        self.data_dir.join("daemon.pid")
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn daemon_log(&self) -> PathBuf {
+        self.data_dir.join("daemon.log")
+    }
+
     async fn lock_within(&self, wait: Duration) -> Result<DataDirLock> {
         let path = self.data_dir.join(LOCK_FILE);
         // Directory creation and open are blocking file I/O: keep them off the
@@ -609,6 +636,26 @@ pub async fn restore_from(
     Ok(Restored { client, session })
 }
 
+/// Drop `client` and wait until its last clone is gone; matrix-sdk's own
+/// tasks hold clones for a while (about one second with matrix-sdk 0.20.0,
+/// measured). Then nothing of the client is left that could write to the
+/// store; its SQLite connections are being closed (deadpool-sync drops them
+/// in a blocking task). Gives the client back when clones remain after
+/// `within`, so a caller never opens a second client beside a live one.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub async fn close_client(client: Client, within: Duration) -> std::result::Result<(), Client> {
+    let weak = client.downgrade();
+    drop(client);
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match weak.get() {
+            None => return Ok(()),
+            Some(client) if tokio::time::Instant::now() >= deadline => return Err(client),
+            Some(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+}
+
 /// A client with an in-memory store, logged in with the session file's
 /// token. It cannot decrypt or send encrypted messages; `logout` uses it to
 /// revoke the token when the SQLite store cannot be opened.
@@ -834,6 +881,78 @@ mod tests {
         let a = generate_passphrase();
         assert_eq!(a.len(), 64);
         assert_ne!(a, generate_passphrase());
+    }
+
+    /// Open file descriptors of this process that point into `dir`.
+    #[cfg(target_os = "linux")]
+    fn open_files_in(dir: &Path) -> usize {
+        let dir = fs::canonicalize(dir).unwrap();
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|e| fs::read_link(e.ok()?.path()).ok())
+            .filter(|target| target.starts_with(&dir))
+            .count()
+    }
+
+    /// The watch daemon replaces its client for a send to unverified devices
+    /// (`run_op`): once [`close_client`] returns, no clone of the client is
+    /// left and the store's connections close.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_client_returns_once_the_store_is_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            data_dir: tmp.path().join("app"),
+        };
+        let session = SessionFile {
+            homeserver: "https://matrix.invalid".into(),
+            ..sample()
+        };
+        for sharing in [KeySharing::VerifiedOnly, KeySharing::IncludeUnverified] {
+            let restored = restore_from(session.clone(), &paths, sharing)
+                .await
+                .unwrap();
+            assert!(open_files_in(&paths.store_dir()) > 0, "the store is open");
+            assert!(
+                close_client(restored.client, Duration::from_secs(30))
+                    .await
+                    .is_ok()
+            );
+            // The last clone is gone. What remains is deadpool-sync closing
+            // the SQLite connections in a blocking task (its SyncWrapper's
+            // Drop): no matrix-sdk state is left that could write.
+            let start = std::time::Instant::now();
+            while open_files_in(&paths.store_dir()) > 0 && start.elapsed() < Duration::from_secs(2)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                open_files_in(&paths.store_dir()),
+                0,
+                "the store is still open ({sharing:?})"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_client_gives_the_client_back_while_clones_remain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            data_dir: tmp.path().join("app"),
+        };
+        let session = SessionFile {
+            homeserver: "https://matrix.invalid".into(),
+            ..sample()
+        };
+        let client = restore_from(session, &paths, KeySharing::VerifiedOnly)
+            .await
+            .unwrap()
+            .client;
+        let held = client.clone();
+        let back = close_client(client, Duration::from_millis(100)).await;
+        assert!(back.is_err(), "a clone is still held");
+        drop((back, held));
     }
 
     #[tokio::test]

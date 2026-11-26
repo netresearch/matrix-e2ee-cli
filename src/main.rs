@@ -6,7 +6,11 @@
 
 mod commands;
 mod config;
+mod daemon_client;
+#[cfg(all(test, unix))]
+mod daemon_test_support;
 mod room_arg;
+mod roomlog;
 mod session;
 mod text;
 
@@ -53,6 +57,13 @@ enum Command {
     Redact(RedactArgs),
     /// Download the attachment of a file, image, video or audio message.
     Download(DownloadArgs),
+    /// Run the watch daemon: it holds the store, logs the rooms in
+    /// config.json's "watch_rooms" and carries out send, react, redact and
+    /// edit for the other commands while it runs (Linux and macOS).
+    WatchDaemon(WatchDaemonArgs),
+    /// Follow a watched room's log: a summary of what is new since the
+    /// cursor, then one line per event. Needs no store and no lock.
+    Watch(WatchArgs),
     /// Import secrets and room keys from server-side key backup with a recovery key.
     ///
     /// The key comes from MATRIX_RECOVERY_KEY or a prompt, never from the
@@ -186,6 +197,38 @@ pub struct RedactArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("action").required(true).args(["start", "stop", "status", "foreground"])))]
+pub struct WatchDaemonArgs {
+    /// Start in the background (output in daemon.log in the data directory).
+    #[arg(long)]
+    pub start: bool,
+    /// Stop the daemon that answers on the socket.
+    #[arg(long)]
+    pub stop: bool,
+    /// Ask the running daemon for its state.
+    #[arg(long)]
+    pub status: bool,
+    /// Run in this terminal.
+    #[arg(long)]
+    pub foreground: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WatchArgs {
+    /// Room id (!x:server), or the alias or room id as written in "watch_rooms".
+    pub room: String,
+    /// Name this reader's position, so several sessions can follow one room.
+    #[arg(long, default_value = "default", value_name = "NAME")]
+    pub cursor: String,
+    /// Skip the "since last" line.
+    #[arg(long)]
+    pub no_summary: bool,
+    /// Print what is new and exit instead of following.
+    #[arg(long)]
+    pub once: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct DownloadArgs {
     /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
     pub room: String,
@@ -215,6 +258,8 @@ async fn main() {
         Command::React(args) => commands::react::run(args).await,
         Command::Redact(args) => commands::redact::run(args).await,
         Command::Download(args) => commands::download::run(args).await,
+        Command::WatchDaemon(args) => commands::watch_daemon::run(args).await,
+        Command::Watch(args) => commands::watch::run(args).await,
         Command::BackupRestore => commands::backup::run().await,
         Command::Logout { yes, local_only } => commands::logout::run(yes, local_only).await,
         Command::MigrateNio {
@@ -369,6 +414,35 @@ mod tests {
         assert_eq!(args.output, Some(std::path::PathBuf::from("d")));
         assert_eq!(args.filename.as_deref(), Some("f.txt"));
         assert!(Cli::try_parse_from(["m", "download", "r", "$e", "--overwrite"]).is_err());
+    }
+
+    #[test]
+    fn watch_daemon_needs_exactly_one_action() {
+        assert!(Cli::try_parse_from(["m", "watch-daemon"]).is_err());
+        assert!(Cli::try_parse_from(["m", "watch-daemon", "--start", "--stop"]).is_err());
+        for action in ["--start", "--stop", "--status", "--foreground"] {
+            assert!(
+                Cli::try_parse_from(["m", "watch-daemon", action]).is_ok(),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_takes_a_room_and_a_cursor() {
+        let Command::Watch(args) =
+            Cli::try_parse_from(["m", "watch", "!r:e", "--cursor", "s1", "--once"])
+                .unwrap()
+                .command
+        else {
+            panic!("not watch")
+        };
+        assert_eq!((args.room.as_str(), args.cursor.as_str()), ("!r:e", "s1"));
+        assert!(args.once && !args.no_summary);
+        let Command::Watch(args) = Cli::try_parse_from(["m", "watch", "r"]).unwrap().command else {
+            panic!("not watch")
+        };
+        assert_eq!(args.cursor, "default");
     }
 
     #[test]

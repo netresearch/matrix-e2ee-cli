@@ -15,6 +15,8 @@ pub mod redact;
 pub mod send;
 pub mod status;
 pub mod verify;
+pub mod watch;
+pub mod watch_daemon;
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::time::Duration;
@@ -37,6 +39,43 @@ pub async fn sync_once(client: &Client) -> Result<()> {
         .await
         .context("sync failed")?;
     Ok(())
+}
+
+/// Hand `request` to the watch daemon when one answers on its socket.
+///
+/// `None`: no daemon, take the direct path. A refusal (`"ok": false`) is
+/// an error, never `None`: the direct path could then carry out the same
+/// operation a second time. This is the only routing signal; the data-dir
+/// lock is not one, since a direct command holds it too.
+pub async fn via_daemon<T: serde::de::DeserializeOwned>(
+    paths: &crate::session::Paths,
+    request: serde_json::Value,
+    what: &str,
+) -> Result<Option<T>> {
+    via_daemon_at(&paths.daemon_socket(), request, what).await
+}
+
+/// [`via_daemon`] with the socket path given.
+pub async fn via_daemon_at<T: serde::de::DeserializeOwned>(
+    socket: &std::path::Path,
+    request: serde_json::Value,
+    what: &str,
+) -> Result<Option<T>> {
+    use crate::daemon_client::{REQUEST_TIMEOUT, Reply, error_of, request_async};
+    match request_async(socket, request, REQUEST_TIMEOUT).await? {
+        Reply::NoDaemon => Ok(None),
+        Reply::Answer(answer) => {
+            if answer.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                bail!(
+                    "{}",
+                    error_of(&answer, &format!("the watch daemon refused the {what}"))
+                );
+            }
+            serde_json::from_value(answer)
+                .map(Some)
+                .context("the watch daemon's answer is incomplete")
+        }
+    }
 }
 
 /// Parse the EVENT_ID argument (`$...`).
@@ -252,6 +291,79 @@ pub fn discard_typeahead(fd: std::os::fd::RawFd) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[cfg(unix)]
+    mod routing {
+        use super::super::{via_daemon, via_daemon_at};
+        use crate::commands::send::SendOutcome;
+        use crate::daemon_test_support::{FakeDaemon, short_tempdir};
+        use crate::session::Paths;
+        use serde_json::json;
+
+        fn request() -> serde_json::Value {
+            json!({"op": "send", "room": "!r:e", "body": "hi", "msgtype": "m.text", "trust_unverified_devices": false})
+        }
+
+        #[tokio::test]
+        async fn without_a_socket_the_direct_path_is_taken() {
+            let dir = short_tempdir();
+            let paths = Paths {
+                data_dir: dir.path().to_owned(),
+            };
+            let routed = via_daemon::<SendOutcome>(&paths, request(), "message")
+                .await
+                .unwrap();
+            assert_eq!(routed, None);
+        }
+
+        #[tokio::test]
+        async fn a_listening_daemon_gets_the_request_and_its_answer_is_the_outcome() {
+            let fake = FakeDaemon::start(Some(
+                json!({"ok": true, "event_id": "$x", "room_id": "!r:e", "encrypted": true}),
+            ));
+            // A test socket path must stay short (sun_path), hence not
+            // <data_dir>/daemon.sock under a long TMPDIR.
+            let routed = via_daemon_at::<SendOutcome>(&fake.path, request(), "message")
+                .await
+                .unwrap();
+            assert_eq!(
+                routed,
+                Some(SendOutcome {
+                    event_id: "$x".into(),
+                    room_id: "!r:e".into(),
+                    encrypted: true,
+                    warnings: vec![],
+                })
+            );
+            assert_eq!(fake.received(), request());
+        }
+
+        #[tokio::test]
+        async fn a_refusal_is_an_error_never_the_direct_path() {
+            let fake = FakeDaemon::start(Some(
+                json!({"ok": false, "error": "the room has devices that are not verified"}),
+            ));
+            let err = via_daemon_at::<SendOutcome>(&fake.path, request(), "message")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not verified"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_held_data_dir_lock_does_not_route_to_the_socket() {
+            // The lock is no routing signal: a direct command holds it too.
+            let dir = short_tempdir();
+            let paths = Paths {
+                data_dir: dir.path().to_owned(),
+            };
+            let _lock = paths.try_lock().await.unwrap();
+            let routed = via_daemon::<SendOutcome>(&paths, request(), "message")
+                .await
+                .unwrap();
+            assert_eq!(routed, None);
+        }
+    }
 
     #[test]
     fn redacted_events_are_recognised() {
