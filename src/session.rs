@@ -291,14 +291,16 @@ pub fn read_session(path: &Path) -> Result<Option<SessionFile>> {
     Ok(Some(session))
 }
 
-/// Delete the session file and the store directory. Missing parts are fine.
+/// Delete the store directory, then the session file. Missing parts are
+/// fine. The session file goes last: when the store cannot be removed, it
+/// stays, so a later `logout` finds the session and can finish the cleanup.
 pub fn delete_local_state(paths: &Paths) -> Result<()> {
+    remove_store(paths)?;
     match fs::remove_file(paths.session_file()) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("cannot delete the session file"),
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("cannot delete the session file"),
     }
-    remove_store(paths)
 }
 
 const STASH_SUFFIX: &str = ".prev";
@@ -326,6 +328,16 @@ fn shell_quote(path: &Path) -> String {
 /// the current state.
 pub fn stash_refusal(paths: &Paths) -> String {
     let stash = existing_stash(paths);
+    let store_stash = stash_path(&paths.store_dir());
+    if !stash.contains(&stash_path(&paths.session_file())) && stash.contains(&store_stash) {
+        // Its session file, and with it the store passphrase, is gone: a
+        // remainder of a cleanup, not a session that can be put back.
+        return format!(
+            "{} is left over from an earlier login; it holds only an encrypted store whose passphrase is gone, so it cannot be restored; remove it with: rm -r {}",
+            store_stash.display(),
+            shell_quote(&store_stash)
+        );
+    }
     let listed = stash
         .iter()
         .map(|p| p.display().to_string())
@@ -387,14 +399,17 @@ pub fn restore_stash(paths: &Paths) -> Result<()> {
 
 /// `login --restore-previous`: put a stash left by an interrupted login
 /// back. Refuses while a session file exists, because that
-/// session's device would be lost. A store without a session file is unusable
+/// session's device would be lost, and when only the store is kept aside,
+/// because its passphrase went with the session file. A store without a session file is unusable
 /// (its passphrase was in the session file) and is replaced only when its own
 /// stash exists.
 pub fn restore_previous(paths: &Paths) -> Result<()> {
     if existing_stash(paths).is_empty() {
         bail!("no previous session is kept aside; nothing to restore");
     }
-    if paths.session_file().exists() {
+    if paths.session_file().exists()
+        || fs::symlink_metadata(stash_path(&paths.session_file())).is_err()
+    {
         bail!(stash_refusal(paths));
     }
     restore_stash(paths)
@@ -559,13 +574,8 @@ pub async fn restore(config: &Config, paths: &Paths, sharing: KeySharing) -> Res
     restore_from(session, paths, sharing).await
 }
 
-/// Restore from the session file alone, without config.json (for `logout`).
-pub async fn restore_session(paths: &Paths, sharing: KeySharing) -> Result<Restored> {
-    let session = read_existing_session(paths)?;
-    restore_from(session, paths, sharing).await
-}
-
-fn read_existing_session(paths: &Paths) -> Result<SessionFile> {
+/// The session file, or why there is none. Needs no config.json (`logout`).
+pub fn read_existing_session(paths: &Paths) -> Result<SessionFile> {
     match read_session(&paths.session_file())? {
         Some(session) => Ok(session),
         None if !existing_stash(paths).is_empty() => {
@@ -575,7 +585,7 @@ fn read_existing_session(paths: &Paths) -> Result<SessionFile> {
     }
 }
 
-async fn restore_from(
+pub async fn restore_from(
     session: SessionFile,
     paths: &Paths,
     sharing: KeySharing,
@@ -587,6 +597,25 @@ async fn restore_from(
         sharing,
     )
     .await?;
+    attach_session(&client, &session).await?;
+    Ok(Restored { client, session })
+}
+
+/// A client with an in-memory store, logged in with the session file's
+/// token. It cannot decrypt or send encrypted messages; `logout` uses it to
+/// revoke the token when the SQLite store cannot be opened.
+pub async fn restore_without_store(session: SessionFile) -> Result<Restored> {
+    let client = Client::builder()
+        .homeserver_url(&session.homeserver)
+        .with_encryption_settings(encryption_settings())
+        .build()
+        .await
+        .context("cannot set up the Matrix client")?;
+    attach_session(&client, &session).await?;
+    Ok(Restored { client, session })
+}
+
+async fn attach_session(client: &Client, session: &SessionFile) -> Result<()> {
     let user_id: OwnedUserId = session
         .user_id
         .as_str()
@@ -607,7 +636,7 @@ async fn restore_from(
         )
         .await
         .context("cannot restore the session")?;
-    Ok(Restored { client, session })
+    Ok(())
 }
 
 /// Read a secret from `env_name` or, on a terminal, a prompt without echo.
@@ -1010,6 +1039,53 @@ mod tests {
             fs::read_to_string(paths.store_dir().join("db")).unwrap(),
             "old"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_store_removal_keeps_the_session_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(&tmp);
+        write_state(&paths, &sample(), "db");
+        // The store's own directory is not writable: its files cannot be
+        // removed, while the session file next to it could be.
+        fs::set_permissions(paths.store_dir(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = delete_local_state(&paths);
+        fs::set_permissions(paths.store_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "store removal did not fail (running as root?)"
+        );
+        assert!(
+            paths.session_file().exists(),
+            "session.json was deleted before the store"
+        );
+    }
+
+    #[test]
+    fn store_only_stash_is_not_offered_for_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(&tmp);
+        write_state(&paths, &sample(), "old");
+        stash_local_state(&paths).unwrap();
+        // A discard that removed session.json.prev but not store.prev.
+        fs::remove_file(paths.data_dir.join("session.json.prev")).unwrap();
+        let store_prev = paths.data_dir.join("store.prev");
+        let rm = format!("rm -r {}", shell_quote(&store_prev));
+        let without_session = stash_refusal(&paths);
+        write_state(&paths, &sample(), "current");
+        let with_session = stash_refusal(&paths);
+        for text in [&without_session, &with_session] {
+            assert!(text.contains(&rm), "{text}");
+            assert!(text.contains("cannot be restored"), "{text}");
+            assert!(
+                !text.contains("logout") && !text.contains("--restore-previous"),
+                "{text}"
+            );
+        }
+        fs::remove_file(paths.session_file()).unwrap();
+        assert!(restore_previous(&paths).is_err());
+        assert!(store_prev.exists(), "the remainder was moved into place");
     }
 
     #[test]

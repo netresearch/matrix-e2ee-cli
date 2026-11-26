@@ -1,5 +1,7 @@
 //! `login`: password login that creates a new device.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use matrix_sdk::Client;
 use matrix_sdk::ruma::UserId;
@@ -14,6 +16,8 @@ use crate::session::{
 use crate::text::term;
 
 pub const DEVICE_NAME: &str = "Matrix Skill E2EE (Rust)";
+/// How long a failed login waits for the server to revoke the new device.
+const REVOKE_WAIT: Duration = Duration::from_secs(10);
 
 pub async fn run(force: bool, restore_prev: bool) -> Result<()> {
     let paths = Paths::from_env()?;
@@ -118,6 +122,39 @@ fn store_new_session(paths: &Paths, session: &SessionFile) -> Result<()> {
     })
 }
 
+/// The error of a failed `send()`. The SDK installs the access token after
+/// the server accepted the login and before it sets up the local store
+/// (`MatrixAuth::set_session`), so a token means the server created a device
+/// and only the local activation failed: try to log that device out again.
+async fn failed_login(client: &Client, err: anyhow::Error, wait: Duration) -> anyhow::Error {
+    if client.access_token().is_none() {
+        return err.context("login failed");
+    }
+    // Known once the store loaded; unknown when the activation failed before.
+    let device = client.device_id().map(ToString::to_string);
+    let revoked = matches!(
+        tokio::time::timeout(wait, client.matrix_auth().logout()).await,
+        Ok(Ok(_))
+    );
+    err.context(activation_failure(device.as_deref(), revoked))
+}
+
+fn activation_failure(device: Option<&str>, revoked: bool) -> String {
+    let device = match device {
+        Some(id) => format!("device {id}"),
+        None => format!("the new device \"{DEVICE_NAME}\""),
+    };
+    if revoked {
+        format!(
+            "the server accepted the login, but the local store could not be set up; {device} was logged out again"
+        )
+    } else {
+        format!(
+            "the server accepted the login and created {device}, but the local store could not be set up and logging it out again failed; remove {device} in Element under Settings > Sessions"
+        )
+    }
+}
+
 /// Log in and write the session file. Once this returns Ok, the device
 /// exists on the server and its session is stored.
 async fn create_device(
@@ -135,13 +172,16 @@ async fn create_device(
         KeySharing::VerifiedOnly,
     )
     .await?;
-    let response = client
+    let response = match client
         .matrix_auth()
         .login_username(&config.user_id, password)
         .initial_device_display_name(DEVICE_NAME)
         .send()
         .await
-        .context("login failed")?;
+    {
+        Ok(response) => response,
+        Err(err) => return Err(failed_login(&client, err.into(), REVOKE_WAIT).await),
+    };
     let device_id = response.device_id.to_string();
     match judge_returned_user(&configured, &response.user_id) {
         ReturnedUser::Accept => {}
@@ -202,6 +242,86 @@ mod tests {
             judge_returned_user(&id("@alice:example.org"), &id("@alice:other.org")),
             ReturnedUser::Reject(_)
         ));
+    }
+
+    #[test]
+    fn activation_failure_says_whether_the_device_was_revoked() {
+        let revoked = activation_failure(Some("NEWDEV"), true);
+        assert!(
+            revoked.contains("NEWDEV") && revoked.contains("logged out again"),
+            "{revoked}"
+        );
+        assert!(!revoked.contains("Element"), "{revoked}");
+        let left = activation_failure(Some("NEWDEV"), false);
+        assert!(
+            left.contains("remove device NEWDEV in Element under Settings > Sessions"),
+            "{left}"
+        );
+        let unnamed = activation_failure(None, false);
+        assert!(unnamed.contains(DEVICE_NAME), "{unnamed}");
+    }
+
+    async fn test_client(tmp: &tempfile::TempDir) -> Client {
+        let paths = Paths {
+            data_dir: tmp.path().join("app"),
+        };
+        // Port 9 on loopback: nothing answers, so a logout cannot succeed.
+        build_client(
+            "http://127.0.0.1:9",
+            &paths,
+            &generate_passphrase(),
+            KeySharing::VerifiedOnly,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejected_login_is_reported_as_login_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = test_client(&tmp).await;
+        let err = failed_login(
+            &client,
+            anyhow::anyhow!("M_FORBIDDEN"),
+            Duration::from_secs(1),
+        )
+        .await;
+        let chain = format!("{err:#}");
+        assert!(chain.starts_with("login failed: M_FORBIDDEN"), "{chain}");
+    }
+
+    #[tokio::test]
+    async fn failed_activation_after_a_token_names_the_device_to_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = test_client(&tmp).await;
+        // The state send() leaves when the server accepted the login: a token
+        // is installed on the client.
+        client
+            .matrix_auth()
+            .restore_session(
+                matrix_sdk::authentication::matrix::MatrixSession {
+                    meta: matrix_sdk::SessionMeta {
+                        user_id: parse_user_id("@a:example.org", "test").unwrap(),
+                        device_id: "NEWDEV".into(),
+                    },
+                    tokens: matrix_sdk::SessionTokens {
+                        access_token: "token".into(),
+                        refresh_token: None,
+                    },
+                },
+                matrix_sdk::store::RoomLoadSettings::default(),
+            )
+            .await
+            .unwrap();
+        let err = failed_login(
+            &client,
+            anyhow::anyhow!("sqlite I/O error"),
+            Duration::from_secs(2),
+        )
+        .await;
+        let chain = format!("{err:#}");
+        assert!(chain.contains("remove device NEWDEV in Element"), "{chain}");
+        assert!(!chain.starts_with("login failed"), "{chain}");
     }
 
     #[test]

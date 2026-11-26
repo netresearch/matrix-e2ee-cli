@@ -55,6 +55,11 @@ enum Command {
         /// Do not ask for confirmation.
         #[arg(long)]
         yes: bool,
+        /// When the server reports a soft logout (the token is suspended and
+        /// the device may remain on the server), delete the local session and
+        /// store anyway. Other failures still keep the local state.
+        #[arg(long)]
+        local_only: bool,
     },
 }
 
@@ -116,7 +121,7 @@ async fn main() {
         Command::Send(args) => commands::send::run(args).await,
         Command::Read(args) => commands::read::run(args).await,
         Command::BackupRestore => commands::backup::run().await,
-        Command::Logout { yes } => commands::logout::run(yes).await,
+        Command::Logout { yes, local_only } => commands::logout::run(yes, local_only).await,
     };
     let code = match result {
         Ok(()) => 0,
@@ -160,6 +165,11 @@ mod tests {
         assert!(Cli::try_parse_from(["m", "verify"]).is_err());
         assert!(Cli::try_parse_from(["m", "verify", "--listen", "--request", "D"]).is_err());
         assert!(Cli::try_parse_from(["m", "verify", "--listen"]).is_ok());
+    }
+
+    #[test]
+    fn logout_takes_local_only() {
+        assert!(Cli::try_parse_from(["m", "logout", "--yes", "--local-only"]).is_ok());
     }
 
     #[test]
