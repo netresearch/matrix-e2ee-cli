@@ -3,10 +3,13 @@
 //! Room keys go to verified devices only (`CollectStrategy::OnlyTrustedDevices`).
 //! `--trust-unverified-devices` builds this process's client with
 //! `CollectStrategy::AllDevices` instead, and discards the room key after the
-//! send, so the next message starts a new megolm session.
+//! send, so the next message starts a new megolm session. `edit` sends
+//! through the same [`send_guarded`].
 
 use anyhow::{Context, Result, bail};
 use matrix_sdk::encryption::identities::Device;
+use matrix_sdk::ruma::OwnedEventId;
+use matrix_sdk::ruma::events::MessageLikeEventContent;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::{EncryptionState, Room, RoomMemberships};
 use serde_json::json;
@@ -21,39 +24,10 @@ pub async fn run(args: SendArgs) -> Result<()> {
     let config = load_config()?;
     let paths = Paths::from_env()?;
     let _lock = paths.lock().await?;
-    let sharing = if args.trust_unverified_devices {
-        KeySharing::IncludeUnverified
-    } else {
-        KeySharing::VerifiedOnly
-    };
-    let restored = restore(&config, &paths, sharing).await?;
+    let restored = restore(&config, &paths, key_sharing(args.trust_unverified_devices)).await?;
     let client = restored.client;
     sync_once(&client).await?;
     let room = resolve_room(&client, &args.room).await?;
-
-    let encrypted = match room
-        .latest_encryption_state()
-        .await
-        .context("cannot read the room's encryption state")?
-    {
-        EncryptionState::Encrypted => true,
-        EncryptionState::NotEncrypted => false,
-        // Never fall back to plaintext on a room whose state is unknown.
-        other => bail!(
-            "the encryption state of {} is unknown ({other:?}); not sending",
-            room.room_id()
-        ),
-    };
-
-    if encrypted && !args.trust_unverified_devices {
-        let untrusted = untrusted_devices(&room).await?;
-        if !untrusted.is_empty() {
-            bail!(
-                "the room has devices that are not verified, so the message was not sent:{} verify them, or pass --trust-unverified-devices to share this message's key with them anyway",
-                describe(&untrusted)
-            );
-        }
-    }
 
     let body = args.message.as_str();
     let content = if args.notice {
@@ -63,33 +37,10 @@ pub async fn run(args: SendArgs) -> Result<()> {
     } else {
         RoomMessageEventContent::text_plain(body)
     };
-
-    let result = room.send(content).await;
-    let discarded = if encrypted && args.trust_unverified_devices {
-        // The opt-in covers this message only: drop the session the
-        // unverified devices may now hold, before anything else can reuse
-        // it. Also after a failed send: the key may have been shared already.
-        room.discard_room_key().await
-    } else {
-        Ok(())
-    };
-    let (sent, warning) = settle_send(result, discarded)?;
-    if let Some(warning) = warning {
-        eprintln!("warning: {}", term(&warning));
-    }
-    let event_id = sent.response.event_id;
-
-    if encrypted && !args.trust_unverified_devices {
-        // The SDK queries device lists inside send(), after the check above:
-        // devices learnt there got the key withheld. Say so.
-        let withheld = untrusted_devices(&room).await.unwrap_or_default();
-        if !withheld.is_empty() {
-            eprintln!(
-                "warning: sent, but the room key was withheld from unverified devices:{}",
-                describe(&withheld)
-            );
-        }
-    }
+    let Sent {
+        event_id,
+        encrypted,
+    } = send_guarded(&room, content, args.trust_unverified_devices, "message").await?;
 
     if args.json {
         // json_line escapes DEL and C1, which a hostile server can put into a
@@ -104,6 +55,97 @@ pub async fn run(args: SendArgs) -> Result<()> {
         println!("{}", term(event_id.as_str()));
     }
     Ok(())
+}
+
+/// The room-key sharing rule for a command that sends an encrypted event:
+/// verified devices only, unless `--trust-unverified-devices` was given.
+pub fn key_sharing(trust_unverified_devices: bool) -> KeySharing {
+    if trust_unverified_devices {
+        KeySharing::IncludeUnverified
+    } else {
+        KeySharing::VerifiedOnly
+    }
+}
+
+/// A sent event.
+pub struct Sent {
+    pub event_id: OwnedEventId,
+    /// The room is encrypted, so the event was sent encrypted.
+    pub encrypted: bool,
+}
+
+/// Send one message-like event the way `send` does. The client must have
+/// been built with [`key_sharing`]`(trust_unverified_devices)`.
+///
+/// - The room's encryption state must be known; never plaintext on doubt.
+/// - In an encrypted room without `trust_unverified_devices`, refuse while
+///   devices are known that are neither verified nor blacklisted, and warn
+///   afterwards about devices the key was withheld from.
+/// - With `trust_unverified_devices`, discard the room key after the send
+///   (also after a failed one), so the opt-in covers this event only.
+///
+/// `what` names the event in the refusal ("message", "edit").
+pub async fn send_guarded(
+    room: &Room,
+    content: impl MessageLikeEventContent,
+    trust_unverified_devices: bool,
+    what: &str,
+) -> Result<Sent> {
+    let encrypted = match room
+        .latest_encryption_state()
+        .await
+        .context("cannot read the room's encryption state")?
+    {
+        EncryptionState::Encrypted => true,
+        EncryptionState::NotEncrypted => false,
+        // Never fall back to plaintext on a room whose state is unknown.
+        other => bail!(
+            "the encryption state of {} is unknown ({other:?}); not sending",
+            room.room_id()
+        ),
+    };
+
+    if encrypted && !trust_unverified_devices {
+        let untrusted = untrusted_devices(room).await?;
+        if !untrusted.is_empty() {
+            bail!(
+                "the room has devices that are not verified, so the {what} was not sent:{} verify them, or pass --trust-unverified-devices to share this {what}'s key with them anyway",
+                describe(&untrusted)
+            );
+        }
+    }
+
+    let result = room.send(content).await;
+    let discarded = if encrypted && trust_unverified_devices {
+        // The opt-in covers this event only: drop the session the
+        // unverified devices may now hold, before anything else can reuse
+        // it. Also after a failed send: the key may have been shared already.
+        room.discard_room_key().await
+    } else {
+        Ok(())
+    };
+    let (sent, warning) = settle_send(result, discarded)?;
+    if let Some(warning) = warning {
+        eprintln!("warning: {}", term(&warning));
+    }
+    let event_id = sent.response.event_id;
+
+    if encrypted && !trust_unverified_devices {
+        // The SDK queries device lists inside send(), after the check above:
+        // devices learnt there got the key withheld. Say so.
+        let withheld = untrusted_devices(room).await.unwrap_or_default();
+        if !withheld.is_empty() {
+            eprintln!(
+                "warning: sent, but the room key was withheld from unverified devices:{}",
+                describe(&withheld)
+            );
+        }
+    }
+
+    Ok(Sent {
+        event_id,
+        encrypted,
+    })
 }
 
 /// Combine the send result with the result of discarding the room key: a

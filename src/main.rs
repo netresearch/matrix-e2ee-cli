@@ -45,6 +45,14 @@ enum Command {
     Send(SendArgs),
     /// Read the last messages of a room, decrypted.
     Read(ReadArgs),
+    /// Edit one of your own messages (encrypted if the room is encrypted).
+    Edit(EditArgs),
+    /// Add, remove, swap or list your own reactions on a message.
+    React(ReactArgs),
+    /// Redact (delete) an event, if your power level allows it.
+    Redact(RedactArgs),
+    /// Download the attachment of a file, image, video or audio message.
+    Download(DownloadArgs),
     /// Import secrets and room keys from server-side key backup with a recovery key.
     ///
     /// The key comes from MATRIX_RECOVERY_KEY or a prompt, never from the
@@ -124,6 +132,72 @@ pub struct ReadArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct EditArgs {
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
+    pub room: String,
+    /// The message to edit ($...); it must be one of your own.
+    pub event_id: String,
+    /// The new text; it replaces the whole message.
+    pub new_message: String,
+    /// Share this edit's room key with unverified devices too (this edit only).
+    #[arg(long)]
+    pub trust_unverified_devices: bool,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ReactArgs {
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
+    pub room: String,
+    /// The event to react to ($...).
+    pub event_id: String,
+    /// The reaction key, usually an emoji.
+    #[arg(required_unless_present = "list", conflicts_with = "list")]
+    pub key: Option<String>,
+    /// Remove your own KEY reaction instead of adding one.
+    #[arg(long, conflicts_with_all = ["replace", "list"])]
+    pub remove: bool,
+    /// Status swap: set KEY, then remove your own reactions with any of OLD.
+    #[arg(long, num_args = 1.., value_name = "OLD", conflicts_with = "list")]
+    pub replace: Option<Vec<String>>,
+    /// List your own reactions on the event (key and reaction event id).
+    #[arg(long)]
+    pub list: bool,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RedactArgs {
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
+    pub room: String,
+    /// The event to redact ($...).
+    pub event_id: String,
+    /// Why; shown to the room's members.
+    pub reason: Option<String>,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DownloadArgs {
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
+    pub room: String,
+    /// The file, image, video or audio message ($...).
+    pub event_id: String,
+    /// Directory to save into (created if missing; default: the current one).
+    #[arg(long, value_name = "DIR")]
+    pub output: Option<std::path::PathBuf>,
+    /// File name instead of the one the message gives (sanitized the same way).
+    #[arg(long, value_name = "NAME")]
+    pub filename: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -136,6 +210,10 @@ async fn main() {
         Command::Verify(args) => commands::verify::run(args).await,
         Command::Send(args) => commands::send::run(args).await,
         Command::Read(args) => commands::read::run(args).await,
+        Command::Edit(args) => commands::edit::run(args).await,
+        Command::React(args) => commands::react::run(args).await,
+        Command::Redact(args) => commands::redact::run(args).await,
+        Command::Download(args) => commands::download::run(args).await,
         Command::BackupRestore => commands::backup::run().await,
         Command::Logout { yes, local_only } => commands::logout::run(yes, local_only).await,
         Command::MigrateNio {
@@ -198,6 +276,83 @@ mod tests {
         assert!(Cli::try_parse_from(["m", "verify"]).is_err());
         assert!(Cli::try_parse_from(["m", "verify", "--listen", "--request", "D"]).is_err());
         assert!(Cli::try_parse_from(["m", "verify", "--listen"]).is_ok());
+    }
+
+    #[test]
+    fn edit_takes_three_arguments() {
+        assert!(Cli::try_parse_from(["m", "edit", "r", "$e", "new"]).is_ok());
+        assert!(Cli::try_parse_from(["m", "edit", "r", "$e"]).is_err());
+        let cli = Cli::try_parse_from([
+            "m",
+            "edit",
+            "r",
+            "$e",
+            "new",
+            "--trust-unverified-devices",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Edit(args) = cli.command else {
+            panic!("not edit")
+        };
+        assert!(args.trust_unverified_devices && args.json);
+        assert_eq!(args.new_message, "new");
+    }
+
+    #[test]
+    fn react_modes() {
+        let parse = |a: &[&str]| Cli::try_parse_from([&["m", "react", "r", "$e"][..], a].concat());
+        assert!(parse(&["✅"]).is_ok());
+        assert!(parse(&[]).is_err(), "KEY is required without --list");
+        assert!(parse(&["--list"]).is_ok());
+        assert!(parse(&["✅", "--list"]).is_err(), "--list takes no KEY");
+        assert!(parse(&["✅", "--remove"]).is_ok());
+        assert!(parse(&["--remove"]).is_err());
+        assert!(parse(&["✅", "--remove", "--replace", "▶️"]).is_err());
+        assert!(parse(&["--list", "--remove"]).is_err());
+        assert!(parse(&["✅", "--replace"]).is_err(), "--replace needs OLD");
+        let Command::React(args) = parse(&["✅", "--replace", "▶️", "🩹"]).unwrap().command
+        else {
+            panic!("not react")
+        };
+        assert_eq!(args.key.as_deref(), Some("✅"));
+        assert_eq!(args.replace, Some(vec!["▶️".to_owned(), "🩹".to_owned()]));
+    }
+
+    #[test]
+    fn redact_reason_is_optional() {
+        assert!(Cli::try_parse_from(["m", "redact", "r", "$e"]).is_ok());
+        let Command::Redact(args) = Cli::try_parse_from(["m", "redact", "r", "$e", "spam"])
+            .unwrap()
+            .command
+        else {
+            panic!("not redact")
+        };
+        assert_eq!(args.reason.as_deref(), Some("spam"));
+        assert!(Cli::try_parse_from(["m", "redact", "r", "$e", "a", "b"]).is_err());
+    }
+
+    #[test]
+    fn download_options() {
+        assert!(Cli::try_parse_from(["m", "download", "r", "$e"]).is_ok());
+        let Command::Download(args) = Cli::try_parse_from([
+            "m",
+            "download",
+            "r",
+            "$e",
+            "--output",
+            "d",
+            "--filename",
+            "f.txt",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("not download")
+        };
+        assert_eq!(args.output, Some(std::path::PathBuf::from("d")));
+        assert_eq!(args.filename.as_deref(), Some("f.txt"));
+        assert!(Cli::try_parse_from(["m", "download", "r", "$e", "--overwrite"]).is_err());
     }
 
     #[test]
