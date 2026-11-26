@@ -3,6 +3,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -46,7 +47,7 @@ impl Paths {
     pub fn from_env() -> Result<Self> {
         Self::from_env_values(
             std::env::var("XDG_DATA_HOME").ok().as_deref(),
-            std::env::var("HOME").ok().as_deref(),
+            home_dir().as_deref(),
         )
     }
 
@@ -87,9 +88,19 @@ pub fn generate_passphrase() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Create `dir` (and parents) and restrict it to the owner.
+/// HOME, or USERPROFILE on Windows, where HOME is usually not set.
+pub fn home_dir() -> Option<String> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok())
+}
+
+/// Create `dir` (and parents) and restrict it to the owner. On Windows the
+/// directory keeps the ACL it inherits from the user's profile directory.
 pub fn ensure_private_dir(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    #[cfg(unix)]
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("cannot restrict {}", dir.display()))?;
     Ok(())
@@ -110,14 +121,16 @@ pub fn write_session(path: &Path, session: &SessionFile) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("cannot remove {}", tmp.display())),
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&tmp)
         .with_context(|| format!("cannot create {}", tmp.display()))?;
     // create_new + mode is subject to the umask; 0600 minus a umask is never
     // wider than 0600, but set it explicitly so it is exactly 0600.
+    #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(serde_json::to_string_pretty(session)?.as_bytes())?;
     file.sync_all()?;
@@ -134,7 +147,12 @@ pub fn read_session(path: &Path) -> Result<Option<SessionFile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
+    // Windows: the file keeps the ACL of the user's profile directory.
+    #[cfg(not(unix))]
+    let _ = &meta;
+    #[cfg(unix)]
     let mode = meta.permissions().mode() & 0o777;
+    #[cfg(unix)]
     if mode & 0o077 != 0 {
         bail!(
             "{} has mode {:o}; it holds an access token, run: chmod 600 {}",
@@ -501,6 +519,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
@@ -519,6 +538,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn new_session_file_is_0600_and_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
@@ -530,6 +550,7 @@ mod tests {
         assert_eq!(read_session(&path).unwrap(), Some(s));
     }
 
+    #[cfg(unix)]
     #[test]
     fn overwriting_a_world_readable_file_leaves_0600() {
         let tmp = tempfile::tempdir().unwrap();
@@ -540,6 +561,7 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_a_session_file_others_can_read() {
         let tmp = tempfile::tempdir().unwrap();

@@ -32,7 +32,7 @@ pub fn config_path_from(xdg_config_home: Option<&str>, home: Option<&str>) -> Re
 pub fn config_path() -> Result<PathBuf> {
     config_path_from(
         std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
+        crate::session::home_dir().as_deref(),
     )
 }
 
