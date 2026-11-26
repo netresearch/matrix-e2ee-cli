@@ -3,16 +3,18 @@
 //! A sync loop runs in the background for the whole flow, because every
 //! verification step arrives as a to-device event.
 
+use std::future::Future;
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use matrix_sdk::Client;
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::encryption::verification::{
-    Emoji, SasState, SasVerification, Verification, VerificationRequest, VerificationRequestState,
+    CancelInfo, Emoji, SasState, SasVerification, Verification, VerificationRequest,
+    VerificationRequestState,
 };
 use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
 use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
@@ -89,6 +91,14 @@ fn confirm_emoji_on(
 const OTHER_SIDE_START_GRACE: Duration = Duration::from_secs(5);
 /// Sync time after success, so cross-signing updates and secrets arrive.
 const SETTLE_TIME: Duration = Duration::from_secs(5);
+/// How long the cancellation after a timeout may take.
+const CANCEL_LIMIT: Duration = Duration::from_secs(10);
+
+/// Run a best-effort step for at most `limit`: a responsive server still
+/// gets it, a stalled one cannot keep the command from ending.
+async fn best_effort(step: impl Future, limit: Duration) {
+    let _ = tokio::time::timeout(limit, step).await;
+}
 
 pub async fn run(args: VerifyArgs) -> Result<()> {
     // stdin: the answer comes from a person. stderr: the emoji and the
@@ -100,6 +110,7 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
     }
     let config = load_config()?;
     let paths = Paths::from_env()?;
+    let _lock = paths.lock().await?;
     let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
     let client = restored.client;
     let own_user: OwnedUserId = client
@@ -149,7 +160,7 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
         Err(_) => {
             let pending = current.lock().ok().and_then(|slot| slot.clone());
             if let Some(request) = pending {
-                let _ = request.cancel().await;
+                best_effort(request.cancel(), CANCEL_LIMIT).await;
             }
             Err(anyhow::anyhow!(
                 "verification timed out after {} s",
@@ -223,6 +234,11 @@ async fn flow(
             }
         };
         eprintln!("Verification request received; accepting.");
+        // Register before accepting: accept() marks the request ready before
+        // its send completes, so a timeout during the send must cancel it too.
+        if let Ok(mut slot) = current.lock() {
+            *slot = Some(request.clone());
+        }
         request
             .accept()
             .await
@@ -287,6 +303,50 @@ async fn wait_for_sas(request: &VerificationRequest) -> Result<SasVerification> 
     }
 }
 
+fn cancelled(info: &CancelInfo) -> anyhow::Error {
+    anyhow::anyhow!(
+        "verification cancelled: {} ({})",
+        info.reason(),
+        info.cancel_code()
+    )
+}
+
+/// What ended the wait for the person's answer.
+#[derive(Debug)]
+enum PromptOutcome {
+    /// The prompt returned: the answer, or why there is none.
+    Answered(Result<bool>),
+    /// The verification ended first (e.g. the other device cancelled); a
+    /// later answer must not be acted on.
+    Ended(anyhow::Error),
+}
+
+/// Wait for `prompt` while watching `changes`: when `ends` turns a state
+/// into an error, or the stream ends, stop at once with that error.
+async fn answer_unless_ended<T>(
+    prompt: impl Future<Output = Result<bool>>,
+    changes: &mut (impl Stream<Item = T> + Unpin),
+    ends: impl Fn(&T) -> Option<anyhow::Error>,
+) -> PromptOutcome {
+    tokio::pin!(prompt);
+    loop {
+        tokio::select! {
+            biased;
+            state = changes.next() => match state {
+                Some(state) => {
+                    if let Some(err) = ends(&state) {
+                        return PromptOutcome::Ended(err);
+                    }
+                }
+                None => {
+                    return PromptOutcome::Ended(anyhow::anyhow!("the verification stream ended"));
+                }
+            },
+            answer = &mut prompt => return PromptOutcome::Answered(answer),
+        }
+    }
+}
+
 fn into_sas(verification: Verification) -> Result<SasVerification> {
     match verification {
         Verification::SasV1(sas) => Ok(sas),
@@ -310,19 +370,31 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
                 asked = true;
                 let comparison =
                     comparison_text(emojis.as_ref().map(|short| &short.emojis[..]), *decimals);
-                let answer =
-                    match tokio::task::spawn_blocking(move || confirm_emoji(&comparison)).await {
-                        Ok(Ok(answer)) => answer,
-                        Ok(Err(err)) => {
-                            sas.cancel().await.ok();
-                            return Err(err.context("verification cancelled"));
-                        }
-                        Err(err) => {
-                            sas.cancel().await.ok();
-                            return Err(anyhow::Error::new(err)
-                                .context("the prompt failed; verification cancelled"));
-                        }
-                    };
+                // The prompt blocks on stdin, so it runs on its own thread; a
+                // prompt abandoned here ends with the process.
+                let prompt = async {
+                    tokio::task::spawn_blocking(move || confirm_emoji(&comparison))
+                        .await
+                        .unwrap_or_else(|err| {
+                            Err(anyhow::Error::new(err).context("the prompt failed"))
+                        })
+                };
+                let ends = |state: &SasState| match state {
+                    SasState::Cancelled(info) => Some(cancelled(info)),
+                    _ => None,
+                };
+                let answer = match answer_unless_ended(prompt, &mut changes, ends).await {
+                    PromptOutcome::Ended(err) => return Err(err),
+                    PromptOutcome::Answered(Ok(answer)) => answer,
+                    PromptOutcome::Answered(Err(err)) => {
+                        sas.cancel().await.ok();
+                        return Err(err.context("verification cancelled"));
+                    }
+                };
+                // A cancellation that arrived together with the answer.
+                if let Some(info) = sas.cancel_info() {
+                    return Err(cancelled(&info));
+                }
                 if answer {
                     sas.confirm()
                         .await
@@ -340,13 +412,7 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
                 );
                 return Ok(());
             }
-            SasState::Cancelled(info) => {
-                bail!(
-                    "verification cancelled: {} ({})",
-                    info.reason(),
-                    info.cancel_code()
-                )
-            }
+            SasState::Cancelled(info) => return Err(cancelled(info)),
             _ => {}
         }
         state = changes
@@ -371,6 +437,71 @@ async fn print_final_state(client: &Client) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Fails the test instead of hanging when a wait is not bounded.
+    async fn within_5s<F: Future>(what: &str, fut: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), fut)
+            .await
+            .unwrap_or_else(|_| panic!("{what}"))
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_the_timeout_is_bounded() {
+        within_5s(
+            "the cancellation was awaited without a limit",
+            best_effort(std::future::pending::<()>(), Duration::from_millis(50)),
+        )
+        .await;
+    }
+
+    fn ends_on_2(state: &i32) -> Option<anyhow::Error> {
+        (*state == 2).then(|| anyhow::anyhow!("cancelled by the other device"))
+    }
+
+    #[tokio::test]
+    async fn peer_cancellation_ends_the_wait_for_the_answer() {
+        let mut changes = futures_util::stream::iter([1, 2]).chain(futures_util::stream::pending());
+        let outcome = within_5s(
+            "the wait for the answer ignored the cancellation",
+            answer_unless_ended(
+                std::future::pending::<Result<bool>>(),
+                &mut changes,
+                ends_on_2,
+            ),
+        )
+        .await;
+        match outcome {
+            PromptOutcome::Ended(err) => {
+                assert!(err.to_string().contains("other device"), "{err}")
+            }
+            other => panic!("expected Ended, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn answer_counts_when_no_cancellation_comes() {
+        let mut changes = futures_util::stream::iter([1]).chain(futures_util::stream::pending());
+        let outcome = within_5s(
+            "the answer was not taken",
+            answer_unless_ended(async { Ok(true) }, &mut changes, ends_on_2),
+        )
+        .await;
+        assert!(
+            matches!(outcome, PromptOutcome::Answered(Ok(true))),
+            "{outcome:?}"
+        );
+        let mut ended = futures_util::stream::empty::<i32>();
+        let outcome = within_5s(
+            "the end of the stream was ignored",
+            answer_unless_ended(
+                std::future::pending::<Result<bool>>(),
+                &mut ended,
+                ends_on_2,
+            ),
+        )
+        .await;
+        assert!(matches!(outcome, PromptOutcome::Ended(_)), "{outcome:?}");
+    }
 
     #[test]
     fn emoji_confirmation_is_not_taken_from_a_pipe() {

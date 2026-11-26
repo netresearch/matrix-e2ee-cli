@@ -158,8 +158,34 @@ pub fn discard_typeahead_stdin() -> Result<()> {
     discard_typeahead(libc::STDIN_FILENO)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn discard_typeahead_stdin() -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    discard_console_input(std::io::stdin().as_raw_handle())
+}
+
+/// No way to discard typed-ahead input here: refuse, so an answer typed
+/// before the question cannot answer it.
+#[cfg(not(any(unix, windows)))]
+pub fn discard_typeahead_stdin() -> Result<()> {
+    bail!("cannot discard typed-ahead input on this platform")
+}
+
+/// Drop input the console received but nobody has read yet
+/// (`FlushConsoleInputBuffer`). Fails when `handle` is no console input
+/// handle (a pipe, a file, an msys/mintty terminal), so the confirmation is
+/// refused instead of reading an answer typed earlier.
+#[cfg(windows)]
+fn discard_console_input(handle: std::os::windows::io::RawHandle) -> Result<()> {
+    if handle.is_null() {
+        bail!("stdin has no console; cannot discard typed-ahead input");
+    }
+    // SAFETY: FlushConsoleInputBuffer only takes the handle value; a handle
+    // that is not a console input handle is reported through the return value.
+    if unsafe { windows_sys::Win32::System::Console::FlushConsoleInputBuffer(handle) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot discard typed-ahead input (stdin is not a console)");
+    }
     Ok(())
 }
 
@@ -207,6 +233,15 @@ mod tests {
             .unwrap()
         );
         assert!(discarded);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discard_refuses_a_handle_that_is_no_console() {
+        use std::os::windows::io::AsRawHandle;
+        let file = tempfile::tempfile().unwrap();
+        assert!(discard_console_input(file.as_raw_handle()).is_err());
+        assert!(discard_console_input(std::ptr::null_mut()).is_err());
     }
 
     #[cfg(unix)]

@@ -17,6 +17,8 @@ pub const DEVICE_NAME: &str = "Matrix Skill E2EE (Rust)";
 
 pub async fn run(force: bool, restore_prev: bool) -> Result<()> {
     let paths = Paths::from_env()?;
+    // Before the stash and the store are touched, held until the login ends.
+    let _lock = paths.lock().await?;
     if restore_prev {
         restore_previous(&paths)?;
         let restored = read_session(&paths.session_file())?;

@@ -34,6 +34,7 @@ struct CrossSigningKeys {
 pub async fn run(json: bool) -> Result<()> {
     let config = load_config()?;
     let paths = Paths::from_env()?;
+    let _lock = paths.lock().await?;
     let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
     let client = restored.client;
     sync_once(&client).await?;

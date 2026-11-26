@@ -46,6 +46,7 @@ pub const UNVERIFIED_MARK: &str = "[unverified device] ";
 pub async fn run(args: ReadArgs) -> Result<()> {
     let config = load_config()?;
     let paths = Paths::from_env()?;
+    let _lock = paths.lock().await?;
     let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
     let client = restored.client;
     sync_once(&client).await?;

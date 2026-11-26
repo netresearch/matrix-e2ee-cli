@@ -5,7 +5,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use matrix_sdk::authentication::matrix::MatrixSession;
@@ -22,6 +23,10 @@ use crate::config::Config;
 const APP_DIR: &str = "matrix-e2ee-cli";
 const SESSION_FILE: &str = "session.json";
 const STORE_DIR: &str = "store";
+const LOCK_FILE: &str = ".lock";
+/// How long a command waits for another process to release the data directory.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+const LOCK_RETRY: Duration = Duration::from_millis(200);
 
 /// Where this tool keeps its state. Never the Python skill's store paths.
 #[derive(Debug, Clone)]
@@ -39,6 +44,14 @@ impl Paths {
                 None => bail!("neither XDG_DATA_HOME nor HOME is set"),
             },
         };
+        // A ".." can lead out of the directory a later check compares against
+        // (on Windows, the user profile), so it is refused everywhere.
+        if base.components().any(|c| c == Component::ParentDir) {
+            bail!(
+                "{} contains \"..\"; give the data directory without parent-directory references",
+                base.display()
+            );
+        }
         Ok(Self {
             data_dir: base.join(APP_DIR),
         })
@@ -58,6 +71,57 @@ impl Paths {
     pub fn store_dir(&self) -> PathBuf {
         self.data_dir.join(STORE_DIR)
     }
+
+    /// Hold the data directory for this process, waiting up to 30 s for
+    /// another process to release it. Every command that opens the store
+    /// takes it before the client is built and keeps it until it ends: two
+    /// processes on one store could otherwise both advance the same outbound
+    /// Megolm session from the same state.
+    pub async fn lock(&self) -> Result<DataDirLock> {
+        self.lock_within(LOCK_WAIT).await
+    }
+
+    async fn lock_within(&self, wait: Duration) -> Result<DataDirLock> {
+        ensure_private_dir(&self.data_dir)?;
+        let path = self.data_dir.join(LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut told = false;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(DataDirLock { _file: file }),
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("cannot lock {}", path.display()));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "another matrix-e2ee-cli process uses the store in {}; gave up after {} s",
+                    self.data_dir.display(),
+                    wait.as_secs()
+                );
+            }
+            if !told {
+                told = true;
+                eprintln!("Waiting for another matrix-e2ee-cli process to finish...");
+            }
+            tokio::time::sleep(LOCK_RETRY).await;
+        }
+    }
+}
+
+/// The exclusive lock on `<data_dir>/.lock`; released when dropped (the file
+/// is closed) or when the process ends.
+#[derive(Debug)]
+pub struct DataDirLock {
+    _file: fs::File,
 }
 
 /// What a later command needs to restore the device. Holds secrets: the
@@ -88,15 +152,17 @@ pub fn generate_passphrase() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Windows: refuse a data directory outside %USERPROFILE%.
+/// Windows: refuse a data directory outside %USERPROFILE%, by its name and
+/// after resolving links and junctions.
 #[cfg(all(not(unix), not(test)))]
 fn check_inside_profile(dir: &Path) -> Result<()> {
     let profile = std::env::var("USERPROFILE").context("USERPROFILE is not set")?;
-    if !is_inside(dir, Path::new(&profile)) {
+    let profile = Path::new(&profile);
+    if !is_inside(dir, profile) || !resolves_inside(dir, profile)? {
         bail!(
             "{} is outside {}; on Windows the session must live in the user profile, whose ACL keeps the access token private (unset XDG_DATA_HOME or point it into the profile)",
             dir.display(),
-            profile
+            profile.display()
         );
     }
     Ok(())
@@ -113,6 +179,24 @@ fn is_inside(dir: &Path, base: &Path) -> bool {
     };
     let (dir, base) = (lower(dir), lower(base));
     dir.len() >= base.len() && dir[..base.len()] == base[..]
+}
+
+/// Whether `dir` stays inside `base` once links, junctions and ".." are
+/// resolved: its nearest existing ancestor is resolved and compared with the
+/// resolved `base`. The missing rest is created by this process later.
+#[cfg_attr(unix, allow(dead_code))]
+fn resolves_inside(dir: &Path, base: &Path) -> Result<bool> {
+    let base =
+        fs::canonicalize(base).with_context(|| format!("cannot resolve {}", base.display()))?;
+    let dir =
+        std::path::absolute(dir).with_context(|| format!("cannot resolve {}", dir.display()))?;
+    let existing = dir
+        .ancestors()
+        .find(|p| fs::symlink_metadata(p).is_ok())
+        .with_context(|| format!("no part of {} exists", dir.display()))?;
+    let existing = fs::canonicalize(existing)
+        .with_context(|| format!("cannot resolve {}", existing.display()))?;
+    Ok(is_inside(&existing, &base))
 }
 
 /// HOME, or USERPROFILE on Windows, where HOME is usually not set.
@@ -616,6 +700,58 @@ mod tests {
             Path::new("/users/ann")
         ));
         assert!(!is_inside(Path::new("/tmp/x"), Path::new("/users/ann")));
+    }
+
+    #[test]
+    fn data_dir_with_parent_references_is_refused() {
+        let escaping = Path::new("/users/ann").join("..").join("public");
+        let escaping = escaping.to_str().unwrap();
+        let err = Paths::from_env_values(Some(escaping), Some("/home/u"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".."), "{err}");
+        assert!(Paths::from_env_values(None, Some(escaping)).is_err());
+        assert!(Paths::from_env_values(Some("/users/ann/data"), None).is_ok());
+    }
+
+    #[test]
+    fn resolved_ancestry_must_stay_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("profile");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&profile).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        assert!(resolves_inside(&profile.join("app").join("x"), &profile).unwrap());
+        assert!(resolves_inside(&profile, &profile).unwrap());
+        assert!(
+            !resolves_inside(&profile.join("..").join("outside").join("x"), &profile).unwrap(),
+            "a \"..\" left the profile"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, profile.join("link")).unwrap();
+            assert!(
+                !resolves_inside(&profile.join("link").join("app"), &profile).unwrap(),
+                "a link out of the profile was followed as inside"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn second_lock_on_the_data_dir_waits_then_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            data_dir: tmp.path().join("app"),
+        };
+        let first = paths.lock_within(Duration::ZERO).await.unwrap();
+        let err = paths
+            .lock_within(Duration::from_millis(300))
+            .await
+            .expect_err("a second lock was granted while the first is held")
+            .to_string();
+        assert!(err.contains("another matrix-e2ee-cli process"), "{err}");
+        drop(first);
+        paths.lock_within(Duration::ZERO).await.unwrap();
     }
 
     #[test]

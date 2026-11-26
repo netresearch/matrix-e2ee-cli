@@ -20,6 +20,7 @@ use crate::text::{json_line, term};
 pub async fn run(args: SendArgs) -> Result<()> {
     let config = load_config()?;
     let paths = Paths::from_env()?;
+    let _lock = paths.lock().await?;
     let sharing = if args.trust_unverified_devices {
         KeySharing::IncludeUnverified
     } else {

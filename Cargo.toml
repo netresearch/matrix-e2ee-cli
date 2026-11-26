@@ -28,6 +28,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-std", "io-util"] }
 
+[target.'cfg(windows)'.dependencies]
+# FlushConsoleInputBuffer (discard typed-ahead input before the emoji confirmation).
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
 [profile.release]
 strip = true
 lto = "thin"

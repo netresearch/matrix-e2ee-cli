@@ -11,6 +11,8 @@ use crate::text::term;
 
 pub async fn run(yes: bool) -> Result<()> {
     let paths = Paths::from_env()?;
+    // Held until the store is deleted: no other command may use it meanwhile.
+    let _lock = paths.lock().await?;
     // The session file alone: logout is the way out of a session that does
     // not match config.json, so it must not depend on config.json.
     let restored = restore_session(&paths, KeySharing::VerifiedOnly).await?;

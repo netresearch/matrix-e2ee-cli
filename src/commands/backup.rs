@@ -11,6 +11,7 @@ use crate::session::{KeySharing, Paths, read_secret, restore};
 pub async fn run() -> Result<()> {
     let config = load_config()?;
     let paths = Paths::from_env()?;
+    let _lock = paths.lock().await?;
     let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
     let client = restored.client;
     sync_once(&client).await?;
@@ -31,7 +32,7 @@ pub async fn run() -> Result<()> {
         .recovery()
         .recover(&key)
         .await
-        .context("cannot import secrets with this recovery key")?;
+        .context("recovery from secret storage failed")?;
     drop(key);
     eprintln!(
         "Secrets imported; recovery state: {:?}",
@@ -70,7 +71,10 @@ pub async fn run() -> Result<()> {
             Err(err) => failed.push(format!("{}: {err}", room.room_id())),
         }
     }
-    println!("Room keys downloaded for {done} encrypted room(s).");
+    // Ok also when the backup holds no keys for a room: count rooms checked.
+    println!(
+        "Key backup checked for {done} encrypted room(s); the keys found there were imported."
+    );
     println!(
         "Key backup enabled: {}",
         if backups.are_enabled().await {
