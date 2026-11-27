@@ -143,9 +143,12 @@ pub async fn run(args: ReadArgs) -> Result<()> {
     let mut lines = fetch_lines(&room, args.limit, room_encrypted).await?;
     if args.request_keys && lines.iter().any(Line::is_undecryptable) {
         warn_without_verified_device(&client).await;
-        key_wait_rounds(KEY_WAIT_ROUNDS, KEY_WAIT_INTERVAL, || {
-            sync_with_timeout(&client, KEY_WAIT_SYNC_TIMEOUT)
-        })
+        key_wait_rounds(
+            KEY_WAIT_ROUNDS,
+            KEY_WAIT_INTERVAL,
+            || sync_with_timeout(&client, KEY_WAIT_SYNC_TIMEOUT),
+            |line| eprintln!("{line}"),
+        )
         .await;
         lines = fetch_lines(&room, args.limit, room_encrypted).await?;
     }
@@ -220,18 +223,36 @@ pub async fn sync_with_timeout(client: &Client, timeout: Duration) -> Result<()>
     Ok(())
 }
 
+/// Remembers the sync errors already reported, so a homeserver that stays
+/// unreachable gives one warning per distinct message, not one per round.
+#[derive(Debug, Default)]
+pub struct SyncWarnings(std::collections::BTreeSet<String>);
+
+impl SyncWarnings {
+    /// The line to print for `err`; `None` if its message was printed before.
+    pub fn line(&mut self, err: &anyhow::Error) -> Option<String> {
+        let msg = format!("{err:#}");
+        let line = format!("warning: {}", term(&msg));
+        self.0.insert(msg).then_some(line)
+    }
+}
+
 /// `rounds` times: wait `interval`, then sync. A failed sync is reported
-/// and the next round runs, as in Python, where a sync error is a return
-/// value nobody checks.
-pub async fn key_wait_rounds<S, F>(rounds: u32, interval: Duration, mut sync: S)
+/// (once per distinct message, through `warn`) and the next round runs, as
+/// in Python, where a sync error is a return value nobody checks.
+pub async fn key_wait_rounds<S, F, W>(rounds: u32, interval: Duration, mut sync: S, mut warn: W)
 where
     S: FnMut() -> F,
     F: Future<Output = Result<()>>,
+    W: FnMut(String),
 {
+    let mut warnings = SyncWarnings::default();
     for _ in 0..rounds {
         tokio::time::sleep(interval).await;
-        if let Err(err) = sync().await {
-            eprintln!("warning: {}", term(&format!("{err:#}")));
+        if let Err(err) = sync().await
+            && let Some(line) = warnings.line(&err)
+        {
+            warn(line);
         }
     }
 }
@@ -826,18 +847,27 @@ mod tests {
     #[tokio::test]
     async fn key_wait_runs_six_rounds_and_survives_a_failed_sync() {
         let calls = std::cell::Cell::new(0u32);
-        key_wait_rounds(KEY_WAIT_ROUNDS, Duration::ZERO, || {
-            calls.set(calls.get() + 1);
-            let n = calls.get();
-            async move {
-                if n == 2 {
-                    anyhow::bail!("sync failed")
+        let mut warnings = Vec::new();
+        key_wait_rounds(
+            KEY_WAIT_ROUNDS,
+            Duration::ZERO,
+            || {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move {
+                    // The network is down from round 2 on: the same error
+                    // five times gives one warning.
+                    if n >= 2 {
+                        anyhow::bail!("sync failed: connection refused")
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-        })
+            },
+            |line| warnings.push(line),
+        )
         .await;
         assert_eq!(calls.get(), 6);
+        assert_eq!(warnings, ["warning: sync failed: connection refused"]);
         assert_eq!(
             (KEY_WAIT_INTERVAL, KEY_WAIT_SYNC_TIMEOUT),
             (Duration::from_secs(5), Duration::from_secs(5))

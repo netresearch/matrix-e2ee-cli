@@ -10,6 +10,7 @@
 //! output counts sessions without a key, not requests it cannot observe.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -18,7 +19,7 @@ use matrix_sdk::deserialized_responses::{TimelineEvent, TimelineEventKind};
 
 use crate::FetchKeysArgs;
 use crate::commands::read::{
-    fetch_events, sync_with_timeout, to_line, warn_without_verified_device,
+    SyncWarnings, fetch_events, sync_with_timeout, to_line, warn_without_verified_device,
 };
 use crate::commands::resolve_room;
 use crate::config::load_config;
@@ -171,6 +172,40 @@ where
     count
 }
 
+/// Sync until `total` has passed; `after` runs after each sync with the
+/// seconds elapsed. A failed sync returns at once when the network is down
+/// (matrix-sdk 0.20.0 does not retry a network failure), so the rest of its
+/// `round` is waited out, never past `total`, instead of spinning. Each
+/// distinct error is reported once through `warn`.
+pub async fn sync_for<S, F, W, A>(
+    total: Duration,
+    round: Duration,
+    mut sync: S,
+    mut warn: W,
+    mut after: A,
+) where
+    S: FnMut() -> F,
+    F: Future<Output = Result<()>>,
+    W: FnMut(String),
+    A: FnMut(u64),
+{
+    let start = Instant::now();
+    let mut warnings = SyncWarnings::default();
+    while start.elapsed() < total {
+        let begun = Instant::now();
+        if let Err(err) = sync().await {
+            if let Some(line) = warnings.line(&err) {
+                warn(line);
+            }
+            let rest = round
+                .saturating_sub(begun.elapsed())
+                .min(total.saturating_sub(start.elapsed()));
+            tokio::time::sleep(rest).await;
+        }
+        after(start.elapsed().as_secs());
+    }
+}
+
 pub async fn run(args: FetchKeysArgs) -> Result<()> {
     let config = load_config()?;
     let paths = Paths::from_env()?;
@@ -212,17 +247,20 @@ pub async fn run(args: FetchKeysArgs) -> Result<()> {
         args.sync_time
     );
     println!("(Ensure you have other verified devices online)");
-    let start = Instant::now();
     let mut last = received;
-    while start.elapsed() < Duration::from_secs(args.sync_time) {
-        if let Err(err) = sync_with_timeout(&client, WAIT_SYNC_TIMEOUT).await {
-            eprintln!("warning: {}", term(&format!("{err:#}")));
-        }
-        received += drain(&mut keys);
-        if let Some(line) = progress_line(received, &mut last, start.elapsed().as_secs()) {
-            println!("{line}");
-        }
-    }
+    sync_for(
+        Duration::from_secs(args.sync_time),
+        WAIT_SYNC_TIMEOUT,
+        || sync_with_timeout(&client, WAIT_SYNC_TIMEOUT),
+        |line| eprintln!("{line}"),
+        |elapsed| {
+            received += drain(&mut keys);
+            if let Some(line) = progress_line(received, &mut last, elapsed) {
+                println!("{line}");
+            }
+        },
+    )
+    .await;
 
     let after = Scan::of(&fetch_events(&room, args.limit).await?);
     print!("{}", results(&before, received, &after));
@@ -341,6 +379,36 @@ mod tests {
         fn session(&self) -> &str {
             self.1
         }
+    }
+
+    #[tokio::test]
+    async fn a_failing_sync_waits_out_its_round_and_warns_once() {
+        // The network is down: every sync fails at once.
+        let total = Duration::from_millis(350);
+        let round = Duration::from_millis(100);
+        let calls = std::cell::Cell::new(0u32);
+        let mut warnings = Vec::new();
+        let mut afters = 0u32;
+        let started = Instant::now();
+        sync_for(
+            total,
+            round,
+            || {
+                calls.set(calls.get() + 1);
+                async { anyhow::bail!("sync failed: connection refused") }
+            },
+            |line| warnings.push(line),
+            |_| afters += 1,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        // About total / round syncs, not one per spin of the loop.
+        assert!((3..=5).contains(&calls.get()), "{} syncs", calls.get());
+        assert_eq!(afters, calls.get());
+        assert_eq!(warnings, ["warning: sync failed: connection refused"]);
+        // The last wait is cut at the deadline.
+        assert!(elapsed >= total, "{elapsed:?}");
+        assert!(elapsed < total + round, "{elapsed:?}");
     }
 
     #[test]
