@@ -35,9 +35,18 @@ use crate::commands::verify_handover::{
 use crate::commands::{confirm_fresh_on, discard_typeahead_stdin, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
-use crate::text::{json_line, term};
+use crate::text::{json_line, term_id};
 
 const MATCH_QUESTION: &str = "Do they match exactly?";
+
+/// A line on stderr. A failed write (a closed stderr) is ignored instead of
+/// panicking: the flow must still reach its cancel and its cleanup.
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
 
 /// The emoji (or numbers) to compare, as shown before the question.
 fn comparison_text(emojis: Option<&[Emoji]>, decimals: (u16, u16, u16)) -> String {
@@ -48,8 +57,8 @@ fn comparison_text(emojis: Option<&[Emoji]>, decimals: (u16, u16, u16)) -> Strin
             for emoji in emojis {
                 text.push_str(&format!(
                     "  {}  {}\n",
-                    term(emoji.symbol),
-                    term(emoji.description)
+                    term_id(emoji.symbol),
+                    term_id(emoji.description)
                 ));
             }
         }
@@ -148,7 +157,7 @@ impl Answer {
     fn report(&self, line: &str) {
         match self {
             Answer::Prompt => println!("{line}"),
-            Answer::HandOver { .. } => eprintln!("{line}"),
+            Answer::HandOver { .. } => note!("{line}"),
         }
     }
 }
@@ -167,7 +176,7 @@ fn decide(token: &str, decision: Decision) -> Result<()> {
         &target.comparison.other_device,
         target.pid,
     )?;
-    eprintln!("{line}");
+    note!("{line}");
     Ok(())
 }
 
@@ -213,19 +222,6 @@ fn taken_report(
     }
 }
 
-/// [`term`], and the Unicode bidi controls (U+202A-U+202E, U+2066-U+2069)
-/// replaced too: an id or device name the other side chose cannot reorder
-/// the text around it.
-fn term_id(s: &str) -> String {
-    term(s)
-        .chars()
-        .map(|c| match c {
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => '\u{FFFD}',
-            c => c,
-        })
-        .collect()
-}
-
 /// The emoji in the hand-over's form.
 fn emoji_items(emojis: &[Emoji]) -> Vec<EmojiItem> {
     emojis
@@ -252,26 +248,43 @@ fn hand_over_instructions(token: &str, other_device: &str, timeout: u64) -> Stri
         "Compare the emoji on stdout with the ones device {} shows.\n\
          If the person confirms they match exactly, run:\n  matrix-e2ee-cli verify --confirm {token}\n\
          If they do not match, run:\n  matrix-e2ee-cli verify --cancel {token}\n\
+         --confirm or --cancel exits 0 once this process took the decision; whether the \
+         device ended up verified is reported here, on this process's stderr.\n\
          Waiting for the decision (the verification gives up {timeout} s after it started).\n",
         term_id(other_device)
     )
 }
 
-/// The error after a failed `confirm()`. When the SAS is done anyway (the
-/// other side's MAC arrived first), the device is trusted locally: say so,
-/// and do not claim a cancellation.
-fn confirm_failure(
-    err: anyhow::Error,
-    verified_locally: bool,
-    other_device: &str,
-) -> anyhow::Error {
-    if verified_locally {
-        err.context(format!(
-            "device {} is verified locally; the confirmation was not delivered to it",
-            term_id(other_device)
-        ))
-    } else {
-        err.context("cannot send the confirmation; verification cancelled")
+/// The other device's id when the store holds it as verified: then the
+/// trust is in place, whatever ended the flow.
+async fn verified_in_store(client: &Client, sas: &SasVerification) -> Option<String> {
+    let device = sas.other_device();
+    match client
+        .encryption()
+        .get_device(device.user_id(), device.device_id())
+        .await
+    {
+        Ok(Some(stored)) if stored.is_verified() => Some(device.device_id().to_string()),
+        _ => None,
+    }
+}
+
+/// The error to report after a failed, timed-out or interrupted flow, and
+/// whether the request is still to be cancelled. A device the store holds
+/// as verified is reported as such, and nothing is cancelled then.
+fn after_failure(err: anyhow::Error, verified_device: Option<&str>) -> (anyhow::Error, bool) {
+    match verified_device {
+        Some(device) => (
+            err.context(format!(
+                "device {} is verified locally; the confirmation may not have reached it",
+                term_id(device)
+            )),
+            false,
+        ),
+        None => (
+            err.context("verification cancelled; nothing was trusted"),
+            true,
+        ),
     }
 }
 
@@ -306,15 +319,19 @@ async fn termination_signal() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let (Ok(mut interrupt), Ok(mut terminate)) = (
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup), Ok(mut quit)) = (
             signal(SignalKind::interrupt()),
             signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+            signal(SignalKind::quit()),
         ) else {
             return std::future::pending().await;
         };
         tokio::select! {
             _ = interrupt.recv() => "SIGINT",
             _ = terminate.recv() => "SIGTERM",
+            _ = hangup.recv() => "SIGHUP",
+            _ = quit.recv() => "SIGQUIT",
         }
     }
     #[cfg(not(unix))]
@@ -357,8 +374,8 @@ fn device_lines(rows: &[DeviceRow], json: bool) -> Result<Vec<String>> {
     for row in rows {
         lines.push(format!(
             "  {}: {} [{}]{}",
-            term(&row.device_id),
-            term(row.display_name.as_deref().unwrap_or("No name")),
+            term_id(&row.device_id),
+            term_id(row.display_name.as_deref().unwrap_or("No name")),
             if row.verified {
                 "verified"
             } else {
@@ -465,10 +482,10 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
             let own = own.clone();
             async move {
                 if ev.sender != own {
-                    eprintln!(
+                    note!(
                         "Ignoring a verification request from {}: only devices of {} are verified here.",
-                        term(ev.sender.as_str()),
-                        term(own.as_str())
+                        term_id(ev.sender.as_str()),
+                        term_id(own.as_str())
                     );
                     return;
                 }
@@ -487,12 +504,21 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
     let sync_task = tokio::spawn(async move {
         let settings = SyncSettings::default().timeout(Duration::from_secs(5));
         if let Err(err) = sync_client.sync(settings).await {
-            eprintln!("sync stopped: {}", term(&err.to_string()));
+            note!("sync stopped: {}", term_id(&err.to_string()));
         }
     });
 
     let current: Arc<Mutex<Option<VerificationRequest>>> = Arc::default();
-    let flow = flow(&client, &own_user, &args, &mut rx, current.clone(), &answer);
+    let sas_slot: Arc<Mutex<Option<SasVerification>>> = Arc::default();
+    let flow = flow(
+        &client,
+        &own_user,
+        &args,
+        &mut rx,
+        current.clone(),
+        sas_slot.clone(),
+        &answer,
+    );
     // Without a person at the terminal, SIGINT and SIGTERM take the
     // timeout's path: cancel, remove the hand-over files, trust nothing.
     let stop = async {
@@ -501,30 +527,44 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
             Answer::Prompt => std::future::pending().await,
         }
     };
-    let outcome = match run_until_stopped(flow, Duration::from_secs(args.timeout), stop).await {
-        Stop::Finished(result) => result,
-        Stop::Interrupted(signal) => Err(anyhow::anyhow!(
-            "verification interrupted by {signal}; cancelled, nothing was trusted"
-        )),
-        Stop::TimedOut => {
-            let pending = current.lock().ok().and_then(|slot| slot.clone());
-            if let Some(request) = pending {
-                best_effort(request.cancel(), CANCEL_LIMIT).await;
+    let agent = matches!(answer, Answer::HandOver { .. });
+    let (outcome, stopped) =
+        match run_until_stopped(flow, Duration::from_secs(args.timeout), stop).await {
+            Stop::Finished(result) => (result, false),
+            Stop::Interrupted(signal) => (
+                Err(anyhow::anyhow!("verification interrupted by {signal}")),
+                true,
+            ),
+            Stop::TimedOut => (
+                Err(anyhow::anyhow!(
+                    "verification timed out after {} s",
+                    args.timeout
+                )),
+                true,
+            ),
+        };
+    // A timeout, a signal or (without a person) any error can come after
+    // confirm() stored the trust: ask the store before cancelling, so a
+    // verified device is never reported as "nothing was trusted".
+    let outcome = match outcome {
+        Ok(()) => Ok(()),
+        Err(err) if stopped || agent => {
+            let sas = sas_slot.lock().ok().and_then(|slot| slot.clone());
+            let verified = match &sas {
+                Some(sas) => verified_in_store(&client, sas).await,
+                None => None,
+            };
+            let (err, cancel) = after_failure(err, verified.as_deref());
+            if cancel {
+                let pending = current.lock().ok().and_then(|slot| slot.clone());
+                if let Some(request) = pending.filter(|r| !r.is_done() && !r.is_cancelled()) {
+                    best_effort(request.cancel(), CANCEL_LIMIT).await;
+                }
             }
-            Err(anyhow::anyhow!(
-                "verification timed out after {} s",
-                args.timeout
-            ))
+            Err(err)
         }
+        Err(err) => Err(err),
     };
-    // Without a person at the terminal, any failure cancels what is still
-    // open: nothing is trusted unless a handed-over confirm completed.
-    if outcome.is_err() && matches!(answer, Answer::HandOver { .. }) {
-        let pending = current.lock().ok().and_then(|slot| slot.clone());
-        if let Some(request) = pending.filter(|r| !r.is_done() && !r.is_cancelled()) {
-            best_effort(request.cancel(), CANCEL_LIMIT).await;
-        }
-    }
 
     if outcome.is_ok() {
         tokio::time::sleep(SETTLE_TIME).await;
@@ -540,6 +580,7 @@ async fn flow(
     args: &VerifyArgs,
     rx: &mut mpsc::UnboundedReceiver<(OwnedUserId, String)>,
     current: Arc<Mutex<Option<VerificationRequest>>>,
+    sas_slot: Arc<Mutex<Option<SasVerification>>>,
     answer: &Answer,
 ) -> Result<()> {
     let encryption = client.encryption();
@@ -557,9 +598,9 @@ async fn flow(
                 .map(|d| {
                     format!(
                         "{}{}",
-                        term(d.device_id().as_str()),
+                        term_id(d.device_id().as_str()),
                         d.display_name()
-                            .map(|n| format!(" ({})", term(n)))
+                            .map(|n| format!(" ({})", term_id(n)))
                             .unwrap_or_default()
                     )
                 })
@@ -573,16 +614,16 @@ async fn flow(
                 }
             );
         };
-        eprintln!(
+        note!(
             "Requesting verification with {}; accept it on that device.",
-            term(device_id.as_str())
+            term_id(device_id.as_str())
         );
         device
             .request_verification()
             .await
             .context("cannot send the verification request")?
     } else {
-        eprintln!("Waiting for a verification request from one of your devices...");
+        note!("Waiting for a verification request from one of your devices...");
         let request = loop {
             let (sender, flow_id) = rx.recv().await.context("the request listener stopped")?;
             match encryption.get_verification_request(&sender, &flow_id).await {
@@ -591,7 +632,7 @@ async fn flow(
                 _ => continue,
             }
         };
-        eprintln!("Verification request received; accepting.");
+        note!("Verification request received; accepting.");
         // Register before accepting: accept() marks the request ready before
         // its send completes, so a timeout during the send must cancel it too.
         if let Ok(mut slot) = current.lock() {
@@ -608,6 +649,9 @@ async fn flow(
     }
 
     let sas = wait_for_sas(&request).await?;
+    if let Ok(mut slot) = sas_slot.lock() {
+        *slot = Some(sas.clone());
+    }
     run_sas(&sas, request.flow_id(), answer).await
 }
 
@@ -774,10 +818,14 @@ async fn run_sas(sas: &SasVerification, flow_id: &str, how: &Answer) -> Result<(
                             sas.cancel().await.ok();
                             return Err(err.context("verification cancelled"));
                         }
-                        eprint!(
-                            "{}",
-                            hand_over_instructions(pending.token(), other, *timeout)
-                        );
+                        {
+                            use std::io::Write as _;
+                            let _ = write!(
+                                std::io::stderr(),
+                                "{}",
+                                hand_over_instructions(pending.token(), other, *timeout)
+                            );
+                        }
                         answer_unless_ended(wait_for_decision(pending), &mut changes, ends).await
                     }
                 };
@@ -798,21 +846,15 @@ async fn run_sas(sas: &SasVerification, flow_id: &str, how: &Answer) -> Result<(
                         sas.confirm()
                             .await
                             .context("cannot send the confirmation")?;
-                        eprintln!("Confirmed; waiting for the other device.");
+                        note!("Confirmed; waiting for the other device.");
                     }
                     (true, Answer::HandOver { .. }) => {
-                        if let Err(err) = sas.confirm().await {
-                            let verified_locally = sas.is_done();
-                            if !verified_locally {
-                                sas.cancel().await.ok();
-                            }
-                            return Err(confirm_failure(
-                                anyhow::Error::new(err),
-                                verified_locally,
-                                sas.other_device().device_id().as_str(),
-                            ));
-                        }
-                        eprintln!("Confirmed; waiting for the other device.");
+                        // On an error, run() looks up whether the device is
+                        // stored as verified before it cancels anything.
+                        sas.confirm()
+                            .await
+                            .context("cannot send the confirmation")?;
+                        note!("Confirmed; waiting for the other device.");
                     }
                     (false, Answer::Prompt) => {
                         sas.mismatch().await.ok();
@@ -820,7 +862,7 @@ async fn run_sas(sas: &SasVerification, flow_id: &str, how: &Answer) -> Result<(
                     }
                     (false, Answer::HandOver { .. }) => {
                         sas.cancel().await.ok();
-                        bail!("verification cancelled with verify --cancel; nothing was trusted");
+                        bail!("the person cancelled with verify --cancel");
                     }
                 }
             }
@@ -964,18 +1006,12 @@ mod tests {
             text.contains("device PH\u{FFFD}\u{FFFD}ONE shows"),
             "{text}"
         );
-    }
-
-    #[test]
-    fn bidi_controls_are_replaced_in_ids() {
-        let shown = term_id(
-            "a\u{202A}b\u{202B}c\u{202C}d\u{202D}e\u{202E}f\u{2066}g\u{2067}h\u{2068}i\u{2069}j\u{1b}k",
+        assert!(
+            text.contains(
+                "exits 0 once this process took the decision; whether the device ended up verified is reported here, on this process's stderr."
+            ),
+            "{text}"
         );
-        assert_eq!(
-            shown,
-            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e\u{FFFD}f\u{FFFD}g\u{FFFD}h\u{FFFD}i\u{FFFD}j\u{FFFD}k"
-        );
-        assert_eq!(term_id("ABCDEF"), "ABCDEF");
     }
 
     #[test]
@@ -993,6 +1029,25 @@ mod tests {
         let mut out = Vec::new();
         emit_line(&mut out, "{\"a\":1}").unwrap();
         assert_eq!(out, b"{\"a\":1}\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_and_sigquit_end_the_wait() {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Handlers of the test's own first, so a signal that arrives before
+        // termination_signal() listens cannot end the test process.
+        let _hangup = signal(SignalKind::hangup()).unwrap();
+        let _quit = signal(SignalKind::quit()).unwrap();
+        for (number, name) in [(libc::SIGHUP, "SIGHUP"), (libc::SIGQUIT, "SIGQUIT")] {
+            let waiting = tokio::spawn(termination_signal());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // SAFETY: raise only sends a signal to this process, whose
+            // handler for it is installed above.
+            assert_eq!(unsafe { libc::raise(number) }, 0);
+            let got = within_5s("the signal did not end the wait", waiting).await;
+            assert_eq!(got.unwrap(), name);
+        }
     }
 
     #[tokio::test]
@@ -1026,14 +1081,21 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_confirmation_after_done_reports_verified_locally() {
-        let err = confirm_failure(anyhow::anyhow!("send failed"), true, "PHONE");
+    fn a_device_verified_in_the_store_is_reported_and_not_cancelled() {
+        let (err, cancel) = after_failure(anyhow::anyhow!("timed out"), Some("PH\u{202E}ONE"));
         let msg = format!("{err:#}");
-        assert!(msg.contains("verified locally"), "{msg}");
-        assert!(!msg.contains("cancelled"), "{msg}");
-        let err = confirm_failure(anyhow::anyhow!("send failed"), false, "PHONE");
+        assert!(!cancel, "a verified device would be cancelled");
+        assert!(
+            msg.contains(
+                "device PH\u{FFFD}ONE is verified locally; the confirmation may not have reached it"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("nothing was trusted"), "{msg}");
+        let (err, cancel) = after_failure(anyhow::anyhow!("timed out"), None);
         let msg = format!("{err:#}");
-        assert!(msg.contains("verification cancelled"), "{msg}");
+        assert!(cancel);
+        assert!(msg.contains("nothing was trusted"), "{msg}");
         assert!(!msg.contains("verified locally"), "{msg}");
     }
 

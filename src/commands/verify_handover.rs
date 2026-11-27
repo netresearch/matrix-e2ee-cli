@@ -118,6 +118,29 @@ fn token_pid(token: &str) -> Option<u32> {
 /// Write `bytes` to `path` with mode 0600: a temporary file created
 /// 0600 at open time, renamed over the target.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_through_tmp(path, bytes, |tmp, path| fs::rename(tmp, path))
+}
+
+/// Like [`write_private`], but never replaces an existing `path`: the
+/// temporary file is hard-linked to it, which fails when it exists. The
+/// error then has kind `AlreadyExists`.
+fn write_new_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_through_tmp(path, bytes, |tmp, path| {
+        let linked = fs::hard_link(tmp, path);
+        let _ = fs::remove_file(tmp);
+        linked
+    })
+    .map_err(|err| match err.downcast::<std::io::Error>() {
+        Ok(io) => io,
+        Err(other) => std::io::Error::other(format!("{other:#}")),
+    })
+}
+
+fn write_through_tmp(
+    path: &Path,
+    bytes: &[u8],
+    finish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     let name = path
         .file_name()
         .context("hand-over file has no name")?
@@ -138,7 +161,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))
+        finish(&tmp, path).map_err(anyhow::Error::new)
     })();
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -201,6 +224,9 @@ pub fn sweep(dir: &Path) -> Result<()> {
 /// to read; the next `verify` sweeps it if nobody did.
 #[derive(Debug)]
 pub struct Pending {
+    /// The first decision read; every later poll returns it, so a cancel
+    /// once seen stays a cancel.
+    taken: std::sync::Mutex<Option<Decision>>,
     comparison: Comparison,
     line: String,
     emoji_file: PathBuf,
@@ -225,6 +251,7 @@ impl Pending {
             token: token.clone(),
         };
         let pending = Self {
+            taken: std::sync::Mutex::new(None),
             line: json_line(&comparison)?,
             emoji_file: dir.join(format!("{token}{EMOJI_SUFFIX}")),
             decision_file: dir.join(format!("{token}{DECISION_SUFFIX}")),
@@ -258,23 +285,33 @@ impl Pending {
     }
 
     /// The decision for this comparison, once one was handed over, and
-    /// acknowledged. A file under this token that names another transaction
-    /// is removed and acknowledged as ignored. Once a decision is taken the
+    /// acknowledged. The first decision counts: it is kept and returned by
+    /// every later poll, and its file stays, so no second hand-over can be
+    /// placed. A file under this token that names another transaction is
+    /// removed and acknowledged as ignored. Once a decision is taken the
     /// emoji file goes too: the verification no longer waits, so a later
     /// --confirm or --cancel finds nothing.
     pub fn poll(&self) -> Result<Option<Decision>> {
+        let mut taken = self
+            .taken
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the decision state is poisoned"))?;
+        if let Some(decision) = *taken {
+            return Ok(Some(decision));
+        }
         let Some(text) = read_private(&self.decision_file)? else {
             return Ok(None);
         };
-        let _ = fs::remove_file(&self.decision_file);
         let decision = serde_json::from_str::<DecisionFile>(&text)
             .ok()
             .filter(|file| file.transaction_id == self.comparison.transaction_id)
             .map(|file| file.decision);
         let Some(decision) = decision else {
+            let _ = fs::remove_file(&self.decision_file);
             self.acknowledge(Taken::Ignored)?;
             return Ok(None);
         };
+        *taken = Some(decision);
         let _ = fs::remove_file(&self.emoji_file);
         self.acknowledge(match decision {
             Decision::Confirm => Taken::Confirm,
@@ -321,7 +358,8 @@ fn process_alive(pid: u32) -> bool {
 }
 
 /// Hand `decision` to the comparison with `token`: only when its emoji file
-/// exists and its process still runs.
+/// exists, its process still runs and no decision was handed over before
+/// (the first one counts).
 pub fn hand_over(dir: &Path, token: &str, decision: Decision) -> Result<Waiting> {
     let Some(pid) = token_pid(token) else {
         bail!(
@@ -341,16 +379,22 @@ pub fn hand_over(dir: &Path, token: &str, decision: Decision) -> Result<Waiting>
     if comparison.token != token {
         bail!("the emoji file of token {token} names another token");
     }
+    // The acknowledgement of an earlier decider stays for that decider.
     let taken_file = dir.join(format!("{token}{TAKEN_SUFFIX}"));
-    let _ = fs::remove_file(&taken_file);
     let file = DecisionFile {
         transaction_id: comparison.transaction_id.clone(),
         decision,
     };
-    write_private(
-        &dir.join(format!("{token}{DECISION_SUFFIX}")),
-        serde_json::to_string(&file)?.as_bytes(),
-    )?;
+    let decision_file = dir.join(format!("{token}{DECISION_SUFFIX}"));
+    match write_new_private(&decision_file, serde_json::to_string(&file)?.as_bytes()) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("a decision was already handed over for token {token}; the first one counts")
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("cannot write {}", decision_file.display()));
+        }
+    }
     Ok(Waiting {
         pid,
         comparison,
@@ -363,8 +407,9 @@ pub fn hand_over(dir: &Path, token: &str, decision: Decision) -> Result<Waiting>
 pub fn await_taken(waiting: &Waiting, within: Duration, every: Duration) -> Result<Option<Taken>> {
     let deadline = Instant::now() + within;
     loop {
+        // Read, never removed: another decider may read it too; the next
+        // `verify` sweeps it.
         if let Some(text) = read_private(&waiting.taken_file)? {
-            let _ = fs::remove_file(&waiting.taken_file);
             let file: TakenFile =
                 serde_json::from_str(&text).context("the acknowledgement is not valid")?;
             return Ok(Some(file.taken));
@@ -419,6 +464,82 @@ mod tests {
         // Decided: a later --cancel must not report a hand-over nobody reads.
         let err = hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap_err();
         assert!(err.to_string().contains("already decided"), "{err}");
+    }
+
+    #[test]
+    fn the_first_decision_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = publish(tmp.path(), "tx1");
+        // --cancel, then --confirm before the waiting process polled.
+        let first = hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap();
+        let err = hand_over(tmp.path(), pending.token(), Decision::Confirm).unwrap_err();
+        assert!(err.to_string().contains("already handed over"), "{err}");
+        assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
+        assert_eq!(
+            await_taken(&first, QUICK, QUICK).unwrap(),
+            Some(Taken::Cancel)
+        );
+    }
+
+    #[test]
+    fn a_cancel_once_seen_stays_a_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = publish(tmp.path(), "tx1");
+        hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap();
+        assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
+        // Whatever replaces the decision file afterwards.
+        let confirm = DecisionFile {
+            transaction_id: "tx1".to_owned(),
+            decision: Decision::Confirm,
+        };
+        write_private(
+            &pending.decision_file,
+            serde_json::to_string(&confirm).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
+    }
+
+    #[test]
+    fn a_later_reader_keeps_the_acknowledgement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = publish(tmp.path(), "tx1");
+        let first = hand_over(tmp.path(), pending.token(), Decision::Confirm).unwrap();
+        assert_eq!(pending.poll().unwrap(), Some(Decision::Confirm));
+        // A second decider fails, and does not take the first one's answer.
+        assert!(hand_over(tmp.path(), pending.token(), Decision::Cancel).is_err());
+        assert_eq!(
+            await_taken(&first, QUICK, QUICK).unwrap(),
+            Some(Taken::Confirm)
+        );
+        assert_eq!(
+            await_taken(&first, QUICK, QUICK).unwrap(),
+            Some(Taken::Confirm)
+        );
+    }
+
+    #[test]
+    fn a_second_decider_leaves_the_first_ones_acknowledgement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = publish(tmp.path(), "tx1");
+        let first = hand_over(tmp.path(), pending.token(), Decision::Confirm).unwrap();
+        // The first decision turns out not to name the transaction.
+        let wrong = DecisionFile {
+            transaction_id: "tx0".to_owned(),
+            decision: Decision::Confirm,
+        };
+        write_private(
+            &pending.decision_file,
+            serde_json::to_string(&wrong).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(pending.poll().unwrap(), None);
+        // A second decider may hand over now, and leaves the answer alone.
+        hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap();
+        assert_eq!(
+            await_taken(&first, QUICK, QUICK).unwrap(),
+            Some(Taken::Ignored)
+        );
     }
 
     #[test]
