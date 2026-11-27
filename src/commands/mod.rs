@@ -16,6 +16,7 @@ pub mod redact;
 pub mod send;
 pub mod status;
 pub mod verify;
+pub mod verify_handover;
 pub mod watch;
 pub mod watch_daemon;
 

@@ -2,10 +2,20 @@
 //!
 //! A sync loop runs in the background for the whole flow, because every
 //! verification step arrives as a to-device event.
+//!
+//! With a terminal on stdin and stderr, a person confirms the emoji at the
+//! prompt. With `--hand-over` (an agent runs the command, with or without a
+//! terminal), the emoji go to stdout as one JSON line and to an owner-only
+//! file, and the verification is confirmed only after a second process,
+//! `verify --confirm`, handed over the person's decision; the CLI never
+//! confirms on its own. Without a terminal and without `--hand-over` it
+//! refuses.
 
 use std::future::Future;
 use std::io::IsTerminal;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -18,15 +28,29 @@ use matrix_sdk::encryption::verification::{
 };
 use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
 use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::VerifyArgs;
+use crate::commands::verify_handover::{
+    Decision, EmojiItem, Pending, TAKEN_STALE, TAKEN_WAIT, Taken, await_taken, hand_over,
+    handover_dir, sweep,
+};
 use crate::commands::{confirm_fresh_on, discard_typeahead_stdin, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
-use crate::text::term;
+use crate::text::{json_line, term_id};
 
 const MATCH_QUESTION: &str = "Do they match exactly?";
+
+/// A line on stderr. A failed write (a closed stderr) is ignored instead of
+/// panicking: the flow must still reach its cancel and its cleanup.
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
 
 /// The emoji (or numbers) to compare, as shown before the question.
 fn comparison_text(emojis: Option<&[Emoji]>, decimals: (u16, u16, u16)) -> String {
@@ -37,8 +61,8 @@ fn comparison_text(emojis: Option<&[Emoji]>, decimals: (u16, u16, u16)) -> Strin
             for emoji in emojis {
                 text.push_str(&format!(
                     "  {}  {}\n",
-                    term(emoji.symbol),
-                    term(emoji.description)
+                    term_id(emoji.symbol),
+                    term_id(emoji.description)
                 ));
             }
         }
@@ -94,23 +118,597 @@ const SETTLE_TIME: Duration = Duration::from_secs(5);
 /// How long the cancellation after a timeout may take.
 const CANCEL_LIMIT: Duration = Duration::from_secs(10);
 
+/// How often a waiting verification looks for a handed-over decision.
+const DECISION_POLL: Duration = Duration::from_millis(250);
+/// How often --confirm / --cancel look for the waiting process's answer
+/// (they wait for it up to `TAKEN_WAIT`).
+const TAKEN_POLL: Duration = Duration::from_millis(100);
+
 /// Run a best-effort step for at most `limit`: a responsive server still
-/// gets it, a stalled one cannot keep the command from ending.
-async fn best_effort(step: impl Future, limit: Duration) {
-    let _ = tokio::time::timeout(limit, step).await;
+/// gets it, a stalled one cannot keep the command from ending. `None` when
+/// the time ran out.
+async fn best_effort<F: Future>(step: F, limit: Duration) -> Option<F::Output> {
+    tokio::time::timeout(limit, step).await.ok()
 }
 
-pub async fn run(args: VerifyArgs) -> Result<()> {
-    // stdin: the answer comes from a person. stderr: the emoji and the
-    // question are shown to that person, not written to a file.
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+/// Who confirms the emoji.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirmer {
+    /// A person at the terminal (stdin and stderr are terminals).
+    Person,
+    /// An agent: the decision comes from `verify --confirm` / `--cancel`.
+    Agent,
+}
+
+const NEEDS_TERMINAL: &str = "verify needs a terminal on stdin and stderr: the emoji comparison must be seen and confirmed by a person; no verification was started";
+
+/// The hand-over only when asked for (`--hand-over`), with or without a
+/// terminal. Otherwise the prompt, whose answer comes from stdin and whose
+/// emoji and question go to stderr: both must be a terminal, or verify
+/// refuses as before; it never falls back to the hand-over on its own.
+fn confirmer(
+    hand_over: bool,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> Result<Confirmer> {
+    if hand_over {
+        Ok(Confirmer::Agent)
+    } else if stdin_is_terminal && stderr_is_terminal {
+        Ok(Confirmer::Person)
+    } else {
         bail!(
-            "verify needs a terminal on stdin and stderr: the emoji comparison must be seen and confirmed by a person; no verification was started"
-        );
+            "{NEEDS_TERMINAL}. An agent that has the person compare the emoji passes --hand-over."
+        )
     }
+}
+
+/// How the waiting process gets the answer.
+enum Answer {
+    Prompt,
+    HandOver { dir: PathBuf, timeout: u64 },
+}
+
+impl Answer {
+    /// The result lines: stdout at a terminal, as before; stderr for an
+    /// agent, whose stdout carries only the emoji line.
+    fn report(&self, line: &str) {
+        match self {
+            Answer::Prompt => println!("{line}"),
+            Answer::HandOver { .. } => note!("{line}"),
+        }
+    }
+}
+
+/// `verify --confirm` / `--cancel`: hand the decision to the comparison with
+/// `token` and report what the waiting process did with it. Takes neither the
+/// data-directory lock (the waiting process holds it) nor the store.
+fn decide(token: &str, decision: Decision) -> Result<()> {
+    let paths = Paths::from_env()?;
+    let target = hand_over(&handover_dir(&paths.data_dir), token, decision)?;
+    let taken = await_taken(&target, TAKEN_WAIT, TAKEN_POLL)?;
+    let line = taken_report(
+        decision,
+        taken,
+        &target.comparison.transaction_id,
+        &target.comparison.other_device,
+        target.pid,
+    )?;
+    note!("{line}");
+    Ok(())
+}
+
+/// What the waiting process did with the decision this process handed over.
+fn taken_report(
+    sent: Decision,
+    taken: Option<Taken>,
+    transaction_id: &str,
+    other_device: &str,
+    pid: u32,
+) -> Result<String> {
+    let name = |decision: Decision| match decision {
+        Decision::Confirm => "the confirmation",
+        Decision::Cancel => "the cancellation",
+    };
+    let which = format!(
+        "verification {} with device {} (process {pid})",
+        term_id(transaction_id),
+        term_id(other_device)
+    );
+    match (sent, taken) {
+        (Decision::Confirm, Some(Taken::Confirm)) => Ok(format!(
+            "The {which} took the confirmation; it confirms the emoji and reports the result."
+        )),
+        (Decision::Cancel, Some(Taken::Cancel)) => Ok(format!(
+            "The {which} took the cancellation; it cancels and reports the result."
+        )),
+        (Decision::Cancel, Some(Taken::Confirm)) => {
+            bail!("the {which} acted on a confirmation, not on this cancellation")
+        }
+        (Decision::Confirm, Some(Taken::Cancel)) => {
+            bail!("the {which} acted on a cancellation, not on this confirmation")
+        }
+        (_, Some(Taken::Ignored)) => bail!(
+            "the {which} ignored {}: it did not name its transaction",
+            name(sent)
+        ),
+        (_, None) => bail!(
+            "the {which} did not acknowledge {} within {} s; it may still act on it",
+            name(sent),
+            TAKEN_WAIT.as_secs()
+        ),
+    }
+}
+
+/// The emoji in the hand-over's form.
+fn emoji_items(emojis: &[Emoji]) -> Vec<EmojiItem> {
+    emojis
+        .iter()
+        .map(|e| EmojiItem {
+            symbol: e.symbol.to_owned(),
+            description: e.description.to_owned(),
+        })
+        .collect()
+}
+
+/// Write the emoji line; an error (a closed stdout) is returned, never a
+/// panic, so the caller can cancel.
+fn emit_line(out: &mut impl std::io::Write, line: &str) -> Result<()> {
+    writeln!(out, "{line}")
+        .and_then(|()| out.flush())
+        .context("cannot write the emoji line to stdout")
+}
+
+/// How to answer, on stderr, after the emoji line. `token` is this
+/// process's own (digits, a dash, hex), safe on a command line as it is.
+fn hand_over_instructions(token: &str, other_device: &str, timeout: u64) -> String {
+    format!(
+        "Compare the emoji on stdout with the ones device {} shows.\n\
+         If the person confirms they match exactly, run:\n  matrix-e2ee-cli verify --confirm {token}\n\
+         If they do not match, run:\n  matrix-e2ee-cli verify --cancel {token}\n\
+         --confirm or --cancel exits 0 once this process took the decision; whether the \
+         device ended up verified is reported here, on this process's stderr.\n\
+         Waiting for the decision (the verification gives up {timeout} s after it started).\n",
+        term_id(other_device)
+    )
+}
+
+/// Whether the store holds the other device of `sas` as verified; an error
+/// when the store could not be read. A device the store does not know is
+/// not verified.
+async fn stored_as_verified(client: &Client, sas: &SasVerification) -> Result<bool> {
+    let device = sas.other_device();
+    let stored = client
+        .encryption()
+        .get_device(device.user_id(), device.device_id())
+        .await
+        .context("cannot read the device from the store")?;
+    Ok(stored.is_some_and(|stored| stored.is_verified()))
+}
+
+/// What the flow shares with the cleanup in `run()`, which runs after a
+/// timeout or a signal dropped the flow.
+#[derive(Default)]
+struct FlowState {
+    /// The verification request, once there is a handle for it.
+    request: Mutex<Option<VerificationRequest>>,
+    /// A request is being sent and its handle is not there yet: the SDK
+    /// returns it only after the send succeeded.
+    requesting: AtomicBool,
+    /// The SAS, and whether the store held its device as verified when it
+    /// began (`None`: that could not be read).
+    sas: Mutex<Option<(SasVerification, Option<bool>)>>,
+    /// This comparison called `sas.confirm()` (set before the call, so a
+    /// confirmation interrupted while it is sent counts).
+    confirmed: AtomicBool,
+    /// The flow's own cancellation of the comparison (`sas.cancel()`,
+    /// `sas.mismatch()`). The SDK marks the request cancelled before it
+    /// sends, so only this tells the cleanup that a send was cut off.
+    sas_cancel: SendTracker,
+}
+
+/// Whether a send started and whether it ended; kept outside the flow, so a
+/// timeout or a signal that drops the send midway leaves "started, not
+/// finished" behind.
+#[derive(Default)]
+struct SendTracker {
+    started: AtomicBool,
+    finished: AtomicBool,
+}
+
+impl SendTracker {
+    async fn track<F: Future>(&self, send: F) -> F::Output {
+        self.started.store(true, Ordering::SeqCst);
+        let sent = send.await;
+        self.finished.store(true, Ordering::SeqCst);
+        sent
+    }
+
+    /// The outcome to report when the flow stopped while the send ran.
+    fn interrupted(&self) -> Option<CancelOutcome> {
+        (self.started.load(Ordering::SeqCst) && !self.finished.load(Ordering::SeqCst))
+            .then_some(CancelOutcome::SendInterrupted)
+    }
+}
+
+/// Send a verification request. `requesting` is set for the send and
+/// cleared only once it succeeded and its handle is stored in `slot`: an
+/// error from the send can come after the request reached the server, so
+/// the cleanup must still say that its cancellation could not be confirmed.
+async fn send_request<T: Clone, E>(
+    requesting: &AtomicBool,
+    slot: &Mutex<Option<T>>,
+    send: impl Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, E> {
+    requesting.store(true, Ordering::SeqCst);
+    let sent = send.await;
+    if let (Ok(request), Ok(mut slot)) = (&sent, slot.lock()) {
+        *slot = Some(request.clone());
+        requesting.store(false, Ordering::SeqCst);
+    }
+    sent
+}
+
+/// Why a device the store holds as verified is not counted as verified by
+/// this comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotByThisFlow {
+    /// Nobody confirmed this comparison.
+    NobodyConfirmed,
+    /// The device was verified already when the comparison began.
+    VerifiedBefore,
+    /// The state before the comparison could not be read.
+    BeforeUnknown,
+    /// The comparison was cancelled.
+    SasCancelled,
+}
+
+/// What a failed, timed-out or interrupted flow may say about the trust of
+/// the other device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustAfterFailure {
+    /// No comparison began.
+    NoComparison,
+    /// Not verified in the store.
+    NotVerified,
+    /// This comparison confirmed, and the store went from not verified to
+    /// verified: the only case nothing is cancelled.
+    VerifiedByThisFlow,
+    /// Verified in the store, but not attributable to this comparison.
+    VerifiedNotByThisFlow(NotByThisFlow),
+    /// The store could not be read after the flow.
+    Unknown { confirmed: bool, error: String },
+}
+
+impl TrustAfterFailure {
+    /// Whether the unfinished request is to be cancelled.
+    fn needs_cancel(&self) -> bool {
+        !matches!(self, TrustAfterFailure::VerifiedByThisFlow)
+    }
+}
+
+/// Classify the trust of the other device after a failed flow. `before` is
+/// the store's answer when the comparison began (`None`: unreadable), `now`
+/// its answer after the flow, `confirmed` whether this comparison called
+/// `sas.confirm()`.
+fn trust_after_failure(
+    before: Option<bool>,
+    now: std::result::Result<bool, String>,
+    confirmed: bool,
+    sas_cancelled: bool,
+) -> TrustAfterFailure {
+    match now {
+        Err(error) => TrustAfterFailure::Unknown { confirmed, error },
+        Ok(false) => TrustAfterFailure::NotVerified,
+        Ok(true) if !confirmed => {
+            TrustAfterFailure::VerifiedNotByThisFlow(NotByThisFlow::NobodyConfirmed)
+        }
+        Ok(true) => match before {
+            None => TrustAfterFailure::VerifiedNotByThisFlow(NotByThisFlow::BeforeUnknown),
+            Some(true) => TrustAfterFailure::VerifiedNotByThisFlow(NotByThisFlow::VerifiedBefore),
+            Some(false) if sas_cancelled => {
+                TrustAfterFailure::VerifiedNotByThisFlow(NotByThisFlow::SasCancelled)
+            }
+            Some(false) => TrustAfterFailure::VerifiedByThisFlow,
+        },
+    }
+}
+
+/// What the cancellation of the request after a failed flow achieved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CancelOutcome {
+    /// The cancellation was sent.
+    Sent,
+    /// There was no unfinished request to cancel.
+    NothingToCancel,
+    /// Cancelled here; sending the cancellation failed.
+    Failed(String),
+    /// Cancelled here; sending the cancellation did not end in time.
+    TimedOut,
+    /// The request was still being sent when the flow stopped, or its send
+    /// failed: there is no handle to cancel it with.
+    RequestInFlight,
+    /// Cancelled here; the flow stopped while the cancellation was sent.
+    SendInterrupted,
+}
+
+/// Whether a failed flow gets the cleanup (trust check, cancellation and
+/// its report). A timeout, a signal or an agent always do; with a person at
+/// the terminal, so does a request whose send failed, because the request
+/// may have reached the other device all the same.
+fn needs_cleanup(stopped: bool, agent: bool, state: &FlowState) -> bool {
+    stopped || agent || state.requesting.load(Ordering::SeqCst)
+}
+
+/// The outcome when there is no request handle to cancel.
+fn without_request(requesting: bool) -> CancelOutcome {
+    if requesting {
+        CancelOutcome::RequestInFlight
+    } else {
+        CancelOutcome::NothingToCancel
+    }
+}
+
+/// The context for the error of a failed flow: what was cancelled, and what
+/// this comparison did to the trust of `device`.
+fn failure_context(trust: &TrustAfterFailure, cancel: &CancelOutcome, device: &str) -> String {
+    let device = term_id(device);
+    let trust = match trust {
+        TrustAfterFailure::VerifiedByThisFlow => {
+            return format!(
+                "device {device} is verified locally; the confirmation may not have reached it"
+            );
+        }
+        TrustAfterFailure::NoComparison | TrustAfterFailure::NotVerified => {
+            "nothing was trusted on this device".to_owned()
+        }
+        TrustAfterFailure::VerifiedNotByThisFlow(why) => {
+            let why = match why {
+                NotByThisFlow::NobodyConfirmed => "nobody confirmed this comparison",
+                NotByThisFlow::VerifiedBefore => "it was verified before this comparison began",
+                NotByThisFlow::BeforeUnknown => {
+                    "its state before this comparison could not be read"
+                }
+                NotByThisFlow::SasCancelled => "this comparison was cancelled",
+            };
+            format!(
+                "device {device} is verified locally, but that is not counted as this comparison's doing: {why}"
+            )
+        }
+        TrustAfterFailure::Unknown {
+            confirmed: false,
+            error,
+        } => format!(
+            "this comparison trusted nothing; whether device {device} is verified locally could not be determined: {}",
+            term_id(error)
+        ),
+        TrustAfterFailure::Unknown {
+            confirmed: true,
+            error,
+        } => format!(
+            "whether device {device} is verified locally could not be determined: {}",
+            term_id(error)
+        ),
+    };
+    match cancel {
+        CancelOutcome::Sent => format!("verification cancelled; {trust}"),
+        CancelOutcome::NothingToCancel => trust,
+        CancelOutcome::Failed(error) => format!(
+            "{trust}; cancelled here; the other device may not have been notified: {}",
+            term_id(error)
+        ),
+        CancelOutcome::TimedOut => format!(
+            "{trust}; cancelled here; the other device may not have been notified: the cancellation was not sent within {} s",
+            CANCEL_LIMIT.as_secs()
+        ),
+        CancelOutcome::RequestInFlight => format!(
+            "{trust}; the verification request was still being sent or its send failed: there is no handle to cancel it, its cancellation could not be confirmed, and the other device may still show the request"
+        ),
+        CancelOutcome::SendInterrupted => format!(
+            "{trust}; cancelled here; the other device may not have been notified: the verification stopped while the cancellation was being sent"
+        ),
+    }
+}
+
+/// How a `sas.cancel()` in the flow ended, as the start of its error.
+fn cancel_context(sent: &std::result::Result<(), String>) -> String {
+    match sent {
+        Ok(()) => "verification cancelled".to_owned(),
+        Err(error) => format!(
+            "cancelled here; the other device may not have been notified: {}",
+            term_id(error)
+        ),
+    }
+}
+
+/// Cancel `sas` and describe the outcome (see [`cancel_context`]).
+async fn cancel_sas(sas: &SasVerification, send: &SendTracker) -> String {
+    cancel_context(
+        &send
+            .track(sas.cancel())
+            .await
+            .map_err(|err| err.to_string()),
+    )
+}
+
+/// What ended the verification flow.
+#[derive(Debug)]
+enum Stop<T> {
+    Finished(T),
+    TimedOut,
+    Interrupted(&'static str),
+}
+
+/// Run `flow` until it finishes, `limit` passes or `stop` resolves; the
+/// flow is dropped in the last two cases (its hand-over files go with it).
+async fn run_until_stopped<F: Future>(
+    flow: F,
+    limit: Duration,
+    stop: impl Future<Output = &'static str>,
+) -> Stop<F::Output> {
+    tokio::select! {
+        biased;
+        signal = stop => Stop::Interrupted(signal),
+        result = tokio::time::timeout(limit, flow) => match result {
+            Ok(output) => Stop::Finished(output),
+            Err(_) => Stop::TimedOut,
+        },
+    }
+}
+
+/// SIGINT or SIGTERM (Ctrl-C on Windows); never resolves when the handlers
+/// cannot be installed.
+async fn termination_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup), Ok(mut quit)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+            signal(SignalKind::quit()),
+        ) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+            _ = hangup.recv() => "SIGHUP",
+            _ = quit.recv() => "SIGQUIT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "Ctrl-C",
+            Err(_) => std::future::pending().await,
+        }
+    }
+}
+
+/// Wait until a decision for `pending` was handed over; true for confirm.
+async fn wait_for_decision(pending: &Pending) -> Result<bool> {
+    loop {
+        if let Some(decision) = pending.poll()? {
+            return Ok(decision == Decision::Confirm);
+        }
+        tokio::time::sleep(DECISION_POLL).await;
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceRow {
+    device_id: String,
+    display_name: Option<String>,
+    verified: bool,
+    is_current: bool,
+}
+
+/// `verify --list`: the lines to print, as matrix-e2ee-verify.py `--list`
+/// with a verified column, or one JSON object per device.
+fn device_lines(rows: &[DeviceRow], json: bool) -> Result<Vec<String>> {
+    if json {
+        return rows
+            .iter()
+            .map(|row| json_line(row).map_err(Into::into))
+            .collect();
+    }
+    let mut lines = vec!["Your devices:".to_owned()];
+    for row in rows {
+        lines.push(format!(
+            "  {}: {} [{}]{}",
+            term_id(&row.device_id),
+            term_id(row.display_name.as_deref().unwrap_or("No name")),
+            if row.verified {
+                "verified"
+            } else {
+                "not verified"
+            },
+            if row.is_current {
+                " ← this device"
+            } else {
+                ""
+            }
+        ));
+    }
+    Ok(lines)
+}
+
+async fn list_devices(json: bool) -> Result<()> {
     let config = load_config()?;
     let paths = Paths::from_env()?;
     let _lock = paths.lock().await?;
+    let client = restore(&config, &paths, KeySharing::VerifiedOnly)
+        .await?
+        .client;
+    let own_user = client
+        .user_id()
+        .context("no user id after restore")?
+        .to_owned();
+    // Device keys, and with them the verification state, arrive with a sync.
+    sync_once(&client).await?;
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
+    let devices = client
+        .devices()
+        .await
+        .context("cannot list the devices")?
+        .devices;
+    let mut rows = Vec::new();
+    for device in devices {
+        let verified = client
+            .encryption()
+            .get_device(&own_user, &device.device_id)
+            .await?
+            .is_some_and(|d| d.is_verified());
+        rows.push(DeviceRow {
+            is_current: client.device_id() == Some(&*device.device_id),
+            device_id: device.device_id.to_string(),
+            display_name: device.display_name,
+            verified,
+        });
+    }
+    if rows.is_empty() {
+        bail!("the server lists no devices for {own_user}");
+    }
+    for line in device_lines(&rows, json)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+pub async fn run(args: VerifyArgs) -> Result<()> {
+    if let Some(token) = &args.confirm {
+        return decide(token, Decision::Confirm);
+    }
+    if let Some(token) = &args.cancel {
+        return decide(token, Decision::Cancel);
+    }
+    if args.list {
+        return list_devices(args.json).await;
+    }
+    let who = confirmer(
+        args.hand_over,
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    )?;
+    let config = load_config()?;
+    let paths = Paths::from_env()?;
+    let _lock = paths.lock().await?;
+    let answer = match who {
+        Confirmer::Person => Answer::Prompt,
+        Confirmer::Agent => {
+            let dir = handover_dir(&paths.data_dir);
+            // This process holds the lock: no other one waits, so whatever
+            // is in the directory was left by a process that ended.
+            sweep(&dir, TAKEN_STALE)?;
+            Answer::HandOver {
+                dir,
+                timeout: args.timeout,
+            }
+        }
+    };
     let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
     let client = restored.client;
     let own_user: OwnedUserId = client
@@ -127,10 +725,10 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
             let own = own.clone();
             async move {
                 if ev.sender != own {
-                    eprintln!(
+                    note!(
                         "Ignoring a verification request from {}: only devices of {} are verified here.",
-                        term(ev.sender.as_str()),
-                        term(own.as_str())
+                        term_id(ev.sender.as_str()),
+                        term_id(own.as_str())
                     );
                     return;
                 }
@@ -149,24 +747,82 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
     let sync_task = tokio::spawn(async move {
         let settings = SyncSettings::default().timeout(Duration::from_secs(5));
         if let Err(err) = sync_client.sync(settings).await {
-            eprintln!("sync stopped: {}", term(&err.to_string()));
+            note!("sync stopped: {}", term_id(&err.to_string()));
         }
     });
 
-    let current: Arc<Mutex<Option<VerificationRequest>>> = Arc::default();
-    let flow = flow(&client, &own_user, &args, &mut rx, current.clone());
-    let outcome = match tokio::time::timeout(Duration::from_secs(args.timeout), flow).await {
-        Ok(result) => result,
-        Err(_) => {
-            let pending = current.lock().ok().and_then(|slot| slot.clone());
-            if let Some(request) = pending {
-                best_effort(request.cancel(), CANCEL_LIMIT).await;
-            }
-            Err(anyhow::anyhow!(
-                "verification timed out after {} s",
-                args.timeout
-            ))
+    let state = FlowState::default();
+    let flow = flow(&client, &own_user, &args, &mut rx, &state, &answer);
+    // Without a person at the terminal, SIGINT and SIGTERM take the
+    // timeout's path: cancel, remove the hand-over files, trust nothing.
+    let stop = async {
+        match &answer {
+            Answer::HandOver { .. } => termination_signal().await,
+            Answer::Prompt => std::future::pending().await,
         }
+    };
+    let agent = matches!(answer, Answer::HandOver { .. });
+    let (outcome, stopped) =
+        match run_until_stopped(flow, Duration::from_secs(args.timeout), stop).await {
+            Stop::Finished(result) => (result, false),
+            Stop::Interrupted(signal) => (
+                Err(anyhow::anyhow!("verification interrupted by {signal}")),
+                true,
+            ),
+            Stop::TimedOut => (
+                Err(anyhow::anyhow!(
+                    "verification timed out after {} s",
+                    args.timeout
+                )),
+                true,
+            ),
+        };
+    // A timeout, a signal or (without a person) any error can come after
+    // confirm() stored the trust: ask the store before cancelling, so a
+    // verified device is never reported as "nothing was trusted on this device".
+    // A failed request send is reported in every mode (see needs_cleanup).
+    let outcome = match outcome {
+        Ok(()) => Ok(()),
+        Err(err) if needs_cleanup(stopped, agent, &state) => {
+            let sas = state.sas.lock().ok().and_then(|slot| slot.clone());
+            let (trust, device) = match &sas {
+                Some((sas, before)) => {
+                    let now = stored_as_verified(&client, sas)
+                        .await
+                        .map_err(|err| format!("{err:#}"));
+                    (
+                        trust_after_failure(
+                            *before,
+                            now,
+                            state.confirmed.load(Ordering::SeqCst),
+                            sas.is_cancelled(),
+                        ),
+                        sas.other_device().device_id().to_string(),
+                    )
+                }
+                None => (TrustAfterFailure::NoComparison, String::new()),
+            };
+            let cancel = if let Some(interrupted) = state.sas_cancel.interrupted() {
+                interrupted
+            } else if trust.needs_cancel() {
+                let request = state.request.lock().ok().and_then(|slot| slot.clone());
+                match request {
+                    Some(request) if !request.is_done() && !request.is_cancelled() => {
+                        match best_effort(request.cancel(), CANCEL_LIMIT).await {
+                            Some(Ok(())) => CancelOutcome::Sent,
+                            Some(Err(err)) => CancelOutcome::Failed(err.to_string()),
+                            None => CancelOutcome::TimedOut,
+                        }
+                    }
+                    Some(_) => CancelOutcome::NothingToCancel,
+                    None => without_request(state.requesting.load(Ordering::SeqCst)),
+                }
+            } else {
+                CancelOutcome::NothingToCancel
+            };
+            Err(err.context(failure_context(&trust, &cancel, &device)))
+        }
+        Err(err) => Err(err),
     };
 
     if outcome.is_ok() {
@@ -174,7 +830,7 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
     }
     sync_task.abort();
     outcome?;
-    print_final_state(&client).await
+    print_final_state(&client, &answer).await
 }
 
 async fn flow(
@@ -182,7 +838,8 @@ async fn flow(
     own_user: &OwnedUserId,
     args: &VerifyArgs,
     rx: &mut mpsc::UnboundedReceiver<(OwnedUserId, String)>,
-    current: Arc<Mutex<Option<VerificationRequest>>>,
+    state: &FlowState,
+    answer: &Answer,
 ) -> Result<()> {
     let encryption = client.encryption();
     let request = if let Some(device_id) = &args.request {
@@ -199,9 +856,9 @@ async fn flow(
                 .map(|d| {
                     format!(
                         "{}{}",
-                        term(d.device_id().as_str()),
+                        term_id(d.device_id().as_str()),
                         d.display_name()
-                            .map(|n| format!(" ({})", term(n)))
+                            .map(|n| format!(" ({})", term_id(n)))
                             .unwrap_or_default()
                     )
                 })
@@ -215,16 +872,21 @@ async fn flow(
                 }
             );
         };
-        eprintln!(
+        note!(
             "Requesting verification with {}; accept it on that device.",
-            term(device_id.as_str())
+            term_id(device_id.as_str())
         );
-        device
-            .request_verification()
-            .await
-            .context("cannot send the verification request")?
+        // Until the send succeeded there is no handle; a timeout, a signal
+        // or a failed send cannot cancel, and must not claim it did.
+        send_request(
+            &state.requesting,
+            &state.request,
+            device.request_verification(),
+        )
+        .await
+        .context("cannot send the verification request")?
     } else {
-        eprintln!("Waiting for a verification request from one of your devices...");
+        note!("Waiting for a verification request from one of your devices...");
         let request = loop {
             let (sender, flow_id) = rx.recv().await.context("the request listener stopped")?;
             match encryption.get_verification_request(&sender, &flow_id).await {
@@ -233,10 +895,10 @@ async fn flow(
                 _ => continue,
             }
         };
-        eprintln!("Verification request received; accepting.");
+        note!("Verification request received; accepting.");
         // Register before accepting: accept() marks the request ready before
         // its send completes, so a timeout during the send must cancel it too.
-        if let Ok(mut slot) = current.lock() {
+        if let Ok(mut slot) = state.request.lock() {
             *slot = Some(request.clone());
         }
         request
@@ -245,12 +907,25 @@ async fn flow(
             .context("cannot accept the verification request")?;
         request
     };
-    if let Ok(mut slot) = current.lock() {
+    if let Ok(mut slot) = state.request.lock() {
         *slot = Some(request.clone());
     }
 
     let sas = wait_for_sas(&request).await?;
-    run_sas(&sas).await
+    // Before any confirm: only a change from here counts as this flow's.
+    // Unreadable, it stays unknown, and no change is attributed to the flow.
+    let verified_before = stored_as_verified(client, &sas).await.ok();
+    if let Ok(mut slot) = state.sas.lock() {
+        *slot = Some((sas.clone(), verified_before));
+    }
+    run_sas(
+        &sas,
+        request.flow_id(),
+        answer,
+        &state.confirmed,
+        &state.sas_cancel,
+    )
+    .await
 }
 
 /// Drive the request until it turns into a SAS verification.
@@ -355,7 +1030,13 @@ fn into_sas(verification: Verification) -> Result<SasVerification> {
     }
 }
 
-async fn run_sas(sas: &SasVerification) -> Result<()> {
+async fn run_sas(
+    sas: &SasVerification,
+    flow_id: &str,
+    how: &Answer,
+    confirmed: &AtomicBool,
+    cancel_send: &SendTracker,
+) -> Result<()> {
     let mut changes = sas.changes();
     let mut state = sas.state();
     if matches!(state, SasState::Started { .. }) && !sas.we_started() {
@@ -364,52 +1045,114 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
             .context("cannot accept the emoji verification")?;
     }
     let mut asked = false;
+    // The agent's emoji and decision files; removed when this ends, also
+    // when a timeout drops this future.
+    let mut _published: Option<Pending> = None;
     loop {
         match &state {
             SasState::KeysExchanged { emojis, decimals } if !asked => {
                 asked = true;
-                let comparison =
-                    comparison_text(emojis.as_ref().map(|short| &short.emojis[..]), *decimals);
-                // The prompt blocks on stdin, so it runs on its own thread; a
-                // prompt abandoned here ends with the process.
-                let prompt = async {
-                    tokio::task::spawn_blocking(move || confirm_emoji(&comparison))
-                        .await
-                        .unwrap_or_else(|err| {
-                            Err(anyhow::Error::new(err).context("the prompt failed"))
-                        })
-                };
                 let ends = |state: &SasState| match state {
                     SasState::Cancelled(info) => Some(cancelled(info)),
                     _ => None,
                 };
-                let answer = match answer_unless_ended(prompt, &mut changes, ends).await {
+                let outcome = match how {
+                    Answer::Prompt => {
+                        let comparison = comparison_text(
+                            emojis.as_ref().map(|short| &short.emojis[..]),
+                            *decimals,
+                        );
+                        // The prompt blocks on stdin, so it runs on its own thread; a
+                        // prompt abandoned here ends with the process.
+                        let prompt = async {
+                            tokio::task::spawn_blocking(move || confirm_emoji(&comparison))
+                                .await
+                                .unwrap_or_else(|err| {
+                                    Err(anyhow::Error::new(err).context("the prompt failed"))
+                                })
+                        };
+                        answer_unless_ended(prompt, &mut changes, ends).await
+                    }
+                    Answer::HandOver { dir, timeout } => {
+                        let Some(emojis) = emojis else {
+                            bail!(
+                                "the other device offers numbers only, no emoji; {}",
+                                cancel_sas(sas, cancel_send).await
+                            );
+                        };
+                        let other = sas.other_device().device_id().as_str();
+                        let pending = match Pending::publish(
+                            dir,
+                            flow_id,
+                            other,
+                            emoji_items(&emojis.emojis),
+                        ) {
+                            Ok(pending) => _published.insert(pending),
+                            Err(err) => {
+                                return Err(err.context(cancel_sas(sas, cancel_send).await));
+                            }
+                        };
+                        if let Err(err) = emit_line(&mut std::io::stdout(), pending.line()) {
+                            return Err(err.context(cancel_sas(sas, cancel_send).await));
+                        }
+                        {
+                            use std::io::Write as _;
+                            let _ = write!(
+                                std::io::stderr(),
+                                "{}",
+                                hand_over_instructions(pending.token(), other, *timeout)
+                            );
+                        }
+                        answer_unless_ended(wait_for_decision(pending), &mut changes, ends).await
+                    }
+                };
+                let answer = match outcome {
                     PromptOutcome::Ended(err) => return Err(err),
                     PromptOutcome::Answered(Ok(answer)) => answer,
                     PromptOutcome::Answered(Err(err)) => {
-                        sas.cancel().await.ok();
-                        return Err(err.context("verification cancelled"));
+                        return Err(err.context(cancel_sas(sas, cancel_send).await));
                     }
                 };
                 // A cancellation that arrived together with the answer.
                 if let Some(info) = sas.cancel_info() {
                     return Err(cancelled(&info));
                 }
-                if answer {
-                    sas.confirm()
-                        .await
-                        .context("cannot send the confirmation")?;
-                    eprintln!("Confirmed; waiting for the other device.");
-                } else {
-                    sas.mismatch().await.ok();
-                    bail!("the emoji do not match; verification cancelled");
+                match (answer, how) {
+                    (true, Answer::Prompt) => {
+                        confirmed.store(true, Ordering::SeqCst);
+                        sas.confirm()
+                            .await
+                            .context("cannot send the confirmation")?;
+                        note!("Confirmed; waiting for the other device.");
+                    }
+                    (true, Answer::HandOver { .. }) => {
+                        // On an error, run() looks up whether the device is
+                        // stored as verified before it cancels anything.
+                        confirmed.store(true, Ordering::SeqCst);
+                        sas.confirm()
+                            .await
+                            .context("cannot send the confirmation")?;
+                        note!("Confirmed; waiting for the other device.");
+                    }
+                    (false, Answer::Prompt) => {
+                        cancel_send.track(sas.mismatch()).await.ok();
+                        bail!("the emoji do not match; verification cancelled");
+                    }
+                    (false, Answer::HandOver { .. }) => match cancel_send.track(sas.cancel()).await
+                    {
+                        Ok(()) => bail!("the person cancelled with verify --cancel"),
+                        Err(err) => bail!(
+                            "the person cancelled with verify --cancel; {}",
+                            cancel_context(&Err(err.to_string()))
+                        ),
+                    },
                 }
             }
             SasState::Done { .. } => {
-                println!(
+                how.report(&format!(
                     "Verification done: device {} is verified.",
-                    term(sas.other_device().device_id().as_str())
-                );
+                    term_id(sas.other_device().device_id().as_str())
+                ));
                 return Ok(());
             }
             SasState::Cancelled(info) => return Err(cancelled(info)),
@@ -422,14 +1165,14 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
     }
 }
 
-async fn print_final_state(client: &Client) -> Result<()> {
+async fn print_final_state(client: &Client, how: &Answer) -> Result<()> {
     let own = client.encryption().get_own_device().await?;
     let yn = |b: bool| if b { "yes" } else { "no" };
-    println!(
+    how.report(&format!(
         "This device: cross-signed {}, verified {}",
         yn(own.as_ref().is_some_and(|d| d.is_cross_signed_by_owner())),
         yn(own.as_ref().is_some_and(|d| d.is_verified()))
-    );
+    ));
     Ok(())
 }
 
@@ -501,6 +1244,444 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome, PromptOutcome::Ended(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn the_hand_over_is_opt_in() {
+        // Without --hand-over: the prompt at a terminal, else refused.
+        assert_eq!(confirmer(false, true, true).unwrap(), Confirmer::Person);
+        for (stdin, stderr) in [(false, true), (true, false), (false, false)] {
+            let err = confirmer(false, stdin, stderr).unwrap_err().to_string();
+            assert!(err.starts_with(NEEDS_TERMINAL), "{err}");
+            assert!(err.contains("--hand-over"), "{err}");
+        }
+        // --hand-over: the hand-over, with and without a terminal.
+        for (stdin, stderr) in [(true, true), (false, true), (true, false), (false, false)] {
+            assert_eq!(
+                confirmer(true, stdin, stderr).unwrap(),
+                Confirmer::Agent,
+                "{stdin} {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn emoji_line_has_the_documented_keys() {
+        let emojis = [
+            Emoji {
+                symbol: "🐶",
+                description: "Dog",
+            },
+            Emoji {
+                symbol: "\u{1b}[2J",
+                description: "Cat",
+            },
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = Pending::publish(tmp.path(), "tx1", "PHONE", emoji_items(&emojis)).unwrap();
+        let token = pending.token();
+        assert_eq!(
+            pending.line(),
+            format!(
+                r#"{{"transaction_id":"tx1","other_device":"PHONE","emojis":[{{"symbol":"🐶","description":"Dog"}},{{"symbol":"\u001b[2J","description":"Cat"}}],"token":"{token}"}}"#
+            )
+        );
+        let text = hand_over_instructions(token, "PH\u{1b}\u{202E}ONE", 180);
+        assert!(
+            text.contains(&format!("verify --confirm {token}\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("verify --cancel {token}\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains("device PH\u{FFFD}\u{FFFD}ONE shows"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "exits 0 once this process took the decision; whether the device ended up verified is reported here, on this process's stderr."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_closed_stdout_is_an_error_not_a_panic() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        assert!(emit_line(&mut Closed, "{}").is_err());
+        let mut out = Vec::new();
+        emit_line(&mut out, "{\"a\":1}").unwrap();
+        assert_eq!(out, b"{\"a\":1}\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_and_sigquit_end_the_wait() {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Handlers of the test's own first, so a signal that arrives before
+        // termination_signal() listens cannot end the test process.
+        let _hangup = signal(SignalKind::hangup()).unwrap();
+        let _quit = signal(SignalKind::quit()).unwrap();
+        for (number, name) in [(libc::SIGHUP, "SIGHUP"), (libc::SIGQUIT, "SIGQUIT")] {
+            let waiting = tokio::spawn(termination_signal());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // SAFETY: raise only sends a signal to this process, whose
+            // handler for it is installed above.
+            assert_eq!(unsafe { libc::raise(number) }, 0);
+            let got = within_5s("the signal did not end the wait", waiting).await;
+            assert_eq!(got.unwrap(), name);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signal_stops_the_flow_like_a_timeout() {
+        let stopped = within_5s(
+            "the signal did not stop the flow",
+            run_until_stopped(
+                std::future::pending::<()>(),
+                Duration::from_secs(60),
+                async { "SIGTERM" },
+            ),
+        )
+        .await;
+        assert!(
+            matches!(stopped, Stop::Interrupted("SIGTERM")),
+            "{stopped:?}"
+        );
+        let timed_out = within_5s(
+            "the timeout did not stop the flow",
+            run_until_stopped(
+                std::future::pending::<()>(),
+                Duration::from_millis(20),
+                std::future::pending(),
+            ),
+        )
+        .await;
+        assert!(matches!(timed_out, Stop::TimedOut), "{timed_out:?}");
+        let finished =
+            run_until_stopped(async { 7 }, Duration::from_secs(60), std::future::pending()).await;
+        assert!(matches!(finished, Stop::Finished(7)), "{finished:?}");
+    }
+
+    #[test]
+    fn a_device_verified_before_the_flow_is_cancelled_after_a_timeout() {
+        // Re-verifying a known device: verified before and after, then a
+        // timeout. Not this flow's trust: cancel and say so.
+        let trust = trust_after_failure(Some(true), Ok(true), true, false);
+        assert_eq!(
+            trust,
+            TrustAfterFailure::VerifiedNotByThisFlow(NotByThisFlow::VerifiedBefore)
+        );
+        assert!(trust.needs_cancel(), "the request would not be cancelled");
+        let msg = failure_context(&trust, &CancelOutcome::Sent, "PHONE");
+        assert!(msg.starts_with("verification cancelled; "), "{msg}");
+        assert!(
+            msg.contains("verified before this comparison began"),
+            "{msg}"
+        );
+        assert!(!msg.contains("confirmation may not have reached"), "{msg}");
+        // Only a confirmed change to verified by a SAS that was not
+        // cancelled counts.
+        assert_eq!(
+            trust_after_failure(Some(false), Ok(true), true, false),
+            TrustAfterFailure::VerifiedByThisFlow
+        );
+        assert_eq!(
+            trust_after_failure(Some(false), Ok(false), true, false),
+            TrustAfterFailure::NotVerified
+        );
+        assert_eq!(
+            trust_after_failure(Some(false), Ok(true), true, true),
+            TrustAfterFailure::VerifiedNotByThisFlow(NotByThisFlow::SasCancelled)
+        );
+    }
+
+    #[test]
+    fn a_device_verified_in_the_store_is_reported_and_not_cancelled() {
+        let trust = TrustAfterFailure::VerifiedByThisFlow;
+        assert!(
+            !trust.needs_cancel(),
+            "a verified device would be cancelled"
+        );
+        let msg = failure_context(&trust, &CancelOutcome::NothingToCancel, "PH\u{202E}ONE");
+        assert_eq!(
+            msg,
+            "device PH\u{FFFD}ONE is verified locally; the confirmation may not have reached it"
+        );
+        let trust = TrustAfterFailure::NoComparison;
+        assert!(trust.needs_cancel());
+        let msg = failure_context(&trust, &CancelOutcome::Sent, "");
+        assert_eq!(
+            msg,
+            "verification cancelled; nothing was trusted on this device"
+        );
+    }
+
+    #[test]
+    fn a_failed_trust_lookup_is_never_reported_as_nothing_trusted() {
+        // The lookup after the flow failed: unknown, not "nothing".
+        for confirmed in [true, false] {
+            let trust = trust_after_failure(
+                Some(false),
+                Err("store locked".to_owned()),
+                confirmed,
+                false,
+            );
+            assert_eq!(
+                trust,
+                TrustAfterFailure::Unknown {
+                    confirmed,
+                    error: "store locked".to_owned()
+                }
+            );
+            assert!(trust.needs_cancel());
+            let msg = failure_context(&trust, &CancelOutcome::Sent, "PHONE");
+            assert!(!msg.contains("nothing was trusted"), "{msg}");
+            assert!(
+                msg.contains(
+                    "whether device PHONE is verified locally could not be determined: store locked"
+                ),
+                "{msg}"
+            );
+        }
+        // The baseline lookup failed: a change is never this flow's.
+        let trust = trust_after_failure(None, Ok(true), true, false);
+        assert_eq!(
+            trust,
+            TrustAfterFailure::VerifiedNotByThisFlow(NotByThisFlow::BeforeUnknown)
+        );
+        assert!(trust.needs_cancel());
+        let msg = failure_context(&trust, &CancelOutcome::Sent, "PHONE");
+        assert!(
+            msg.contains("not counted as this comparison's doing"),
+            "{msg}"
+        );
+        assert!(!msg.contains("confirmation may not have reached"), "{msg}");
+        assert_eq!(
+            trust_after_failure(None, Ok(false), true, false),
+            TrustAfterFailure::NotVerified
+        );
+    }
+
+    #[test]
+    fn trust_that_arrived_without_a_confirmation_is_not_this_flows() {
+        // Not verified when the comparison began, verified now (a cross-
+        // signature arrived by sync), but nobody confirmed.
+        let trust = trust_after_failure(Some(false), Ok(true), false, false);
+        assert_eq!(
+            trust,
+            TrustAfterFailure::VerifiedNotByThisFlow(NotByThisFlow::NobodyConfirmed)
+        );
+        assert!(trust.needs_cancel(), "the unfinished request stays open");
+        let msg = failure_context(&trust, &CancelOutcome::Sent, "PHONE");
+        assert_eq!(
+            msg,
+            "verification cancelled; device PHONE is verified locally, but that is not counted as this comparison's doing: nobody confirmed this comparison"
+        );
+    }
+
+    #[test]
+    fn a_request_still_being_sent_is_not_reported_as_cancelled() {
+        assert_eq!(without_request(true), CancelOutcome::RequestInFlight);
+        assert_eq!(without_request(false), CancelOutcome::NothingToCancel);
+        let msg = failure_context(
+            &TrustAfterFailure::NoComparison,
+            &CancelOutcome::RequestInFlight,
+            "",
+        );
+        assert!(!msg.contains("verification cancelled"), "{msg}");
+        assert!(msg.contains("could not be confirmed"), "{msg}");
+        assert!(msg.contains("may still show the request"), "{msg}");
+        assert_eq!(
+            failure_context(
+                &TrustAfterFailure::NoComparison,
+                &CancelOutcome::NothingToCancel,
+                ""
+            ),
+            "nothing was trusted on this device"
+        );
+    }
+
+    #[test]
+    fn a_cancellation_that_was_not_sent_is_reported() {
+        assert_eq!(cancel_context(&Ok(())), "verification cancelled");
+        let failed = cancel_context(&Err("M_LIMIT_EXCEEDED".to_owned()));
+        assert_eq!(
+            failed,
+            "cancelled here; the other device may not have been notified: M_LIMIT_EXCEEDED"
+        );
+        for cancel in [
+            CancelOutcome::Failed("connection reset".to_owned()),
+            CancelOutcome::TimedOut,
+        ] {
+            let msg = failure_context(&TrustAfterFailure::NotVerified, &cancel, "PHONE");
+            assert!(!msg.contains("verification cancelled"), "{msg}");
+            assert!(
+                msg.starts_with(
+                    "nothing was trusted on this device; cancelled here; the other device may not have been notified: "
+                ),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_reports_what_the_waiting_process_did() {
+        use Decision::{Cancel, Confirm};
+        let report = |sent, taken| taken_report(sent, taken, "tx1", "PHONE", 42);
+        assert!(
+            report(Confirm, Some(Taken::Confirm))
+                .unwrap()
+                .contains("took the confirmation")
+        );
+        assert!(
+            report(Cancel, Some(Taken::Cancel))
+                .unwrap()
+                .contains("took the cancellation")
+        );
+        for (sent, taken) in [
+            (Cancel, Some(Taken::Confirm)),
+            (Confirm, Some(Taken::Cancel)),
+            (Confirm, Some(Taken::Ignored)),
+            (Cancel, None),
+        ] {
+            assert!(report(sent, taken).is_err(), "{sent:?} {taken:?}");
+        }
+        let late = report(Cancel, None).unwrap_err().to_string();
+        assert!(late.contains("did not acknowledge"), "{late}");
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_cut_off_while_sent_is_reported() {
+        let done = SendTracker::default();
+        done.track(std::future::ready(())).await;
+        assert_eq!(done.interrupted(), None);
+        assert_eq!(SendTracker::default().interrupted(), None, "never sent");
+        let cut = SendTracker::default();
+        assert!(
+            best_effort(
+                cut.track(std::future::pending::<()>()),
+                Duration::from_millis(20)
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(cut.interrupted(), Some(CancelOutcome::SendInterrupted));
+        let msg = failure_context(
+            &TrustAfterFailure::NotVerified,
+            &CancelOutcome::SendInterrupted,
+            "PHONE",
+        );
+        assert_eq!(
+            msg,
+            "nothing was trusted on this device; cancelled here; the other device may not have been notified: the verification stopped while the cancellation was being sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_send_is_reported_with_a_person_at_the_terminal() {
+        let state = FlowState::default();
+        assert!(!needs_cleanup(false, false, &state));
+        let failed = send_request(
+            &state.requesting,
+            &state.request,
+            std::future::ready(Err::<VerificationRequest, _>("reset")),
+        );
+        assert_eq!(failed.await.err(), Some("reset"));
+        assert!(
+            needs_cleanup(false, false, &state),
+            "a failed send in terminal mode was not reported as uncertain"
+        );
+        assert!(needs_cleanup(true, false, &FlowState::default()));
+        assert!(needs_cleanup(false, true, &FlowState::default()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_send_stays_in_flight() {
+        let requesting = AtomicBool::new(false);
+        let slot = Mutex::new(None);
+        let failed = send_request(
+            &requesting,
+            &slot,
+            std::future::ready(Err::<u8, _>("reset")),
+        );
+        assert_eq!(failed.await, Err("reset"));
+        assert!(
+            requesting.load(Ordering::SeqCst),
+            "a failed send was taken as never sent"
+        );
+        assert_eq!(*slot.lock().unwrap(), None);
+        assert_eq!(
+            without_request(requesting.load(Ordering::SeqCst)),
+            CancelOutcome::RequestInFlight
+        );
+        let sent = send_request(&requesting, &slot, std::future::ready(Ok::<u8, &str>(7)));
+        assert_eq!(sent.await, Ok(7));
+        assert!(!requesting.load(Ordering::SeqCst));
+        assert_eq!(*slot.lock().unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn the_wait_ends_only_with_a_handed_over_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = Pending::publish(tmp.path(), "tx1", "PHONE", Vec::new()).unwrap();
+        let undecided =
+            tokio::time::timeout(Duration::from_millis(600), wait_for_decision(&pending)).await;
+        assert!(
+            undecided.is_err(),
+            "decided without a hand-over: {undecided:?}"
+        );
+        hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap();
+        let answer = within_5s("the cancel was not read", wait_for_decision(&pending)).await;
+        assert!(!answer.unwrap());
+        drop(pending);
+        let pending = Pending::publish(tmp.path(), "tx1", "PHONE", Vec::new()).unwrap();
+        hand_over(tmp.path(), pending.token(), Decision::Confirm).unwrap();
+        let answer = within_5s("the confirm was not read", wait_for_decision(&pending)).await;
+        assert!(answer.unwrap());
+    }
+
+    #[test]
+    fn device_list_matches_matrix_e2ee_verify_py() {
+        let rows = [
+            DeviceRow {
+                device_id: "ABC".to_owned(),
+                display_name: Some("Element Desktop".to_owned()),
+                verified: true,
+                is_current: false,
+            },
+            DeviceRow {
+                device_id: "RUST".to_owned(),
+                display_name: None,
+                verified: false,
+                is_current: true,
+            },
+        ];
+        assert_eq!(
+            device_lines(&rows, false).unwrap(),
+            vec![
+                "Your devices:",
+                "  ABC: Element Desktop [verified]",
+                "  RUST: No name [not verified] ← this device",
+            ]
+        );
+        assert_eq!(
+            device_lines(&rows, true).unwrap(),
+            vec![
+                r#"{"device_id":"ABC","display_name":"Element Desktop","verified":true,"is_current":false}"#,
+                r#"{"device_id":"RUST","display_name":null,"verified":false,"is_current":true}"#,
+            ]
+        );
     }
 
     #[test]

@@ -104,14 +104,42 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("mode").required(true).args(["request", "listen"])))]
+#[command(group(clap::ArgGroup::new("mode").required(true).args(["request", "listen", "list", "confirm", "cancel"])))]
 pub struct VerifyArgs {
-    /// Start verification towards this device of your own account.
+    /// Start verification towards this device of your own account. Needs a
+    /// terminal on stdin and stderr, unless --hand-over is given.
     #[arg(long, value_name = "DEVICE_ID")]
     pub request: Option<String>,
-    /// Wait for a verification request from one of your own devices.
+    /// Wait for a verification request from one of your own devices. Needs
+    /// a terminal on stdin and stderr, unless --hand-over is given.
     #[arg(long)]
     pub listen: bool,
+    /// With --request or --listen: let another process decide. The emoji are
+    /// printed as one JSON line with a token, and the process that runs
+    /// `verify --confirm TOKEN` confirms them: the device is then trusted.
+    /// Run --confirm only after the person compared the emoji with the other
+    /// device and said they match; otherwise run `verify --cancel TOKEN`.
+    /// This process never confirms on its own. Works with or without a
+    /// terminal. The data directory's file system must support hard links:
+    /// --confirm and --cancel hand the decision over with one.
+    #[arg(long, conflicts_with_all = ["list", "confirm", "cancel"])]
+    pub hand_over: bool,
+    /// List your account's devices: id, name, verified or not, this device.
+    #[arg(long)]
+    pub list: bool,
+    /// With --list: one JSON object per device.
+    #[arg(long, conflicts_with_all = ["request", "listen", "confirm", "cancel"])]
+    pub json: bool,
+    /// Confirm the emoji of a verification that waits with --hand-over,
+    /// after the person compared them and said they match. TOKEN is the
+    /// "token" of the emoji line that person saw; it names that comparison
+    /// and no other.
+    #[arg(long, value_name = "TOKEN")]
+    pub confirm: Option<String>,
+    /// Cancel a verification that waits with --hand-over. TOKEN is the
+    /// "token" of its emoji line.
+    #[arg(long, value_name = "TOKEN")]
+    pub cancel: Option<String>,
     /// Give up after this many seconds.
     #[arg(long, default_value_t = 180, value_name = "SECONDS")]
     pub timeout: u64,
@@ -523,6 +551,63 @@ mod tests {
         assert!(Cli::try_parse_from(["m", "verify"]).is_err());
         assert!(Cli::try_parse_from(["m", "verify", "--listen", "--request", "D"]).is_err());
         assert!(Cli::try_parse_from(["m", "verify", "--listen"]).is_ok());
+    }
+
+    fn verify(a: &[&str]) -> VerifyArgs {
+        match Cli::try_parse_from([&["m", "verify"][..], a].concat())
+            .unwrap_or_else(|e| panic!("{a:?}: {e}"))
+            .command
+        {
+            Command::Verify(args) => args,
+            _ => panic!("not verify"),
+        }
+    }
+
+    #[test]
+    fn verify_accepts_the_callers_invocations() {
+        // matrix-skill CLAUDE.md: matrix-e2ee-verify.py --request DEVICE --timeout 180
+        let request = verify(&["--request", "DEVICE", "--timeout", "180"]);
+        assert_eq!(request.request.as_deref(), Some("DEVICE"));
+        assert_eq!(request.timeout, 180);
+        // matrix-e2ee-verify.py --list
+        let list = verify(&["--list"]);
+        assert!(list.list && !list.json);
+        assert!(verify(&["--list", "--json"]).json);
+        assert_eq!(verify(&["--listen"]).timeout, 180);
+    }
+
+    #[test]
+    fn verify_hand_over_goes_with_request_or_listen() {
+        assert!(verify(&["--request", "DEVICE", "--hand-over"]).hand_over);
+        assert!(verify(&["--listen", "--hand-over"]).hand_over);
+        assert!(!verify(&["--listen"]).hand_over);
+        let parse = |a: &[&str]| Cli::try_parse_from([&["m", "verify"][..], a].concat());
+        assert!(parse(&["--hand-over"]).is_err());
+        assert!(parse(&["--list", "--hand-over"]).is_err());
+        let token = "4242-0123456789abcdef0123456789abcdef";
+        assert!(parse(&["--confirm", token, "--hand-over"]).is_err());
+        assert!(parse(&["--cancel", token, "--hand-over"]).is_err());
+    }
+
+    #[test]
+    fn verify_confirm_and_cancel_need_the_token() {
+        let token = "4242-0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            verify(&["--confirm", token]).confirm.as_deref(),
+            Some(token)
+        );
+        assert_eq!(verify(&["--cancel", token]).cancel.as_deref(), Some(token));
+        let parse = |a: &[&str]| Cli::try_parse_from([&["m", "verify"][..], a].concat());
+        assert!(
+            parse(&["--confirm"]).is_err(),
+            "a bare --confirm is bound to nothing"
+        );
+        assert!(parse(&["--cancel"]).is_err());
+        assert!(parse(&["--confirm", token, "--cancel", token]).is_err());
+        assert!(parse(&["--confirm", token, "--listen"]).is_err());
+        assert!(parse(&["--list", "--request", "D"]).is_err());
+        assert!(parse(&["--json"]).is_err(), "--json only with --list");
+        assert!(parse(&["--listen", "--json"]).is_err());
     }
 
     #[test]

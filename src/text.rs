@@ -4,17 +4,19 @@ use std::borrow::Cow;
 
 /// Serialize `value` as one JSON line. serde_json escapes only U+0000-U+001F
 /// in strings; DEL (U+007F) and C1 (U+0080-U+009F) are escaped here as
-/// `\u007f` and `\u0080`..`\u009f`, so a terminal showing the line does not
-/// act on them. These characters can only occur inside JSON strings, so the
-/// result stays valid JSON with the same values.
+/// `\u007f` and `\u0080`..`\u009f`, and the bidi controls of [`is_bidi_control`]
+/// as `\uXXXX` too, so a terminal showing the line does not act on them.
+/// These characters can only occur inside JSON strings, so the result stays
+/// valid JSON with the same values.
 pub fn json_line<T: serde::Serialize>(value: &T) -> serde_json::Result<String> {
     let json = serde_json::to_string(value)?;
-    if !json.chars().any(is_del_or_c1) {
+    let escape = |c: char| is_del_or_c1(c) || is_bidi_control(c);
+    if !json.chars().any(escape) {
         return Ok(json);
     }
     let mut escaped = String::with_capacity(json.len() + 16);
     for c in json.chars() {
-        if is_del_or_c1(c) {
+        if escape(c) {
             escaped.push_str(&format!("\\u{:04x}", u32::from(c)));
         } else {
             escaped.push(c);
@@ -25,6 +27,27 @@ pub fn json_line<T: serde::Serialize>(value: &T) -> serde_json::Result<String> {
 
 fn is_del_or_c1(c: char) -> bool {
     matches!(c, '\u{7f}'..='\u{9f}')
+}
+
+/// The Unicode bidi controls: embeddings and overrides (U+202A-U+202E),
+/// isolates (U+2066-U+2069) and the marks LRM, RLM and ALM (U+200E,
+/// U+200F, U+061C). Text around them can be shown in another order than it
+/// is stored.
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+    )
+}
+
+/// [`term`], and the bidi controls replaced with U+FFFD too: for ids and
+/// names another device or the server chose, so they cannot reorder the
+/// text around them.
+pub fn term_id(s: &str) -> String {
+    term(s)
+        .chars()
+        .map(|c| if is_bidi_control(c) { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 /// Replace control characters (C0 including CR, LF and ESC, DEL, and C1
@@ -179,6 +202,29 @@ mod tests {
             "a\u{FFFD}[2Jb\u{FFFD}c\u{FFFD}d\u{FFFD}e\u{FFFD}f\u{FFFD}g\u{FFFD}h\u{FFFD}i"
         );
         assert!(!shown.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn bidi_controls_are_escaped_in_json_lines() {
+        let value = "a\u{202E}b\u{2066}c\u{200E}d\u{200F}e\u{061C}f";
+        let line = json_line(&value).unwrap();
+        assert_eq!(
+            line,
+            concat!(
+                "\"a\\", "u202eb\\", "u2066c\\", "u200ed\\", "u200fe\\", "u061cf\""
+            )
+        );
+        assert_eq!(serde_json::from_str::<String>(&line).unwrap(), value);
+    }
+
+    #[test]
+    fn bidi_controls_are_replaced_in_ids() {
+        let shown = term_id(
+            "a\u{202A}b\u{202B}c\u{202C}d\u{202D}e\u{202E}f\u{2066}g\u{2067}h\u{2068}i\u{2069}j\u{200E}k\u{200F}l\u{061C}m\u{1b}n",
+        );
+        assert_eq!(shown.matches('\u{FFFD}').count(), 13, "{shown}");
+        assert_eq!(shown.replace('\u{FFFD}', ""), "abcdefghijklmn");
+        assert_eq!(term_id("ABCDEF"), "ABCDEF");
     }
 
     #[test]
