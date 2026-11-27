@@ -211,8 +211,8 @@ pub fn request_trusts_unverified(request: &Value) -> bool {
 /// `mention_room` as `m.mentions`, the body rendered as HTML with pills for
 /// the mentioned users (matrix-watchd.py's `op_send` renders it the same way;
 /// a request's own `formatted_body` is used only when the body renders to
-/// itself), and `thread_root` (with the reply fallback to `reply_to` or the
-/// root) or else `reply_to` as the relation.
+/// itself), and `thread_root` (with `m.in_reply_to` the `reply_to` event, or
+/// the root as a fallback) or else `reply_to` as the relation.
 ///
 /// Unlike matrix-watchd.py, which lets `reply_to` win and writes no fallback,
 /// both paths of this tool build the event of the script's direct path.
@@ -262,7 +262,9 @@ pub fn message_content(request: &Value) -> Result<RoomMessageEventContent> {
         content["m.relates_to"] = json!({
             "rel_type": "m.thread",
             "event_id": root,
-            "is_falling_back": true,
+            // true only when m.in_reply_to merely repeats the root; matrix-send-e2ee.py
+            // (lines 350-355) also sets it beside --reply, so clients drop that reply.
+            "is_falling_back": reply_to.is_none(),
             "m.in_reply_to": {"event_id": reply_to.unwrap_or(root)},
         });
     } else if let Some(reply_to) = reply_to {
@@ -577,11 +579,12 @@ mod tests {
             full["formatted_body"],
             "hi <a href=\"https://matrix.to/#/@a:example.org\">a</a>"
         );
-        // A thread reply names the replied-to event as its fallback.
+        // A reply inside a thread is a genuine reply, not a fallback:
+        // is_falling_back false, which ruma leaves out of the JSON.
         assert_eq!(
             full["m.relates_to"],
             json!({"rel_type": "m.thread", "event_id": "$root:example.org",
-                "is_falling_back": true, "m.in_reply_to": {"event_id": "$parent:example.org"}})
+                "m.in_reply_to": {"event_id": "$parent:example.org"}})
         );
         let thread = serde_json::to_value(
             message_content(&json!({"body": "t", "thread_root": "$root:example.org"})).unwrap(),
@@ -591,6 +594,24 @@ mod tests {
             thread["m.relates_to"],
             json!({"rel_type": "m.thread", "event_id": "$root:example.org",
                 "is_falling_back": true, "m.in_reply_to": {"event_id": "$root:example.org"}})
+        );
+        // Both cases on the typed relation: fallback only without --reply.
+        let falling_back = |request: Value| {
+            let content = message_content(&request).unwrap();
+            let thread = content.thread().expect("a thread relation");
+            (
+                thread.is_falling_back,
+                thread.in_reply_to.as_ref().unwrap().event_id.to_string(),
+            )
+        };
+        assert_eq!(
+            falling_back(json!({"body": "t", "thread_root": "$root:example.org",
+                "reply_to": "$parent:example.org"})),
+            (false, "$parent:example.org".to_owned())
+        );
+        assert_eq!(
+            falling_back(json!({"body": "t", "thread_root": "$root:example.org"})),
+            (true, "$root:example.org".to_owned())
         );
         let reply = serde_json::to_value(
             message_content(&json!({"body": "r", "reply_to": "$p:example.org"})).unwrap(),
@@ -678,7 +699,8 @@ mod tests {
     }
 
     /// The content matrix-send-e2ee.py sends for rich_args() with bot_prefix
-    /// "🤖" (computed with the matrix-skill at 9f5663b).
+    /// "🤖" (computed with the matrix-skill at 9f5663b), except that the
+    /// script also writes "is_falling_back": true beside --reply.
     fn rich_python_content() -> Value {
         json!({
             "msgtype": "m.text",
@@ -689,7 +711,6 @@ mod tests {
             "m.relates_to": {
                 "rel_type": "m.thread",
                 "event_id": "$root:example.org",
-                "is_falling_back": true,
                 "m.in_reply_to": {"event_id": "$parent:example.org"},
             },
         })
