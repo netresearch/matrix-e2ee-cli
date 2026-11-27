@@ -414,7 +414,7 @@ fn failure_context(trust: &TrustAfterFailure, cancel: &CancelOutcome, device: &s
             );
         }
         TrustAfterFailure::NoComparison | TrustAfterFailure::NotVerified => {
-            "nothing was trusted".to_owned()
+            "nothing was trusted on this device".to_owned()
         }
         TrustAfterFailure::VerifiedNotByThisFlow(why) => {
             let why = match why {
@@ -726,7 +726,7 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
         };
     // A timeout, a signal or (without a person) any error can come after
     // confirm() stored the trust: ask the store before cancelling, so a
-    // verified device is never reported as "nothing was trusted".
+    // verified device is never reported as "nothing was trusted on this device".
     let outcome = match outcome {
         Ok(()) => Ok(()),
         Err(err) if stopped || agent => {
@@ -1356,7 +1356,10 @@ mod tests {
         let trust = TrustAfterFailure::NoComparison;
         assert!(trust.needs_cancel());
         let msg = failure_context(&trust, &CancelOutcome::Sent, "");
-        assert_eq!(msg, "verification cancelled; nothing was trusted");
+        assert_eq!(
+            msg,
+            "verification cancelled; nothing was trusted on this device"
+        );
     }
 
     #[test]
@@ -1440,7 +1443,7 @@ mod tests {
                 &CancelOutcome::NothingToCancel,
                 ""
             ),
-            "nothing was trusted"
+            "nothing was trusted on this device"
         );
     }
 
@@ -1460,7 +1463,7 @@ mod tests {
             assert!(!msg.contains("verification cancelled"), "{msg}");
             assert!(
                 msg.starts_with(
-                    "nothing was trusted; cancelled here; the other device may not have been notified: "
+                    "nothing was trusted on this device; cancelled here; the other device may not have been notified: "
                 ),
                 "{msg}"
             );
