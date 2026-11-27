@@ -151,6 +151,12 @@
    "html": "ping <a href=\"https://matrix.to/#/@alice:example.org\">@alice:example.org</a> in <a href=\"https://matrix.to/#/#ops:example.org\">#ops:example.org</a>, not &quot;<a href=\"https://matrix.to/#/@bob:example.org\">@bob:example.org</a>&quot; or /@carol:example.org"
   },
   {
+   "name": "ids inside a link URL",
+   "text": "[profile](https://example.org/?user=@alice:example.org) by @bob:example.org, [room](https://example.org/?r=#ops:example.org) in #web:example.org",
+   "mentions": [],
+   "html": "<a href=\"https://example.org/?user=<a href=\"https://matrix.to/#/@alice:example.org\">@alice:example.org</a>\">profile</a> by <a href=\"https://matrix.to/#/@bob:example.org\">@bob:example.org</a>, <a href=\"https://example.org/?r=<a href=\"https://matrix.to/#/#ops:example.org\">#ops:example.org</a>\">room</a> in <a href=\"https://matrix.to/#/#web:example.org\">#web:example.org</a>"
+  },
+  {
    "name": "newlines",
    "text": "a\nb\n\n\nc\r\nd",
    "mentions": [],

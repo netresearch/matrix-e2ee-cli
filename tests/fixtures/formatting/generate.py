@@ -47,6 +47,7 @@ HAND = [
     ("service url inside markdown link", "[the PR](https://github.com/o/r/pull/1)"),
     ("double scheme", "(https://http://example.org)"),
     ("matrix ids", "ping @alice:example.org in #ops:example.org, not \"@bob:example.org\" or /@carol:example.org"),
+    ("ids inside a link URL", "[profile](https://example.org/?user=@alice:example.org) by @bob:example.org, [room](https://example.org/?r=#ops:example.org) in #web:example.org"),
     ("newlines", "a\nb\n\n\nc\r\nd"),
     ("python whitespace", "\x1c- item\x1d\n\x1f## H\x1e\n**\x1cx**"),
     ("unicode", "Grüße 🎁 **fett** *kursiv* `ç` @jörg:example.org #räum:example.org"),

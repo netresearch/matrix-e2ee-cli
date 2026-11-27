@@ -94,6 +94,28 @@ static BR_AFTER_BLOCK: LazyLock<Regex> =
 static BR_AFTER_OPEN: LazyLock<Regex> = LazyLock::new(|| re(r"(<blockquote>|<table>)\{\{BR\}\}"));
 static HEADING_START: LazyLock<Regex> = LazyLock::new(|| re(r"^#{1,6}[PYS]+"));
 
+// The links markdown_to_html has made (the input itself is escaped, so
+// every `<a ` in the text is one of them).
+static ANCHOR: LazyLock<Regex> = LazyLock::new(|| re(r"(?s)<a [^>]*>.*?</a>"));
+
+/// [`sub`] on the text outside `<a ...>...</a>` elements, href included.
+fn sub_outside_links(
+    pattern: &Regex,
+    text: &str,
+    mut rep: impl FnMut(&Captures<'_, str>) -> String,
+) -> Result<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for link in ANCHOR.find_iter(text) {
+        let link = link.context("cannot find the links of the message")?;
+        out.push_str(&sub(pattern, &text[last..link.start()], 0, &mut rep)?);
+        out.push_str(link.as_str());
+        last = link.end();
+    }
+    out.push_str(&sub(pattern, &text[last..], 0, &mut rep)?);
+    Ok(out)
+}
+
 fn group<'a>(caps: &'a Captures<'_, str>, i: usize) -> &'a str {
     caps.get(i).map_or("", |m| m.as_str())
 }
@@ -227,8 +249,10 @@ pub fn markdown_to_html(text: &str) -> Result<String> {
     })?;
     let html = sub(&MD_LINK, &html, 0, markdown_link)?;
     let pill = |c: &Captures<'_, str>| format!("<a href=\"{MATRIX_TO}{0}\">{0}</a>", group(c, 1));
-    let html = sub(&USER_ID, &html, 0, pill)?;
-    let html = sub(&ROOM_ALIAS, &html, 0, pill)?;
+    // Deviates from formatting.py, which also links ids inside an href:
+    // only text outside the links made so far is searched.
+    let html = sub_outside_links(&USER_ID, &html, pill)?;
+    let html = sub_outside_links(&ROOM_ALIAS, &html, pill)?;
     let html = sub(&STRIKE, &html, 0, |c| format!("<del>{}</del>", group(c, 1)))?;
     let html = sub(&BOLD, &html, 0, |c| {
         format!("<strong>{}</strong>", group(c, 1))
@@ -471,6 +495,11 @@ mod tests {
             "ping <a href=\"https://matrix.to/#/@bjoern.marten:example.org\">bjoern.marten</a> and <a href=\"https://matrix.to/#/@bjoern:example.org\">bjoern</a>",
         ),
         (
+            "ids inside a link URL",
+            "user and room ids are linked only outside existing links, never inside an href",
+            "<a href=\"https://example.org/?user=@alice:example.org\">profile</a> by <a href=\"https://matrix.to/#/@bob:example.org\">@bob:example.org</a>, <a href=\"https://example.org/?r=#ops:example.org\">room</a> in <a href=\"https://matrix.to/#/#web:example.org\">#web:example.org</a>",
+        ),
+        (
             "pill inside a longer word",
             "a localpart matches only at a token boundary, not inside a word",
             "malice and <a href=\"https://matrix.to/#/@alice:example.org\">alice</a>",
@@ -513,6 +542,27 @@ mod tests {
             "a listed deviation is not in the fixture"
         );
         assert!(differ.is_empty(), "{}", differ.join("\n"));
+    }
+
+    #[test]
+    fn ids_inside_a_link_stay_out_of_its_href() {
+        assert_eq!(
+            markdown_to_html("[profile](https://example.org/?user=@alice:example.org)").unwrap(),
+            "<a href=\"https://example.org/?user=@alice:example.org\">profile</a>"
+        );
+        // An id outside the link, on the same line, is still linked.
+        assert_eq!(
+            markdown_to_html(
+                "[profile](https://example.org/?user=@alice:example.org) by @bob:example.org"
+            )
+            .unwrap(),
+            "<a href=\"https://example.org/?user=@alice:example.org\">profile</a> by <a href=\"https://matrix.to/#/@bob:example.org\">@bob:example.org</a>"
+        );
+        assert_eq!(
+            markdown_to_html("[r](https://example.org/?r=#ops:example.org) #web:example.org")
+                .unwrap(),
+            "<a href=\"https://example.org/?r=#ops:example.org\">r</a> <a href=\"https://matrix.to/#/#web:example.org\">#web:example.org</a>"
+        );
     }
 
     #[test]
