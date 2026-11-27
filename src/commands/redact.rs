@@ -23,7 +23,7 @@ pub async fn run(args: RedactArgs) -> Result<()> {
         "op": "redact",
         "room": args.room,
         "event_id": args.event_id,
-        "reason": args.reason,
+        "reason": args.reason(),
     });
     let outcome = match via_daemon::<RedactOutcome>(&paths, request.clone(), "redaction").await? {
         Some(outcome) => outcome,
@@ -36,19 +36,25 @@ pub async fn run(args: RedactArgs) -> Result<()> {
             execute(&restored.client, &request).await?
         }
     };
-    if args.json {
-        println!(
-            "{}",
-            json_line(&json!({
-                "event_id": outcome.event_id,
-                "redacts": outcome.redacts,
-                "room_id": outcome.room_id,
-            }))?
-        );
-    } else {
-        println!("{}", term(&outcome.event_id));
+    for line in render(&args, &outcome)? {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// The stdout lines for a redaction, as matrix-redact.py prints them.
+pub fn render(args: &RedactArgs, outcome: &RedactOutcome) -> Result<Vec<String>> {
+    let id = term(&outcome.event_id);
+    Ok(if args.json {
+        vec![json_line(&json!({"event_id": outcome.event_id}))?]
+    } else if args.quiet {
+        vec![id.into_owned()]
+    } else {
+        vec![
+            format!("Message redacted from {}", term(&args.room)),
+            format!("Redaction event ID: {id}"),
+        ]
+    })
 }
 
 /// What a redaction is reported as, on the direct path and in the daemon's answer.
@@ -124,6 +130,48 @@ mod tests {
 
     fn id(s: &str) -> matrix_sdk::ruma::OwnedUserId {
         UserId::parse(s).unwrap()
+    }
+
+    fn args(quiet: bool, json: bool) -> RedactArgs {
+        RedactArgs {
+            room: "#it:netresearch.de".into(),
+            event_id: "$r".into(),
+            reason: None,
+            reason_option: Some("abgeschlossen".into()),
+            quiet,
+            json,
+        }
+    }
+
+    fn done() -> RedactOutcome {
+        RedactOutcome {
+            event_id: "$x".into(),
+            redacts: "$r".into(),
+            room_id: "!room:netresearch.de".into(),
+        }
+    }
+
+    #[test]
+    fn output_is_matrix_redact_py_s() {
+        assert_eq!(
+            render(&args(false, false), &done()).unwrap(),
+            vec![
+                "Message redacted from #it:netresearch.de".to_owned(),
+                "Redaction event ID: $x".to_owned(),
+            ]
+        );
+        assert_eq!(
+            render(&args(true, false), &done()).unwrap(),
+            vec!["$x".to_owned()]
+        );
+        // --json wins over -q, as in matrix-redact.py.
+        for quiet in [false, true] {
+            let line = render(&args(quiet, true), &done()).unwrap().remove(0);
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap(),
+                json!({"event_id": "$x"})
+            );
+        }
     }
 
     #[test]
