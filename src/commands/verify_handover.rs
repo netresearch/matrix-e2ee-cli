@@ -10,9 +10,15 @@
 //! - `<token>.emoji.json`: written by the waiting process, the JSON line it
 //!   printed (with the token).
 //! - `<token>.decision.json`: written by `--confirm` / `--cancel`, only when
-//!   the emoji file of exactly that token exists.
+//!   the emoji file of exactly that token exists, with a fresh random nonce
+//!   of that decision process. It is published with a hard link, so a
+//!   second decision never replaces the first: the data directory's file
+//!   system must support hard links.
 //! - `<token>.taken.json`: the waiting process's acknowledgement, naming
-//!   what it did with the decision; `--confirm` / `--cancel` read and remove it.
+//!   what it did with the decision and that decision's nonce. The decision
+//!   process whose nonce it names removes it after reading it; one of
+//!   another nonce is left alone. The next `verify` sweeps an
+//!   acknowledgement nobody removed once it is older than [`TAKEN_STALE`].
 //!
 //! A decision is bound to the comparison the person saw by its token, not
 //! by the transaction id (the other side chooses that in `--listen`); the
@@ -39,6 +45,12 @@ const DECISION_SUFFIX: &str = ".decision.json";
 const TAKEN_SUFFIX: &str = ".taken.json";
 const TMP_SUFFIX: &str = ".tmp";
 const NONCE_BYTES: usize = 16;
+
+/// How long `--confirm` / `--cancel` wait for the acknowledgement.
+pub const TAKEN_WAIT: Duration = Duration::from_secs(5);
+/// From this age on, an acknowledgement is no longer read by any decision
+/// process: the acknowledgement window plus a margin.
+pub const TAKEN_STALE: Duration = Duration::from_secs(TAKEN_WAIT.as_secs() + 55);
 
 /// The hand-over directory inside the data directory.
 pub fn handover_dir(data_dir: &Path) -> PathBuf {
@@ -86,11 +98,26 @@ pub enum Taken {
 struct DecisionFile {
     transaction_id: String,
     decision: Decision,
+    /// Fresh random per decision process; the acknowledgement repeats it.
+    nonce: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TakenFile {
     taken: Taken,
+    /// The nonce of the decision file this answers; none when that file
+    /// could not be read as a decision.
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+/// An acknowledgement, as a decision process reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ack {
+    /// The waiting process answered this process's decision.
+    Mine(Taken),
+    /// The acknowledgement answers another decision for the same token.
+    Other(Taken),
 }
 
 fn random_nonce() -> String {
@@ -121,12 +148,52 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     write_through_tmp(path, bytes, |tmp, path| fs::rename(tmp, path))
 }
 
+/// Whether a failed `fs::hard_link` means the file system has no hard links:
+/// `EPERM` from link(2) on Linux (e.g. FAT), `ENOTSUP` / `EOPNOTSUPP`, or on
+/// Windows `ERROR_INVALID_FUNCTION` / `ERROR_NOT_SUPPORTED`.
+fn hard_links_unsupported(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            err.raw_os_error(),
+            Some(code) if code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
+        )
+    }
+    #[cfg(windows)]
+    {
+        matches!(err.raw_os_error(), Some(1 | 50))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+/// A failed hard link, with the cause named when the file system has no
+/// hard links; the kind stays, so `AlreadyExists` still means "exists".
+fn explain_link_error(err: std::io::Error) -> std::io::Error {
+    if hard_links_unsupported(&err) {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "the file system of the data directory does not support hard links, \
+                 which verify --confirm and --cancel need ({err})"
+            ),
+        )
+    } else {
+        err
+    }
+}
+
 /// Like [`write_private`], but never replaces an existing `path`: the
 /// temporary file is hard-linked to it, which fails when it exists. The
 /// error then has kind `AlreadyExists`.
 fn write_new_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_through_tmp(path, bytes, |tmp, path| {
-        let linked = fs::hard_link(tmp, path);
+        let linked = fs::hard_link(tmp, path).map_err(explain_link_error);
         let _ = fs::remove_file(tmp);
         linked
     })
@@ -195,10 +262,13 @@ fn read_private(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Remove every hand-over file in `dir`. Only a process that holds the
-/// data-directory lock calls this: no other waiting process can exist then,
-/// so whatever is there is left over from a process that ended.
-pub fn sweep(dir: &Path) -> Result<()> {
+/// Remove the hand-over files in `dir` that no process uses any more. Only
+/// a process that holds the data-directory lock calls this: no other waiting
+/// process can exist then, so every emoji and decision file is left over
+/// from a process that ended. An acknowledgement is different: a decision
+/// process may still be about to read it after its waiting process ended,
+/// so only one older than `stale` (by modification time) is removed.
+pub fn sweep(dir: &Path, stale: Duration) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -207,12 +277,28 @@ pub fn sweep(dir: &Path) -> Result<()> {
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if [EMOJI_SUFFIX, DECISION_SUFFIX, TAKEN_SUFFIX, TMP_SUFFIX]
-            .iter()
-            .any(|s| name.ends_with(s))
-        {
-            fs::remove_file(entry.path())
-                .with_context(|| format!("cannot remove {}", entry.path().display()))?;
+        let remove = if name.ends_with(TAKEN_SUFFIX) {
+            // An mtime in the future, or none to read, counts as fresh.
+            entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= stale)
+        } else {
+            [EMOJI_SUFFIX, DECISION_SUFFIX, TMP_SUFFIX]
+                .iter()
+                .any(|s| name.ends_with(s))
+        };
+        if remove {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("cannot remove {}", entry.path().display()));
+                }
+            }
         }
     }
     Ok(())
@@ -221,7 +307,8 @@ pub fn sweep(dir: &Path) -> Result<()> {
 /// A comparison published by the waiting process. Dropping it removes its
 /// emoji and decision files, on every exit path (a timeout drops the future
 /// that owns it). The acknowledgement stays for `--confirm` / `--cancel`
-/// to read; the next `verify` sweeps it if nobody did.
+/// to read; the decision process whose nonce it names removes it, and the
+/// next `verify` sweeps it once it is stale if nobody did.
 #[derive(Debug)]
 pub struct Pending {
     /// The first decision read; every later poll returns it, so a cancel
@@ -277,10 +364,10 @@ impl Pending {
         &self.comparison.token
     }
 
-    fn acknowledge(&self, taken: Taken) -> Result<()> {
+    fn acknowledge(&self, taken: Taken, nonce: Option<String>) -> Result<()> {
         write_private(
             &self.taken_file,
-            serde_json::to_string(&TakenFile { taken })?.as_bytes(),
+            serde_json::to_string(&TakenFile { taken, nonce })?.as_bytes(),
         )
     }
 
@@ -302,21 +389,25 @@ impl Pending {
         let Some(text) = read_private(&self.decision_file)? else {
             return Ok(None);
         };
-        let decision = serde_json::from_str::<DecisionFile>(&text)
-            .ok()
+        let file = serde_json::from_str::<DecisionFile>(&text).ok();
+        let nonce = file.as_ref().map(|file| file.nonce.clone());
+        let decision = file
             .filter(|file| file.transaction_id == self.comparison.transaction_id)
             .map(|file| file.decision);
         let Some(decision) = decision else {
             let _ = fs::remove_file(&self.decision_file);
-            self.acknowledge(Taken::Ignored)?;
+            self.acknowledge(Taken::Ignored, nonce)?;
             return Ok(None);
         };
         *taken = Some(decision);
         let _ = fs::remove_file(&self.emoji_file);
-        self.acknowledge(match decision {
-            Decision::Confirm => Taken::Confirm,
-            Decision::Cancel => Taken::Cancel,
-        })?;
+        self.acknowledge(
+            match decision {
+                Decision::Confirm => Taken::Confirm,
+                Decision::Cancel => Taken::Cancel,
+            },
+            nonce,
+        )?;
         Ok(Some(decision))
     }
 }
@@ -334,6 +425,8 @@ pub struct Waiting {
     pub pid: u32,
     pub comparison: Comparison,
     taken_file: PathBuf,
+    /// This decision's nonce; only an acknowledgement naming it is ours.
+    nonce: String,
 }
 
 /// Whether process `pid` still runs. Without a way to ask (Windows), every
@@ -381,9 +474,11 @@ pub fn hand_over(dir: &Path, token: &str, decision: Decision) -> Result<Waiting>
     }
     // The acknowledgement of an earlier decider stays for that decider.
     let taken_file = dir.join(format!("{token}{TAKEN_SUFFIX}"));
+    let nonce = random_nonce();
     let file = DecisionFile {
         transaction_id: comparison.transaction_id.clone(),
         decision,
+        nonce: nonce.clone(),
     };
     let decision_file = dir.join(format!("{token}{DECISION_SUFFIX}"));
     match write_new_private(&decision_file, serde_json::to_string(&file)?.as_bytes()) {
@@ -399,23 +494,31 @@ pub fn hand_over(dir: &Path, token: &str, decision: Decision) -> Result<Waiting>
         pid,
         comparison,
         taken_file,
+        nonce,
     })
 }
 
-/// Wait up to `within` for the waiting process to acknowledge the decision;
-/// `None` when it did not answer.
-pub fn await_taken(waiting: &Waiting, within: Duration, every: Duration) -> Result<Option<Taken>> {
+/// Wait up to `within` for the waiting process to acknowledge this decision.
+/// An acknowledgement naming this decision's nonce is `Ack::Mine` and is
+/// removed once read. One naming another nonce answers another decision for
+/// the token; it is left for that decider and may still be replaced by the
+/// answer to this one, so it is reported (`Ack::Other`) only when the time
+/// is up. `None` when there was no acknowledgement at all.
+pub fn await_taken(waiting: &Waiting, within: Duration, every: Duration) -> Result<Option<Ack>> {
     let deadline = Instant::now() + within;
+    let mut other = None;
     loop {
-        // Read, never removed: another decider may read it too; the next
-        // `verify` sweeps it.
         if let Some(text) = read_private(&waiting.taken_file)? {
             let file: TakenFile =
                 serde_json::from_str(&text).context("the acknowledgement is not valid")?;
-            return Ok(Some(file.taken));
+            if file.nonce.as_deref() == Some(waiting.nonce.as_str()) {
+                let _ = fs::remove_file(&waiting.taken_file);
+                return Ok(Some(Ack::Mine(file.taken)));
+            }
+            other = Some(file.taken);
         }
         if Instant::now() >= deadline {
-            return Ok(None);
+            return Ok(other.map(Ack::Other));
         }
         std::thread::sleep(every);
     }
@@ -459,7 +562,7 @@ mod tests {
         assert_eq!(pending.poll().unwrap(), Some(Decision::Confirm));
         assert_eq!(
             await_taken(&target, QUICK, QUICK).unwrap(),
-            Some(Taken::Confirm)
+            Some(Ack::Mine(Taken::Confirm))
         );
         // Decided: a later --cancel must not report a hand-over nobody reads.
         let err = hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap_err();
@@ -477,7 +580,7 @@ mod tests {
         assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
         assert_eq!(
             await_taken(&first, QUICK, QUICK).unwrap(),
-            Some(Taken::Cancel)
+            Some(Ack::Mine(Taken::Cancel))
         );
     }
 
@@ -491,6 +594,7 @@ mod tests {
         let confirm = DecisionFile {
             transaction_id: "tx1".to_owned(),
             decision: Decision::Confirm,
+            nonce: "n".to_owned(),
         };
         write_private(
             &pending.decision_file,
@@ -501,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_reader_keeps_the_acknowledgement() {
+    fn the_decider_removes_its_acknowledgement_after_reading_it() {
         let tmp = tempfile::tempdir().unwrap();
         let pending = publish(tmp.path(), "tx1");
         let first = hand_over(tmp.path(), pending.token(), Decision::Confirm).unwrap();
@@ -510,11 +614,44 @@ mod tests {
         assert!(hand_over(tmp.path(), pending.token(), Decision::Cancel).is_err());
         assert_eq!(
             await_taken(&first, QUICK, QUICK).unwrap(),
-            Some(Taken::Confirm)
+            Some(Ack::Mine(Taken::Confirm))
+        );
+        assert!(!pending.taken_file.exists(), "the acknowledgement stayed");
+        assert_eq!(await_taken(&first, QUICK, QUICK).unwrap(), None);
+    }
+
+    #[test]
+    fn a_second_decision_never_takes_the_first_ones_acknowledgement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = publish(tmp.path(), "tx1");
+        // A second decider read the emoji file before the first decision
+        // was taken ...
+        let emoji = fs::read(&pending.emoji_file).unwrap();
+        let first = hand_over(tmp.path(), pending.token(), Decision::Confirm).unwrap();
+        assert_eq!(pending.poll().unwrap(), Some(Decision::Confirm));
+        let (emoji_file, taken_file) = (pending.emoji_file.clone(), pending.taken_file.clone());
+        // ... and publishes after the waiting process dropped the comparison.
+        drop(pending);
+        write_private(&emoji_file, &emoji).unwrap();
+        let second = hand_over(
+            tmp.path(),
+            first.comparison.token.as_str(),
+            Decision::Cancel,
+        )
+        .unwrap();
+        fs::remove_file(&emoji_file).unwrap();
+        assert_eq!(
+            await_taken(&second, QUICK, QUICK).unwrap(),
+            Some(Ack::Other(Taken::Confirm)),
+            "the second decision took the first one's acknowledgement"
+        );
+        assert!(
+            taken_file.exists(),
+            "the first one's acknowledgement was removed"
         );
         assert_eq!(
             await_taken(&first, QUICK, QUICK).unwrap(),
-            Some(Taken::Confirm)
+            Some(Ack::Mine(Taken::Confirm))
         );
     }
 
@@ -527,6 +664,7 @@ mod tests {
         let wrong = DecisionFile {
             transaction_id: "tx0".to_owned(),
             decision: Decision::Confirm,
+            nonce: first.nonce.clone(),
         };
         write_private(
             &pending.decision_file,
@@ -535,10 +673,16 @@ mod tests {
         .unwrap();
         assert_eq!(pending.poll().unwrap(), None);
         // A second decider may hand over now, and leaves the answer alone.
-        hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap();
+        let second = hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap();
         assert_eq!(
             await_taken(&first, QUICK, QUICK).unwrap(),
-            Some(Taken::Ignored)
+            Some(Ack::Mine(Taken::Ignored))
+        );
+        // The second decision gets its own acknowledgement.
+        assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
+        assert_eq!(
+            await_taken(&second, QUICK, QUICK).unwrap(),
+            Some(Ack::Mine(Taken::Cancel))
         );
     }
 
@@ -550,7 +694,7 @@ mod tests {
         assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
         assert_eq!(
             await_taken(&target, QUICK, QUICK).unwrap(),
-            Some(Taken::Cancel)
+            Some(Ack::Mine(Taken::Cancel))
         );
     }
 
@@ -630,6 +774,7 @@ mod tests {
         let other = DecisionFile {
             transaction_id: "tx0".to_owned(),
             decision: Decision::Confirm,
+            nonce: "n".to_owned(),
         };
         write_private(
             &pending.decision_file,
@@ -644,7 +789,7 @@ mod tests {
         assert!(!pending.decision_file.exists());
         assert!(pending.emoji_file.exists(), "it stopped waiting");
         let text = fs::read_to_string(&pending.taken_file).unwrap();
-        assert_eq!(text, r#"{"taken":"ignored"}"#);
+        assert_eq!(text, r#"{"taken":"ignored","nonce":"n"}"#);
     }
 
     #[test]
@@ -658,20 +803,80 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(100));
     }
 
+    /// Set the modification time of `path` to `age` ago.
+    fn age(path: &Path, age: Duration) {
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
     #[test]
     fn sweep_removes_what_an_ended_process_left() {
         let tmp = tempfile::tempdir().unwrap();
         let earlier = publish(tmp.path(), "tx1");
         hand_over(tmp.path(), earlier.token(), Decision::Confirm).unwrap();
         write_private(&earlier.taken_file, b"{}").unwrap();
+        age(&earlier.taken_file, TAKEN_STALE);
         std::mem::forget(earlier);
         fs::write(tmp.path().join("unrelated"), "x").unwrap();
-        sweep(tmp.path()).unwrap();
+        sweep(tmp.path(), TAKEN_STALE).unwrap();
         let left: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("unrelated")]);
+    }
+
+    #[test]
+    fn sweep_keeps_an_acknowledgement_a_decider_may_still_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = publish(tmp.path(), "tx1");
+        let target = hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap();
+        assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
+        drop(pending);
+        // The waiting process ended; the next verify starts and sweeps
+        // before --cancel read its acknowledgement.
+        age(&target.taken_file, TAKEN_WAIT);
+        sweep(tmp.path(), TAKEN_STALE).unwrap();
+        assert_eq!(
+            await_taken(&target, QUICK, QUICK).unwrap(),
+            Some(Ack::Mine(Taken::Cancel))
+        );
+        assert!(TAKEN_STALE > TAKEN_WAIT);
+    }
+
+    #[test]
+    fn a_file_system_without_hard_links_is_named() {
+        use std::io::{Error, ErrorKind};
+        #[cfg(unix)]
+        let unsupported = [
+            Error::from_raw_os_error(libc::EPERM),
+            Error::from_raw_os_error(libc::EOPNOTSUPP),
+            Error::from(ErrorKind::Unsupported),
+        ];
+        #[cfg(not(unix))]
+        let unsupported = [Error::from(ErrorKind::Unsupported)];
+        for err in unsupported {
+            let kind = err.kind();
+            let explained = explain_link_error(err);
+            assert_eq!(explained.kind(), kind);
+            assert!(
+                explained.to_string().contains(
+                    "the file system of the data directory does not support hard links, which verify --confirm and --cancel need"
+                ),
+                "{explained}"
+            );
+        }
+        // An existing decision file stays "exists": the first one counts.
+        for err in [
+            Error::from(ErrorKind::AlreadyExists),
+            Error::from(ErrorKind::NotFound),
+        ] {
+            let kind = err.kind();
+            let explained = explain_link_error(err);
+            assert_eq!(explained.kind(), kind);
+            assert!(!explained.to_string().contains("hard links"), "{explained}");
+        }
     }
 
     #[test]

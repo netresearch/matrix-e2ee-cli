@@ -120,7 +120,8 @@ pub struct VerifyArgs {
     /// Run --confirm only after the person compared the emoji with the other
     /// device and said they match; otherwise run `verify --cancel TOKEN`.
     /// This process never confirms on its own. Works with or without a
-    /// terminal.
+    /// terminal. The data directory's file system must support hard links:
+    /// --confirm and --cancel hand the decision over with one.
     #[arg(long, conflicts_with_all = ["list", "confirm", "cancel"])]
     pub hand_over: bool,
     /// List your account's devices: id, name, verified or not, this device.
