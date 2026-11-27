@@ -431,6 +431,14 @@ enum CancelOutcome {
     SendInterrupted,
 }
 
+/// Whether a failed flow gets the cleanup (trust check, cancellation and
+/// its report). A timeout, a signal or an agent always do; with a person at
+/// the terminal, so does a request whose send failed, because the request
+/// may have reached the other device all the same.
+fn needs_cleanup(stopped: bool, agent: bool, state: &FlowState) -> bool {
+    stopped || agent || state.requesting.load(Ordering::SeqCst)
+}
+
 /// The outcome when there is no request handle to cancel.
 fn without_request(requesting: bool) -> CancelOutcome {
     if requesting {
@@ -772,9 +780,10 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
     // A timeout, a signal or (without a person) any error can come after
     // confirm() stored the trust: ask the store before cancelling, so a
     // verified device is never reported as "nothing was trusted on this device".
+    // A failed request send is reported in every mode (see needs_cleanup).
     let outcome = match outcome {
         Ok(()) => Ok(()),
-        Err(err) if stopped || agent => {
+        Err(err) if needs_cleanup(stopped, agent, &state) => {
             let sas = state.sas.lock().ok().and_then(|slot| slot.clone());
             let (trust, device) = match &sas {
                 Some((sas, before)) => {
@@ -1577,6 +1586,24 @@ mod tests {
             msg,
             "nothing was trusted on this device; cancelled here; the other device may not have been notified: the verification stopped while the cancellation was being sent"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_send_is_reported_with_a_person_at_the_terminal() {
+        let state = FlowState::default();
+        assert!(!needs_cleanup(false, false, &state));
+        let failed = send_request(
+            &state.requesting,
+            &state.request,
+            std::future::ready(Err::<VerificationRequest, _>("reset")),
+        );
+        assert_eq!(failed.await.err(), Some("reset"));
+        assert!(
+            needs_cleanup(false, false, &state),
+            "a failed send in terminal mode was not reported as uncertain"
+        );
+        assert!(needs_cleanup(true, false, &FlowState::default()));
+        assert!(needs_cleanup(false, true, &FlowState::default()));
     }
 
     #[tokio::test]
