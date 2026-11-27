@@ -9,6 +9,7 @@ mod config;
 mod daemon_client;
 #[cfg(all(test, unix))]
 mod daemon_test_support;
+mod formatting;
 mod room_arg;
 mod roomlog;
 mod session;
@@ -117,22 +118,46 @@ pub struct VerifyArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(allow_missing_positional = true)]
 pub struct SendArgs {
-    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
-    pub room: String,
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name. Omit with --to.
+    #[arg(required_unless_present = "to")]
+    pub room: Option<String>,
+    /// The message, in Markdown: sent with an HTML body when it renders to more than its text.
     pub message: String,
+    /// Send to the existing direct chat with this user (from m.direct) instead of ROOM; never creates a room.
+    #[arg(long, value_name = "@user:server", conflicts_with = "room")]
+    pub to: Option<String>,
     /// Send as m.notice (for automation).
     #[arg(long, conflicts_with = "emote")]
     pub notice: bool,
-    /// Send as m.emote.
+    /// Send as m.emote (no bot prefix).
     #[arg(long)]
     pub emote: bool,
+    /// Reply in the thread of this root event.
+    #[arg(long, value_name = "EVENT_ID")]
+    pub thread: Option<String>,
+    /// Reply to this event.
+    #[arg(long, value_name = "EVENT_ID")]
+    pub reply: Option<String>,
+    /// Notify this user (repeatable): sets m.mentions, and pills the name where it appears in the text.
+    #[arg(long, value_name = "@user:server")]
+    pub mention: Vec<String>,
+    /// Notify everyone in the room (@room).
+    #[arg(long)]
+    pub mention_room: bool,
+    /// Do not add the bot_prefix of config.json.
+    #[arg(long)]
+    pub no_prefix: bool,
     /// Share this message's room key with unverified devices too (this message only).
     #[arg(long)]
     pub trust_unverified_devices: bool,
     /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,
+    /// Print only the event id.
+    #[arg(short, long)]
+    pub quiet: bool,
 }
 
 #[derive(Debug, Args)]
@@ -172,14 +197,20 @@ pub struct EditArgs {
     pub room: String,
     /// The message to edit ($...); it must be one of your own.
     pub event_id: String,
-    /// The new text; it replaces the whole message.
+    /// The new text, in Markdown; it replaces the whole message.
     pub new_message: String,
+    /// Do not add the bot_prefix of config.json.
+    #[arg(long)]
+    pub no_prefix: bool,
     /// Share this edit's room key with unverified devices too (this edit only).
     #[arg(long)]
     pub trust_unverified_devices: bool,
     /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,
+    /// Print only the edit's event id.
+    #[arg(short, long)]
+    pub quiet: bool,
 }
 
 #[derive(Debug, Args)]
@@ -364,6 +395,60 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    fn send_args(argv: &[&str]) -> Result<SendArgs, clap::Error> {
+        let cli = Cli::try_parse_from([&["m", "send"][..], argv].concat())?;
+        let Command::Send(args) = cli.command else {
+            panic!("not send")
+        };
+        Ok(args)
+    }
+
+    #[test]
+    fn send_takes_room_or_to() {
+        let args = send_args(&["r", "hi"]).unwrap();
+        assert_eq!(
+            (args.room.as_deref(), args.to.as_deref()),
+            (Some("r"), None)
+        );
+        assert_eq!(args.message, "hi");
+        for argv in [&["--to", "@u:e", "hi"][..], &["hi", "--to", "@u:e"]] {
+            let args = send_args(argv).unwrap();
+            assert_eq!(args.room, None, "{argv:?}");
+            assert_eq!(args.to.as_deref(), Some("@u:e"), "{argv:?}");
+            assert_eq!(args.message, "hi", "{argv:?}");
+        }
+        assert!(
+            send_args(&["r", "hi", "--to", "@u:e"]).is_err(),
+            "ROOM and --to"
+        );
+        assert!(send_args(&["hi"]).is_err(), "neither ROOM nor --to");
+    }
+
+    #[test]
+    fn send_options_of_matrix_send_e2ee() {
+        let args = send_args(&[
+            "r",
+            "hi",
+            "--thread",
+            "$root",
+            "--reply",
+            "$p",
+            "--mention",
+            "@a:e",
+            "--mention",
+            "@b:e",
+            "--mention-room",
+            "--no-prefix",
+            "-q",
+        ])
+        .unwrap();
+        assert_eq!(args.thread.as_deref(), Some("$root"));
+        assert_eq!(args.reply.as_deref(), Some("$p"));
+        assert_eq!(args.mention, ["@a:e", "@b:e"]);
+        assert!(args.mention_room && args.no_prefix && args.quiet);
+        assert!(send_args(&["r", "hi", "--quiet", "--json"]).is_ok());
+    }
+
     #[test]
     fn read_takes_the_callers_arguments() {
         // netresearch-jira claiming-a-ticket.md, through the thin
@@ -458,7 +543,16 @@ mod tests {
             panic!("not edit")
         };
         assert!(args.trust_unverified_devices && args.json);
+        assert!(!args.no_prefix && !args.quiet);
         assert_eq!(args.new_message, "new");
+        let Command::Edit(args) =
+            Cli::try_parse_from(["m", "edit", "r", "$e", "new", "--no-prefix", "-q"])
+                .unwrap()
+                .command
+        else {
+            panic!("not edit")
+        };
+        assert!(args.no_prefix && args.quiet);
     }
 
     #[test]

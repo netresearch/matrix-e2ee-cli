@@ -99,6 +99,28 @@ pub fn load_watch_rooms() -> Result<Vec<String>> {
     parse_watch_rooms(&text).with_context(|| format!("in {}", path.display()))
 }
 
+/// `bot_prefix` of config.json: the text `send` and `edit` put before a
+/// message (matrix-skill `add_bot_prefix`). Absent, null or empty: none.
+/// Read only by these two commands, so a malformed value cannot break the
+/// others.
+pub fn parse_bot_prefix(text: &str) -> Result<Option<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).context("config.json is not valid JSON")?;
+    match value.get("bot_prefix") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(prefix)) if prefix.is_empty() => Ok(None),
+        Some(serde_json::Value::String(prefix)) => Ok(Some(prefix.clone())),
+        Some(_) => bail!("bot_prefix must be a string"),
+    }
+}
+
+pub fn load_bot_prefix() -> Result<Option<String>> {
+    let path = config_path()?;
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read config file {}", path.display()))?;
+    parse_bot_prefix(&text).with_context(|| format!("in {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +181,20 @@ mod tests {
         );
         assert!(parse_watch_rooms(r##"{"watch_rooms":"#it:example.org"}"##).is_err());
         assert!(parse_watch_rooms(r#"{"watch_rooms":[1]}"#).is_err());
+    }
+
+    #[test]
+    fn bot_prefix_is_an_optional_string() {
+        assert_eq!(parse_bot_prefix("{}").unwrap(), None);
+        assert_eq!(parse_bot_prefix(r#"{"bot_prefix":null}"#).unwrap(), None);
+        assert_eq!(parse_bot_prefix(r#"{"bot_prefix":""}"#).unwrap(), None);
+        assert_eq!(
+            parse_bot_prefix(r#"{"bot_prefix":"🤖"}"#)
+                .unwrap()
+                .as_deref(),
+            Some("🤖")
+        );
+        assert!(parse_bot_prefix(r#"{"bot_prefix":1}"#).is_err());
     }
 
     #[test]

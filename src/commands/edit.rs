@@ -1,4 +1,6 @@
-//! `edit`: replace the text of one of the user's own messages (`m.replace`).
+//! `edit`: replace the text of one of the user's own messages (`m.replace`),
+//! as the matrix-skill's matrix-edit-e2ee.py: Markdown rendered as HTML and
+//! the bot prefix of config.json.
 //!
 //! The edit is sent like `send` sends a message (see [`send_guarded`]):
 //! encrypted in an encrypted room, room keys to verified devices only unless
@@ -6,8 +8,8 @@
 
 use anyhow::{Context, Result, bail};
 use matrix_sdk::Client;
-use matrix_sdk::ruma::UserId;
 use matrix_sdk::ruma::events::room::message::{ReplacementMetadata, RoomMessageEventContent};
+use matrix_sdk::ruma::{OwnedEventId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -18,7 +20,8 @@ use crate::commands::send::{
 use crate::commands::{
     event_sender, fetch_event, parse_event_id, resolve_room, sync_once, via_daemon,
 };
-use crate::config::load_config;
+use crate::config::{load_bot_prefix, load_config};
+use crate::formatting::{add_bot_prefix, markdown_to_html};
 use crate::session::{Paths, restore};
 use crate::text::{json_line, term};
 
@@ -32,12 +35,23 @@ pub enum EditKind {
 
 pub async fn run(args: EditArgs) -> Result<()> {
     let paths = Paths::from_env()?;
+    // matrix-edit-e2ee.py prefixes every edit (add_bot_prefix leaves a
+    // message that already carries the prefix as it is).
+    let prefix = if args.no_prefix {
+        None
+    } else {
+        load_bot_prefix()?
+    };
+    let body = match prefix {
+        Some(prefix) => add_bot_prefix(&args.new_message, &prefix)?,
+        None => args.new_message.clone(),
+    };
     // The request the watch daemon takes (matrix-watchd.py's "edit").
     let request = json!({
         "op": "edit",
         "room": args.room,
         "event_id": args.event_id,
-        "body": args.new_message,
+        "body": body,
         "trust_unverified_devices": args.trust_unverified_devices,
     });
     let outcome = match via_daemon::<EditOutcome>(&paths, request.clone(), "edit").await? {
@@ -52,20 +66,36 @@ pub async fn run(args: EditArgs) -> Result<()> {
         }
     };
     print_warnings(&outcome.warnings);
-    if args.json {
-        println!(
-            "{}",
-            json_line(&json!({
-                "event_id": outcome.event_id,
-                "replaces": outcome.replaces,
-                "room_id": outcome.room_id,
-                "encrypted": outcome.encrypted,
-            }))?
-        );
-    } else {
-        println!("{}", term(&outcome.event_id));
+    for line in outcome_lines(&outcome, &args.room, args.json, args.quiet)? {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// What `edit` prints on stdout: by default matrix-edit-e2ee.py's two lines,
+/// with `--quiet` the edit's event id alone, with `--json` (which wins) one
+/// JSON object.
+pub fn outcome_lines(
+    outcome: &EditOutcome,
+    room: &str,
+    json: bool,
+    quiet: bool,
+) -> Result<Vec<String>> {
+    Ok(if json {
+        vec![json_line(&json!({
+            "event_id": outcome.event_id,
+            "replaces": outcome.replaces,
+            "room_id": outcome.room_id,
+            "encrypted": outcome.encrypted,
+        }))?]
+    } else if quiet {
+        vec![term(&outcome.event_id).into_owned()]
+    } else {
+        vec![
+            format!("Message edited in {}", term(room)),
+            format!("Edit event ID: {}", term(&outcome.event_id)),
+        ]
+    })
 }
 
 /// What an edit is reported as, on the direct path and in the daemon's answer.
@@ -95,13 +125,7 @@ pub async fn execute(client: &Client, request: &Value) -> Result<EditOutcome> {
     // The wire type: a decrypted original reads m.room.message in its JSON.
     let original_encrypted = fetched.encryption_info().is_some() || fetched.kind.is_utd();
 
-    let body = request_str(request, "body")?;
-    let content = match kind {
-        EditKind::Text => RoomMessageEventContent::text_plain(body),
-        EditKind::Notice => RoomMessageEventContent::notice_plain(body),
-        EditKind::Emote => RoomMessageEventContent::emote_plain(body),
-    }
-    .make_replacement(ReplacementMetadata::new(event_id.clone(), None));
+    let content = edit_content(kind, request_str(request, "body")?, &event_id)?;
     let Sent {
         event_id: edit_id,
         encrypted,
@@ -121,6 +145,26 @@ pub async fn execute(client: &Client, request: &Value) -> Result<EditOutcome> {
         encrypted,
         warnings,
     })
+}
+
+/// The replacement event for `event_id`, as matrix-edit-e2ee.py builds it:
+/// `body` rendered as HTML (no pills) when it renders to more than itself,
+/// in `m.new_content` as it is and in the outer content behind "* ".
+pub fn edit_content(
+    kind: EditKind,
+    body: &str,
+    event_id: &OwnedEventId,
+) -> Result<RoomMessageEventContent> {
+    let html = markdown_to_html(body)?;
+    let content = match (kind, html != body) {
+        (EditKind::Text, true) => RoomMessageEventContent::text_html(body, html),
+        (EditKind::Notice, true) => RoomMessageEventContent::notice_html(body, html),
+        (EditKind::Emote, true) => RoomMessageEventContent::emote_html(body, html),
+        (EditKind::Text, false) => RoomMessageEventContent::text_plain(body),
+        (EditKind::Notice, false) => RoomMessageEventContent::notice_plain(body),
+        (EditKind::Emote, false) => RoomMessageEventContent::emote_plain(body),
+    };
+    Ok(content.make_replacement(ReplacementMetadata::new(event_id.clone(), None)))
 }
 
 /// Refuse an edit whose wire type would differ from the original's: the
@@ -200,6 +244,66 @@ mod tests {
             "origin_server_ts": 1u64,
             "content": {"msgtype": msgtype, "body": "hi"}
         })
+    }
+
+    #[test]
+    fn edit_content_follows_matrix_edit_e2ee() {
+        let id = OwnedEventId::try_from("$orig:example.org").unwrap();
+        let rich =
+            serde_json::to_value(edit_content(EditKind::Text, "🤖 fixed *typo*", &id).unwrap())
+                .unwrap();
+        assert_eq!(
+            rich,
+            json!({
+                "msgtype": "m.text",
+                "body": "* 🤖 fixed *typo*",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "* 🤖 fixed <em>typo</em>",
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": "🤖 fixed *typo*",
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": "🤖 fixed <em>typo</em>",
+                },
+                "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig:example.org"},
+            })
+        );
+        let plain =
+            serde_json::to_value(edit_content(EditKind::Notice, "plain", &id).unwrap()).unwrap();
+        assert_eq!(
+            plain,
+            json!({
+                "msgtype": "m.notice",
+                "body": "* plain",
+                "m.new_content": {"msgtype": "m.notice", "body": "plain"},
+                "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig:example.org"},
+            })
+        );
+    }
+
+    #[test]
+    fn edit_prints_the_lines_of_matrix_edit_e2ee() {
+        let outcome = EditOutcome {
+            event_id: "$edit:example.org".into(),
+            replaces: "$orig:example.org".into(),
+            room_id: "!r:example.org".into(),
+            encrypted: true,
+            warnings: vec![],
+        };
+        assert_eq!(
+            outcome_lines(&outcome, "ops", false, false).unwrap(),
+            ["Message edited in ops", "Edit event ID: $edit:example.org"]
+        );
+        assert_eq!(
+            outcome_lines(&outcome, "ops", false, true).unwrap(),
+            ["$edit:example.org"]
+        );
+        let json = outcome_lines(&outcome, "ops", true, true).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&json[0]).unwrap(),
+            json!({"event_id": "$edit:example.org", "replaces": "$orig:example.org",
+                "room_id": "!r:example.org", "encrypted": true})
+        );
     }
 
     #[test]

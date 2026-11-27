@@ -11,6 +11,9 @@ publish = false
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
+# Lookaround in the patterns of the matrix-skill's Markdown renderer
+# (formatting.rs), which the regex crate does not support.
+fancy-regex = "0.20"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # tcflush (discard typed-ahead input before the emoji confirmation).
 libc = "0.2"
