@@ -55,9 +55,105 @@ pub fn term_body(s: &str) -> String {
         .join("\n    ")
 }
 
+/// `value` as Python's `json.dumps(value, indent=2)` prints it: two-space
+/// indent, `": "` after keys, and (ensure_ascii) every character outside
+/// U+0020-U+007E as `\uXXXX`, characters beyond the BMP as a surrogate pair.
+/// So no control character, DEL or C1 included, reaches the terminal raw.
+pub fn python_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<String> {
+    let mut out = Vec::new();
+    let formatter = AsciiPretty(serde_json::ser::PrettyFormatter::with_indent(b"  "));
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+    value.serialize(&mut serializer)?;
+    // Only ASCII is written.
+    Ok(String::from_utf8(out).expect("python_json writes ASCII only"))
+}
+
+/// serde_json's pretty layout, with Python's ensure_ascii escaping.
+struct AsciiPretty<'a>(serde_json::ser::PrettyFormatter<'a>);
+
+impl serde_json::ser::Formatter for AsciiPretty<'_> {
+    fn begin_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.0.begin_array(w)
+    }
+    fn end_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.0.end_array(w)
+    }
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        self.0.begin_array_value(w, first)
+    }
+    fn end_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.0.end_array_value(w)
+    }
+    fn begin_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.0.begin_object(w)
+    }
+    fn end_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.0.end_object(w)
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        self.0.begin_object_key(w, first)
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.0.begin_object_value(w)
+    }
+    fn end_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.0.end_object_value(w)
+    }
+    fn write_string_fragment<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        fragment: &str,
+    ) -> std::io::Result<()> {
+        for c in fragment.chars() {
+            if (' '..='~').contains(&c) {
+                w.write_all(&[c as u8])?;
+            } else {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    write!(w, "\\u{unit:04x}")?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_json_matches_json_dumps_indent_2() {
+        // python3: json.dumps([{"a": "Grüße 🙂", "e": {}, "l": [], "n": 5,
+        //   "o": {"w": 2}}, None, True], indent=2); json!() sorts the keys, so
+        //   the Python input is given sorted.
+        let value = serde_json::json!([
+            {"a": "Grüße 🙂", "n": 5, "o": {"w": 2}, "e": {}, "l": []},
+            null,
+            true
+        ]);
+        let expected = "[\n  {\n    \"a\": \"Gr\\u00fc\\u00dfe \\ud83d\\ude42\",\n    \"e\": {},\n    \"l\": [],\n    \"n\": 5,\n    \"o\": {\n      \"w\": 2\n    }\n  },\n  null,\n  true\n]";
+        assert_eq!(python_json(&value).unwrap(), expected);
+        assert_eq!(python_json(&Vec::<u8>::new()).unwrap(), "[]");
+    }
+
+    #[test]
+    fn python_json_escapes_every_control_character() {
+        // python3: json.dumps(["a\x7fb\x9b \x1b\n"], indent=2)
+        let shown = python_json(&["a\u{7f}b\u{9b}\u{a0}\u{1b}\n"]).unwrap();
+        assert_eq!(shown, "[\n  \"a\\u007fb\\u009b\\u00a0\\u001b\\n\"\n]");
+        assert!(shown.is_ascii());
+        let back: Vec<String> = serde_json::from_str(&shown).unwrap();
+        assert_eq!(back, ["a\u{7f}b\u{9b}\u{a0}\u{1b}\n"]);
+    }
 
     #[test]
     fn body_line_breaks_are_kept_and_indented() {
