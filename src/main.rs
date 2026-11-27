@@ -50,7 +50,8 @@ enum Command {
     /// Read the last messages of a room, decrypted, newest first.
     Read(ReadArgs),
     /// Ask your other devices for the room keys of the messages this device
-    /// cannot decrypt, then sync to receive them.
+    /// cannot decrypt, then sync to receive them. A session already asked
+    /// for is not asked again.
     FetchKeys(FetchKeysArgs),
     /// Edit one of your own messages (encrypted if the room is encrypted).
     Edit(EditArgs),
@@ -148,6 +149,7 @@ pub struct ReadArgs {
     /// to 5 s per sync) so the key requests reach your other devices and
     /// their keys arrive, then read again.
     /// matrix-sdk asks only when one of your other devices is verified.
+    /// A session already asked for is not asked again.
     #[arg(short = 'k', long)]
     pub request_keys: bool,
 }

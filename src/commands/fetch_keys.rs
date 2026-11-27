@@ -39,8 +39,8 @@ pub struct Scan {
     pub undecryptable: BTreeSet<String>,
     /// Events this device decrypted.
     pub decrypted: usize,
-    /// Every event id of the scan.
-    pub seen: BTreeSet<String>,
+    /// The ids of the events this device decrypted.
+    pub decrypted_ids: BTreeSet<String>,
     /// The distinct Megolm sessions of the undecryptable events.
     pub sessions: BTreeSet<String>,
 }
@@ -58,9 +58,9 @@ impl Scan {
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            scan.seen.insert(id.clone());
             if matches!(event.kind, TimelineEventKind::Decrypted(_)) {
                 scan.decrypted += 1;
+                scan.decrypted_ids.insert(id);
             } else if let Some(line) = to_line(event, true).filter(|l| l.is_undecryptable()) {
                 scan.undecryptable.insert(id);
                 if let Some(Some(session)) = line.session_id {
@@ -82,11 +82,12 @@ impl Scan {
         )
     }
 
-    /// Events undecryptable in `self` that `later` holds and could decrypt.
+    /// Events undecryptable in `self` that `later` decrypted. An event that
+    /// is merely no longer undecryptable (redacted, or out of the window)
+    /// does not count.
     pub fn now_decryptable(&self, later: &Scan) -> usize {
         self.undecryptable
-            .iter()
-            .filter(|id| later.seen.contains(*id) && !later.undecryptable.contains(*id))
+            .intersection(&later.decrypted_ids)
             .count()
     }
 }
@@ -270,8 +271,50 @@ pub async fn run(args: FetchKeysArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::deserialized_responses::UnableToDecryptInfo;
+    use matrix_sdk::deserialized_responses::{
+        AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, UnableToDecryptInfo, VerificationState,
+    };
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn decrypted(event_id: &str) -> TimelineEvent {
+        TimelineEvent::from_decrypted(
+            DecryptedRoomEvent {
+                event: serde_json::from_value(json!({
+                    "type": "m.room.message", "event_id": event_id, "sender": "@b:e",
+                    "room_id": "!r:e", "origin_server_ts": 5u64,
+                    "content": {"msgtype": "m.text", "body": "hi"}
+                }))
+                .unwrap(),
+                encryption_info: Arc::new(EncryptionInfo {
+                    sender: "@b:e".try_into().unwrap(),
+                    sender_device: Some("D".into()),
+                    forwarder: None,
+                    algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                        curve25519_key: "k".into(),
+                        sender_claimed_keys: BTreeMap::new(),
+                        session_id: None,
+                    },
+                    verification_state: VerificationState::Verified,
+                }),
+                unsigned_encryption_info: None,
+            },
+            None,
+        )
+    }
+
+    /// An encrypted event redacted on the server: no ciphertext left.
+    fn redacted(event_id: &str) -> TimelineEvent {
+        TimelineEvent::from_plaintext(
+            serde_json::from_value(json!({
+                "type": "m.room.encrypted", "event_id": event_id, "sender": "@b:e",
+                "origin_server_ts": 5u64, "content": {},
+                "unsigned": {"redacted_because": {"type": "m.room.redaction"}}
+            }))
+            .unwrap(),
+        )
+    }
 
     fn utd(event_id: &str, session_id: &str) -> TimelineEvent {
         TimelineEvent::from_utd(
@@ -327,15 +370,20 @@ mod tests {
 
     #[test]
     fn results_count_what_decrypts_on_the_second_read() {
-        let before = Scan::of(&[utd("$1", "A"), utd("$2", "B"), utd("$3", "C")]);
-        // $1 now decrypts (plain text stands in for it), $2 still does not,
-        // $3 is no longer in the window and does not count.
-        let after = Scan::of(&[text("$1"), utd("$2", "B"), text("$9")]);
+        let before = Scan::of(&[
+            utd("$1", "A"),
+            utd("$2", "B"),
+            utd("$3", "C"),
+            utd("$4", "D"),
+        ]);
+        // $1 now decrypts, $2 still does not, $3 was redacted between the
+        // scans and $4 is no longer in the window: neither counts.
+        let after = Scan::of(&[decrypted("$1"), utd("$2", "B"), redacted("$3"), text("$9")]);
         assert_eq!(before.now_decryptable(&after), 1);
         let shown = results(&before, 2, &after);
         assert!(
             shown.starts_with(
-                "\n=== Results ===\nSessions without a key: 3\nKeys received: 2\nNow decryptable: 1 of 3\n\n✅ Received 2 keys!\n"
+                "\n=== Results ===\nSessions without a key: 4\nKeys received: 2\nNow decryptable: 1 of 4\n\n✅ Received 2 keys!\n"
             ),
             "{shown}"
         );
@@ -344,7 +392,7 @@ mod tests {
             none.contains("\n⚠️  No keys received.\nPossible reasons:\n"),
             "{none}"
         );
-        assert!(none.contains("Now decryptable: 0 of 3"), "{none}");
+        assert!(none.contains("Now decryptable: 0 of 4"), "{none}");
     }
 
     #[test]
