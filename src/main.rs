@@ -109,8 +109,9 @@ pub struct VerifyArgs {
     /// Start verification towards this device of your own account.
     ///
     /// Without a terminal on stdin and stderr, the emoji are printed as one
-    /// JSON line and the command waits for `verify --confirm` or
-    /// `verify --cancel` from a second process; it never confirms on its own.
+    /// JSON line with a token, and the command waits for
+    /// `verify --confirm TOKEN` or `verify --cancel TOKEN` from a second
+    /// process; it never confirms on its own.
     #[arg(long, value_name = "DEVICE_ID")]
     pub request: Option<String>,
     /// Wait for a verification request from one of your own devices
@@ -124,14 +125,15 @@ pub struct VerifyArgs {
     #[arg(long, conflicts_with_all = ["request", "listen", "confirm", "cancel"])]
     pub json: bool,
     /// Confirm the emoji of a verification that waits without a terminal,
-    /// after the person compared them and said they match. Without
-    /// TRANSACTION_ID: the only waiting verification.
-    #[arg(long, value_name = "TRANSACTION_ID", num_args = 0..=1)]
-    pub confirm: Option<Option<String>>,
-    /// Cancel a verification that waits without a terminal. Without
-    /// TRANSACTION_ID: the only waiting verification.
-    #[arg(long, value_name = "TRANSACTION_ID", num_args = 0..=1)]
-    pub cancel: Option<Option<String>>,
+    /// after the person compared them and said they match. TOKEN is the
+    /// "token" of the emoji line that person saw; it names that comparison
+    /// and no other.
+    #[arg(long, value_name = "TOKEN")]
+    pub confirm: Option<String>,
+    /// Cancel a verification that waits without a terminal. TOKEN is the
+    /// "token" of its emoji line.
+    #[arg(long, value_name = "TOKEN")]
+    pub cancel: Option<String>,
     /// Give up after this many seconds.
     #[arg(long, default_value_t = 180, value_name = "SECONDS")]
     pub timeout: u64,
@@ -569,20 +571,21 @@ mod tests {
     }
 
     #[test]
-    fn verify_confirm_and_cancel_take_an_optional_transaction_id() {
-        assert_eq!(verify(&["--confirm"]).confirm, Some(None));
+    fn verify_confirm_and_cancel_need_the_token() {
+        let token = "4242-0123456789abcdef0123456789abcdef";
         assert_eq!(
-            verify(&["--confirm", "tx1"]).confirm,
-            Some(Some("tx1".to_owned()))
+            verify(&["--confirm", token]).confirm.as_deref(),
+            Some(token)
         );
-        assert_eq!(verify(&["--cancel"]).cancel, Some(None));
-        assert_eq!(
-            verify(&["--cancel", "tx1"]).cancel,
-            Some(Some("tx1".to_owned()))
-        );
+        assert_eq!(verify(&["--cancel", token]).cancel.as_deref(), Some(token));
         let parse = |a: &[&str]| Cli::try_parse_from([&["m", "verify"][..], a].concat());
-        assert!(parse(&["--confirm", "--cancel"]).is_err());
-        assert!(parse(&["--confirm", "--listen"]).is_err());
+        assert!(
+            parse(&["--confirm"]).is_err(),
+            "a bare --confirm is bound to nothing"
+        );
+        assert!(parse(&["--cancel"]).is_err());
+        assert!(parse(&["--confirm", token, "--cancel", token]).is_err());
+        assert!(parse(&["--confirm", token, "--listen"]).is_err());
         assert!(parse(&["--list", "--request", "D"]).is_err());
         assert!(parse(&["--json"]).is_err(), "--json only with --list");
         assert!(parse(&["--listen", "--json"]).is_err());

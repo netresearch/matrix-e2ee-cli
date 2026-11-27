@@ -35,7 +35,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # The hash in a room's file names (roomlog.rs).
 sha2 = "0.10"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-std", "io-util", "net", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-std", "io-util", "net", "signal", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
 # FlushConsoleInputBuffer (discard typed-ahead input before the emoji confirmation).

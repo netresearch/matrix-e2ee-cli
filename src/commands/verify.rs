@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 
 use crate::VerifyArgs;
 use crate::commands::verify_handover::{
-    Comparison, Decision, EmojiItem, Pending, hand_over, handover_dir, sweep,
+    Decision, EmojiItem, Pending, Taken, await_taken, hand_over, handover_dir, sweep,
 };
 use crate::commands::{confirm_fresh_on, discard_typeahead_stdin, sync_once};
 use crate::config::load_config;
@@ -107,6 +107,9 @@ const CANCEL_LIMIT: Duration = Duration::from_secs(10);
 
 /// How often a waiting verification looks for a handed-over decision.
 const DECISION_POLL: Duration = Duration::from_millis(250);
+/// How long --confirm / --cancel wait for the waiting process to answer.
+const TAKEN_WAIT: Duration = Duration::from_secs(5);
+const TAKEN_POLL: Duration = Duration::from_millis(100);
 
 /// Run a best-effort step for at most `limit`: a responsive server still
 /// gets it, a stalled one cannot keep the command from ending.
@@ -150,52 +153,177 @@ impl Answer {
     }
 }
 
-/// `verify --confirm` / `--cancel`: hand the decision to the waiting
-/// process. Takes neither the data-directory lock (the waiting process holds
-/// it) nor the store.
-fn decide(transaction_id: Option<&str>, decision: Decision) -> Result<()> {
+/// `verify --confirm` / `--cancel`: hand the decision to the comparison with
+/// `token` and report what the waiting process did with it. Takes neither the
+/// data-directory lock (the waiting process holds it) nor the store.
+fn decide(token: &str, decision: Decision) -> Result<()> {
     let paths = Paths::from_env()?;
-    let target = hand_over(&handover_dir(&paths.data_dir), transaction_id, decision)?;
-    eprintln!(
-        "Handed {} to verification {} with device {} (process {}); that process reports the result.",
-        match decision {
-            Decision::Confirm => "the confirmation",
-            Decision::Cancel => "the cancellation",
-        },
-        term(&target.comparison.transaction_id),
-        term(&target.comparison.other_device),
-        target.pid
-    );
+    let target = hand_over(&handover_dir(&paths.data_dir), token, decision)?;
+    let taken = await_taken(&target, TAKEN_WAIT, TAKEN_POLL)?;
+    let line = taken_report(
+        decision,
+        taken,
+        &target.comparison.transaction_id,
+        &target.comparison.other_device,
+        target.pid,
+    )?;
+    eprintln!("{line}");
     Ok(())
 }
 
-/// The JSON line for the emoji of transaction `transaction_id`.
-fn comparison_record(transaction_id: &str, other_device: &str, emojis: &[Emoji]) -> Comparison {
-    Comparison {
-        transaction_id: transaction_id.to_owned(),
-        other_device: other_device.to_owned(),
-        emojis: emojis
-            .iter()
-            .map(|e| EmojiItem {
-                symbol: e.symbol.to_owned(),
-                description: e.description.to_owned(),
-            })
-            .collect(),
+/// What the waiting process did with the decision this process handed over.
+fn taken_report(
+    sent: Decision,
+    taken: Option<Taken>,
+    transaction_id: &str,
+    other_device: &str,
+    pid: u32,
+) -> Result<String> {
+    let name = |decision: Decision| match decision {
+        Decision::Confirm => "the confirmation",
+        Decision::Cancel => "the cancellation",
+    };
+    let which = format!(
+        "verification {} with device {} (process {pid})",
+        term_id(transaction_id),
+        term_id(other_device)
+    );
+    match (sent, taken) {
+        (Decision::Confirm, Some(Taken::Confirm)) => Ok(format!(
+            "The {which} took the confirmation; it confirms the emoji and reports the result."
+        )),
+        (Decision::Cancel, Some(Taken::Cancel)) => Ok(format!(
+            "The {which} took the cancellation; it cancels and reports the result."
+        )),
+        (Decision::Cancel, Some(Taken::Confirm)) => {
+            bail!("the {which} acted on a confirmation, not on this cancellation")
+        }
+        (Decision::Confirm, Some(Taken::Cancel)) => {
+            bail!("the {which} acted on a cancellation, not on this confirmation")
+        }
+        (_, Some(Taken::Ignored)) => bail!(
+            "the {which} ignored {}: it did not name its transaction",
+            name(sent)
+        ),
+        (_, None) => bail!(
+            "the {which} did not acknowledge {} within {} s; it may still act on it",
+            name(sent),
+            TAKEN_WAIT.as_secs()
+        ),
     }
 }
 
-/// How to answer, on stderr, after the emoji line.
-fn hand_over_instructions(transaction_id: &str, other_device: &str, timeout: u64) -> String {
-    // In --listen the requesting device chose the id: quote it for the shell
-    // (as one argument; --confirm=... keeps a leading dash a value).
-    let id = format!("'{}'", term(transaction_id).replace('\'', r"'\''"));
+/// [`term`], and the Unicode bidi controls (U+202A-U+202E, U+2066-U+2069)
+/// replaced too: an id or device name the other side chose cannot reorder
+/// the text around it.
+fn term_id(s: &str) -> String {
+    term(s)
+        .chars()
+        .map(|c| match c {
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => '\u{FFFD}',
+            c => c,
+        })
+        .collect()
+}
+
+/// The emoji in the hand-over's form.
+fn emoji_items(emojis: &[Emoji]) -> Vec<EmojiItem> {
+    emojis
+        .iter()
+        .map(|e| EmojiItem {
+            symbol: e.symbol.to_owned(),
+            description: e.description.to_owned(),
+        })
+        .collect()
+}
+
+/// Write the emoji line; an error (a closed stdout) is returned, never a
+/// panic, so the caller can cancel.
+fn emit_line(out: &mut impl std::io::Write, line: &str) -> Result<()> {
+    writeln!(out, "{line}")
+        .and_then(|()| out.flush())
+        .context("cannot write the emoji line to stdout")
+}
+
+/// How to answer, on stderr, after the emoji line. `token` is this
+/// process's own (digits, a dash, hex), safe on a command line as it is.
+fn hand_over_instructions(token: &str, other_device: &str, timeout: u64) -> String {
     format!(
         "Compare the emoji on stdout with the ones device {} shows.\n\
-         If the person confirms they match exactly, run:\n  matrix-e2ee-cli verify --confirm={id}\n\
-         If they do not match, run:\n  matrix-e2ee-cli verify --cancel={id}\n\
+         If the person confirms they match exactly, run:\n  matrix-e2ee-cli verify --confirm {token}\n\
+         If they do not match, run:\n  matrix-e2ee-cli verify --cancel {token}\n\
          Waiting for the decision (the verification gives up {timeout} s after it started).\n",
-        term(other_device)
+        term_id(other_device)
     )
+}
+
+/// The error after a failed `confirm()`. When the SAS is done anyway (the
+/// other side's MAC arrived first), the device is trusted locally: say so,
+/// and do not claim a cancellation.
+fn confirm_failure(
+    err: anyhow::Error,
+    verified_locally: bool,
+    other_device: &str,
+) -> anyhow::Error {
+    if verified_locally {
+        err.context(format!(
+            "device {} is verified locally; the confirmation was not delivered to it",
+            term_id(other_device)
+        ))
+    } else {
+        err.context("cannot send the confirmation; verification cancelled")
+    }
+}
+
+/// What ended the verification flow.
+#[derive(Debug)]
+enum Stop<T> {
+    Finished(T),
+    TimedOut,
+    Interrupted(&'static str),
+}
+
+/// Run `flow` until it finishes, `limit` passes or `stop` resolves; the
+/// flow is dropped in the last two cases (its hand-over files go with it).
+async fn run_until_stopped<F: Future>(
+    flow: F,
+    limit: Duration,
+    stop: impl Future<Output = &'static str>,
+) -> Stop<F::Output> {
+    tokio::select! {
+        biased;
+        signal = stop => Stop::Interrupted(signal),
+        result = tokio::time::timeout(limit, flow) => match result {
+            Ok(output) => Stop::Finished(output),
+            Err(_) => Stop::TimedOut,
+        },
+    }
+}
+
+/// SIGINT or SIGTERM (Ctrl-C on Windows); never resolves when the handlers
+/// cannot be installed.
+async fn termination_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut interrupt), Ok(mut terminate)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "Ctrl-C",
+            Err(_) => std::future::pending().await,
+        }
+    }
 }
 
 /// Wait until a decision for `pending` was handed over; true for confirm.
@@ -292,11 +420,11 @@ async fn list_devices(json: bool) -> Result<()> {
 }
 
 pub async fn run(args: VerifyArgs) -> Result<()> {
-    if let Some(id) = &args.confirm {
-        return decide(id.as_deref(), Decision::Confirm);
+    if let Some(token) = &args.confirm {
+        return decide(token, Decision::Confirm);
     }
-    if let Some(id) = &args.cancel {
-        return decide(id.as_deref(), Decision::Cancel);
+    if let Some(token) = &args.cancel {
+        return decide(token, Decision::Cancel);
     }
     if args.list {
         return list_devices(args.json).await;
@@ -365,9 +493,20 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
 
     let current: Arc<Mutex<Option<VerificationRequest>>> = Arc::default();
     let flow = flow(&client, &own_user, &args, &mut rx, current.clone(), &answer);
-    let outcome = match tokio::time::timeout(Duration::from_secs(args.timeout), flow).await {
-        Ok(result) => result,
-        Err(_) => {
+    // Without a person at the terminal, SIGINT and SIGTERM take the
+    // timeout's path: cancel, remove the hand-over files, trust nothing.
+    let stop = async {
+        match &answer {
+            Answer::HandOver { .. } => termination_signal().await,
+            Answer::Prompt => std::future::pending().await,
+        }
+    };
+    let outcome = match run_until_stopped(flow, Duration::from_secs(args.timeout), stop).await {
+        Stop::Finished(result) => result,
+        Stop::Interrupted(signal) => Err(anyhow::anyhow!(
+            "verification interrupted by {signal}; cancelled, nothing was trusted"
+        )),
+        Stop::TimedOut => {
             let pending = current.lock().ok().and_then(|slot| slot.clone());
             if let Some(request) = pending {
                 best_effort(request.cancel(), CANCEL_LIMIT).await;
@@ -619,19 +758,26 @@ async fn run_sas(sas: &SasVerification, flow_id: &str, how: &Answer) -> Result<(
                             );
                         };
                         let other = sas.other_device().device_id().as_str();
-                        let comparison = comparison_record(flow_id, other, &emojis.emojis);
-                        let published = Pending::publish(dir, &comparison)
-                            .and_then(|p| Ok((p, json_line(&comparison)?)));
-                        let (pending, line) = match published {
-                            Ok(published) => published,
+                        let pending = match Pending::publish(
+                            dir,
+                            flow_id,
+                            other,
+                            emoji_items(&emojis.emojis),
+                        ) {
+                            Ok(pending) => _published.insert(pending),
                             Err(err) => {
                                 sas.cancel().await.ok();
                                 return Err(err.context("verification cancelled"));
                             }
                         };
-                        let pending = _published.insert(pending);
-                        println!("{line}");
-                        eprint!("{}", hand_over_instructions(flow_id, other, *timeout));
+                        if let Err(err) = emit_line(&mut std::io::stdout(), pending.line()) {
+                            sas.cancel().await.ok();
+                            return Err(err.context("verification cancelled"));
+                        }
+                        eprint!(
+                            "{}",
+                            hand_over_instructions(pending.token(), other, *timeout)
+                        );
                         answer_unless_ended(wait_for_decision(pending), &mut changes, ends).await
                     }
                 };
@@ -656,9 +802,15 @@ async fn run_sas(sas: &SasVerification, flow_id: &str, how: &Answer) -> Result<(
                     }
                     (true, Answer::HandOver { .. }) => {
                         if let Err(err) = sas.confirm().await {
-                            sas.cancel().await.ok();
-                            return Err(anyhow::Error::new(err)
-                                .context("cannot send the confirmation; verification cancelled"));
+                            let verified_locally = sas.is_done();
+                            if !verified_locally {
+                                sas.cancel().await.ok();
+                            }
+                            return Err(confirm_failure(
+                                anyhow::Error::new(err),
+                                verified_locally,
+                                sas.other_device().device_id().as_str(),
+                            ));
                         }
                         eprintln!("Confirmed; waiting for the other device.");
                     }
@@ -675,7 +827,7 @@ async fn run_sas(sas: &SasVerification, flow_id: &str, how: &Answer) -> Result<(
             SasState::Done { .. } => {
                 how.report(&format!(
                     "Verification done: device {} is verified.",
-                    term(sas.other_device().device_id().as_str())
+                    term_id(sas.other_device().device_id().as_str())
                 ));
                 return Ok(());
             }
@@ -790,40 +942,143 @@ mod tests {
                 description: "Cat",
             },
         ];
-        let line = json_line(&comparison_record("tx1", "PHONE", &emojis)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = Pending::publish(tmp.path(), "tx1", "PHONE", emoji_items(&emojis)).unwrap();
+        let token = pending.token();
         assert_eq!(
-            line,
-            r#"{"transaction_id":"tx1","other_device":"PHONE","emojis":[{"symbol":"🐶","description":"Dog"},{"symbol":"\u001b[2J","description":"Cat"}]}"#
+            pending.line(),
+            format!(
+                r#"{{"transaction_id":"tx1","other_device":"PHONE","emojis":[{{"symbol":"🐶","description":"Dog"}},{{"symbol":"\u001b[2J","description":"Cat"}}],"token":"{token}"}}"#
+            )
         );
-        let text = hand_over_instructions("tx\u{1b}1", "PHONE", 180);
-        assert!(text.contains("verify --confirm='tx\u{FFFD}1'\n"), "{text}");
-        assert!(text.contains("verify --cancel='tx\u{FFFD}1'\n"), "{text}");
-        assert!(!text.contains('\u{1b}'), "{text}");
-        // An id the requesting device chose stays one quoted argument.
-        let text = hand_over_instructions("x'; rm -rf ~; '", "PHONE", 180);
+        let text = hand_over_instructions(token, "PH\u{1b}\u{202E}ONE", 180);
         assert!(
-            text.contains(r"verify --confirm='x'\''; rm -rf ~; '\'''"),
+            text.contains(&format!("verify --confirm {token}\n")),
             "{text}"
         );
+        assert!(
+            text.contains(&format!("verify --cancel {token}\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains("device PH\u{FFFD}\u{FFFD}ONE shows"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn bidi_controls_are_replaced_in_ids() {
+        let shown = term_id(
+            "a\u{202A}b\u{202B}c\u{202C}d\u{202D}e\u{202E}f\u{2066}g\u{2067}h\u{2068}i\u{2069}j\u{1b}k",
+        );
+        assert_eq!(
+            shown,
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e\u{FFFD}f\u{FFFD}g\u{FFFD}h\u{FFFD}i\u{FFFD}j\u{FFFD}k"
+        );
+        assert_eq!(term_id("ABCDEF"), "ABCDEF");
+    }
+
+    #[test]
+    fn a_closed_stdout_is_an_error_not_a_panic() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        assert!(emit_line(&mut Closed, "{}").is_err());
+        let mut out = Vec::new();
+        emit_line(&mut out, "{\"a\":1}").unwrap();
+        assert_eq!(out, b"{\"a\":1}\n");
+    }
+
+    #[tokio::test]
+    async fn a_signal_stops_the_flow_like_a_timeout() {
+        let stopped = within_5s(
+            "the signal did not stop the flow",
+            run_until_stopped(
+                std::future::pending::<()>(),
+                Duration::from_secs(60),
+                async { "SIGTERM" },
+            ),
+        )
+        .await;
+        assert!(
+            matches!(stopped, Stop::Interrupted("SIGTERM")),
+            "{stopped:?}"
+        );
+        let timed_out = within_5s(
+            "the timeout did not stop the flow",
+            run_until_stopped(
+                std::future::pending::<()>(),
+                Duration::from_millis(20),
+                std::future::pending(),
+            ),
+        )
+        .await;
+        assert!(matches!(timed_out, Stop::TimedOut), "{timed_out:?}");
+        let finished =
+            run_until_stopped(async { 7 }, Duration::from_secs(60), std::future::pending()).await;
+        assert!(matches!(finished, Stop::Finished(7)), "{finished:?}");
+    }
+
+    #[test]
+    fn a_failed_confirmation_after_done_reports_verified_locally() {
+        let err = confirm_failure(anyhow::anyhow!("send failed"), true, "PHONE");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("verified locally"), "{msg}");
+        assert!(!msg.contains("cancelled"), "{msg}");
+        let err = confirm_failure(anyhow::anyhow!("send failed"), false, "PHONE");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("verification cancelled"), "{msg}");
+        assert!(!msg.contains("verified locally"), "{msg}");
+    }
+
+    #[test]
+    fn decide_reports_what_the_waiting_process_did() {
+        use Decision::{Cancel, Confirm};
+        let report = |sent, taken| taken_report(sent, taken, "tx1", "PHONE", 42);
+        assert!(
+            report(Confirm, Some(Taken::Confirm))
+                .unwrap()
+                .contains("took the confirmation")
+        );
+        assert!(
+            report(Cancel, Some(Taken::Cancel))
+                .unwrap()
+                .contains("took the cancellation")
+        );
+        for (sent, taken) in [
+            (Cancel, Some(Taken::Confirm)),
+            (Confirm, Some(Taken::Cancel)),
+            (Confirm, Some(Taken::Ignored)),
+            (Cancel, None),
+        ] {
+            assert!(report(sent, taken).is_err(), "{sent:?} {taken:?}");
+        }
+        let late = report(Cancel, None).unwrap_err().to_string();
+        assert!(late.contains("did not acknowledge"), "{late}");
     }
 
     #[tokio::test]
     async fn the_wait_ends_only_with_a_handed_over_decision() {
         let tmp = tempfile::tempdir().unwrap();
-        let comparison = comparison_record("tx1", "PHONE", &[]);
-        let pending = Pending::publish(tmp.path(), &comparison).unwrap();
+        let pending = Pending::publish(tmp.path(), "tx1", "PHONE", Vec::new()).unwrap();
         let undecided =
             tokio::time::timeout(Duration::from_millis(600), wait_for_decision(&pending)).await;
         assert!(
             undecided.is_err(),
             "decided without a hand-over: {undecided:?}"
         );
-        hand_over(tmp.path(), None, Decision::Cancel).unwrap();
+        hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap();
         let answer = within_5s("the cancel was not read", wait_for_decision(&pending)).await;
         assert!(!answer.unwrap());
         drop(pending);
-        let pending = Pending::publish(tmp.path(), &comparison).unwrap();
-        hand_over(tmp.path(), None, Decision::Confirm).unwrap();
+        let pending = Pending::publish(tmp.path(), "tx1", "PHONE", Vec::new()).unwrap();
+        hand_over(tmp.path(), pending.token(), Decision::Confirm).unwrap();
         let answer = within_5s("the confirm was not read", wait_for_decision(&pending)).await;
         assert!(answer.unwrap());
     }
