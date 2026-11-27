@@ -179,6 +179,8 @@ impl Pending {
 
     /// The decision for this comparison, once one was handed over. A file
     /// under this name that names another transaction is removed, not used.
+    /// Once a decision is read, the emoji file goes too: the verification
+    /// no longer waits, so a later --confirm or --cancel finds nothing.
     pub fn poll(&self) -> Result<Option<Decision>> {
         let Some(text) = read_private(&self.decision_file)? else {
             return Ok(None);
@@ -191,6 +193,7 @@ impl Pending {
         if file.transaction_id != self.transaction_id {
             return Ok(None);
         }
+        let _ = fs::remove_file(&self.emoji_file);
         Ok(Some(file.decision))
     }
 }
@@ -340,6 +343,8 @@ mod tests {
         assert_eq!(target.comparison.transaction_id, "tx1");
         assert_eq!(target.pid, std::process::id());
         assert_eq!(pending.poll().unwrap(), Some(Decision::Confirm));
+        // Decided: a later --cancel must not report a hand-over nobody reads.
+        assert!(hand_over(tmp.path(), None, Decision::Cancel).is_err());
     }
 
     #[test]

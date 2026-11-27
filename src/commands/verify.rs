@@ -186,11 +186,13 @@ fn comparison_record(transaction_id: &str, other_device: &str, emojis: &[Emoji])
 
 /// How to answer, on stderr, after the emoji line.
 fn hand_over_instructions(transaction_id: &str, other_device: &str, timeout: u64) -> String {
-    let id = term(transaction_id);
+    // In --listen the requesting device chose the id: quote it for the shell
+    // (as one argument; --confirm=... keeps a leading dash a value).
+    let id = format!("'{}'", term(transaction_id).replace('\'', r"'\''"));
     format!(
         "Compare the emoji on stdout with the ones device {} shows.\n\
-         If the person confirms they match exactly, run:\n  matrix-e2ee-cli verify --confirm {id}\n\
-         If they do not match, run:\n  matrix-e2ee-cli verify --cancel {id}\n\
+         If the person confirms they match exactly, run:\n  matrix-e2ee-cli verify --confirm={id}\n\
+         If they do not match, run:\n  matrix-e2ee-cli verify --cancel={id}\n\
          Waiting for the decision (the verification gives up {timeout} s after it started).\n",
         term(other_device)
     )
@@ -794,9 +796,15 @@ mod tests {
             r#"{"transaction_id":"tx1","other_device":"PHONE","emojis":[{"symbol":"🐶","description":"Dog"},{"symbol":"\u001b[2J","description":"Cat"}]}"#
         );
         let text = hand_over_instructions("tx\u{1b}1", "PHONE", 180);
-        assert!(text.contains("verify --confirm tx\u{FFFD}1\n"), "{text}");
-        assert!(text.contains("verify --cancel tx\u{FFFD}1\n"), "{text}");
+        assert!(text.contains("verify --confirm='tx\u{FFFD}1'\n"), "{text}");
+        assert!(text.contains("verify --cancel='tx\u{FFFD}1'\n"), "{text}");
         assert!(!text.contains('\u{1b}'), "{text}");
+        // An id the requesting device chose stays one quoted argument.
+        let text = hand_over_instructions("x'; rm -rf ~; '", "PHONE", 180);
+        assert!(
+            text.contains(r"verify --confirm='x'\''; rm -rf ~; '\'''"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -813,6 +821,8 @@ mod tests {
         hand_over(tmp.path(), None, Decision::Cancel).unwrap();
         let answer = within_5s("the cancel was not read", wait_for_decision(&pending)).await;
         assert!(!answer.unwrap());
+        drop(pending);
+        let pending = Pending::publish(tmp.path(), &comparison).unwrap();
         hand_over(tmp.path(), None, Decision::Confirm).unwrap();
         let answer = within_5s("the confirm was not read", wait_for_decision(&pending)).await;
         assert!(answer.unwrap());
