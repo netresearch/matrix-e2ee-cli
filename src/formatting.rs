@@ -400,6 +400,9 @@ pub fn add_bot_prefix(message: &str, prefix: &str) -> Result<String> {
 /// `inject_pills`: the first plain `@localpart` or `localpart` of each user
 /// becomes a pill link, for the HTML body only. A name that is not in the
 /// text is not inserted; one already pilled by hand is left alone.
+///
+/// Deviates from formatting.py, which matches inside a word ("malice") and
+/// inside earlier pills: here only at a token boundary, outside any link.
 pub fn inject_pills(markdown: &str, user_ids: &[String]) -> Result<String> {
     let mut markdown = markdown.to_owned();
     for user_id in user_ids {
@@ -411,14 +414,33 @@ pub fn inject_pills(markdown: &str, user_ids: &[String]) -> Result<String> {
             .next()
             .unwrap_or_default()
             .trim_start_matches('@');
-        let pattern =
-            RegexBuilder::new(&format!(r"(?<!\]\()@?{}\b", fancy_regex::escape(localpart)))
-                .backtrack_limit(BACKTRACK_LIMIT)
-                .build()
-                .context("cannot build the mention pattern")?;
-        markdown = sub(&pattern, &markdown, 1, |_| {
-            format!("[{localpart}]({MATRIX_TO}{user_id})")
-        })?;
+        let pattern = RegexBuilder::new(&format!(
+            r"(?<![\w@])@?{}\b",
+            fancy_regex::escape(localpart)
+        ))
+        .backtrack_limit(BACKTRACK_LIMIT)
+        .build()
+        .context("cannot build the mention pattern")?;
+        // Links and pills, those of earlier users included, are left alone.
+        let mut links = Vec::new();
+        for link in MD_LINK.find_iter(&markdown) {
+            let link = link.context("cannot find the links of the message")?;
+            links.push(link.start()..link.end());
+        }
+        let mut hit = None;
+        for found in pattern.find_iter(&markdown) {
+            let found = found.context("cannot find the mention")?;
+            if !links
+                .iter()
+                .any(|l| found.start() < l.end && l.start < found.end())
+            {
+                hit = Some(found.start()..found.end());
+                break;
+            }
+        }
+        if let Some(range) = hit {
+            markdown.replace_range(range, &format!("[{localpart}]({MATRIX_TO}{user_id})"));
+        }
     }
     Ok(markdown)
 }
@@ -440,24 +462,96 @@ mod tests {
             .collect()
     }
 
+    /// Fixture cases where this port deliberately differs from
+    /// formatting.py: (name, reason, the HTML this port renders).
+    const DEVIATIONS: &[(&str, &str, &str)] = &[
+        (
+            "pill dotted localpart",
+            "a later mention must not replace text inside an earlier pill",
+            "ping <a href=\"https://matrix.to/#/@bjoern.marten:example.org\">bjoern.marten</a> and <a href=\"https://matrix.to/#/@bjoern:example.org\">bjoern</a>",
+        ),
+        (
+            "pill inside a longer word",
+            "a localpart matches only at a token boundary, not inside a word",
+            "malice and <a href=\"https://matrix.to/#/@alice:example.org\">alice</a>",
+        ),
+    ];
+
     #[test]
     fn renders_like_formatting_py() {
         let fixture = fixture();
         let cases = fixture["render"].as_array().unwrap();
         assert!(cases.len() > 50, "the corpus is incomplete");
         let mut differ = Vec::new();
+        let mut deviations_seen = 0;
         for case in cases {
+            let name = case["name"].as_str().unwrap();
             let text = case["text"].as_str().unwrap();
+            let python = case["html"].as_str().unwrap();
             let mentions = strings(&case["mentions"]);
             let got = markdown_to_html(&inject_pills(text, &mentions).unwrap()).unwrap();
-            if got != case["html"].as_str().unwrap() {
+            let expected = match DEVIATIONS.iter().find(|(n, _, _)| *n == name) {
+                Some((_, reason, rust)) => {
+                    deviations_seen += 1;
+                    assert_ne!(
+                        python, *rust,
+                        "{name}: listed as a deviation ({reason}), but Python renders the same"
+                    );
+                    *rust
+                }
+                None => python,
+            };
+            if got != expected {
                 differ.push(format!(
-                    "{}:\n  python: {:?}\n  rust:   {got:?}",
-                    case["name"], case["html"]
+                    "{name}:\n  expected: {expected:?}\n  rust:     {got:?}"
                 ));
             }
         }
+        assert_eq!(
+            deviations_seen,
+            DEVIATIONS.len(),
+            "a listed deviation is not in the fixture"
+        );
         assert!(differ.is_empty(), "{}", differ.join("\n"));
+    }
+
+    #[test]
+    fn a_pill_needs_a_token_boundary() {
+        let alice = ["@alice:example.org".to_owned()];
+        assert_eq!(
+            inject_pills("malice and alice", &alice).unwrap(),
+            "malice and [alice](https://matrix.to/#/@alice:example.org)"
+        );
+        assert_eq!(
+            inject_pills("hi @alice!", &alice).unwrap(),
+            "hi [alice](https://matrix.to/#/@alice:example.org)!"
+        );
+        assert_eq!(
+            inject_pills("alice first", &alice).unwrap(),
+            "[alice](https://matrix.to/#/@alice:example.org) first"
+        );
+        assert_eq!(
+            inject_pills("bob@alice.org", &alice).unwrap(),
+            "bob@alice.org"
+        );
+    }
+
+    #[test]
+    fn a_later_mention_leaves_earlier_pills_and_links_alone() {
+        let users = [
+            "@bjoern.marten:example.org".to_owned(),
+            "@bjoern:example.org".to_owned(),
+        ];
+        assert_eq!(
+            inject_pills("ping bjoern.marten and bjoern", &users).unwrap(),
+            "ping [bjoern.marten](https://matrix.to/#/@bjoern.marten:example.org) and [bjoern](https://matrix.to/#/@bjoern:example.org)"
+        );
+        // A link written by hand is no place for a pill either.
+        let bob = ["@bob:example.org".to_owned()];
+        assert_eq!(
+            inject_pills("[bob's notes](https://example.org/bob) by bob", &bob).unwrap(),
+            "[bob's notes](https://example.org/bob) by [bob](https://matrix.to/#/@bob:example.org)"
+        );
     }
 
     #[test]

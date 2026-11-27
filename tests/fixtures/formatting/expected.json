@@ -264,6 +264,14 @@
    "html": "hi <a href=\"https://matrix.to/#/@a+b:example.org\">a+b</a> and <a href=\"https://matrix.to/#/@a.b:example.org\">a.b</a>"
   },
   {
+   "name": "pill inside a longer word",
+   "text": "malice and alice",
+   "mentions": [
+    "@alice:example.org"
+   ],
+   "html": "m<a href=\"https://matrix.to/#/@alice:example.org\">alice</a> and alice"
+  },
+  {
    "name": "pill inside markdown",
    "text": "**alice** said `alice`",
    "mentions": [

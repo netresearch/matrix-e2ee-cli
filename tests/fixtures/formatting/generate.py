@@ -65,6 +65,7 @@ MENTIONS = [
     ("pill duplicate mention", "hi alice", ["@alice:example.org", "@alice:example.org"]),
     ("pill word boundary", "alicex alice_ alice", ["@alice:example.org"]),
     ("pill regex characters", "hi a+b and a.b", ["@a+b:example.org", "@a.b:example.org"]),
+    ("pill inside a longer word", "malice and alice", ["@alice:example.org"]),
     ("pill inside markdown", "**alice** said `alice`", ["@alice:example.org"]),
 ]
 
