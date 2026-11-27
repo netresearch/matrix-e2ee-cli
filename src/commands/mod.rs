@@ -3,6 +3,7 @@
 pub mod backup;
 pub mod download;
 pub mod edit;
+pub mod fetch_keys;
 pub mod login;
 pub mod logout;
 // Unix only: the matrix-skill's nio store and its flock exist on Linux and

@@ -47,8 +47,11 @@ enum Command {
     Verify(VerifyArgs),
     /// Send a message (encrypted if the room is encrypted).
     Send(SendArgs),
-    /// Read the last messages of a room, decrypted.
+    /// Read the last messages of a room, decrypted, newest first.
     Read(ReadArgs),
+    /// Ask your other devices for the room keys of the messages this device
+    /// cannot decrypt, then sync to receive them.
+    FetchKeys(FetchKeysArgs),
     /// Edit one of your own messages (encrypted if the room is encrypted).
     Edit(EditArgs),
     /// Add, remove, swap or list your own reactions on a message.
@@ -136,11 +139,29 @@ pub struct ReadArgs {
     /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
     pub room: String,
     /// Number of timeline events to fetch (non-message events are skipped).
-    #[arg(long, default_value_t = 10)]
+    #[arg(short = 'l', long, default_value_t = 10)]
     pub limit: u32,
-    /// Print one JSON object per line.
+    /// Print the messages as one JSON array (matrix-read-e2ee.py's format).
     #[arg(long)]
     pub json: bool,
+    /// For undecryptable messages: wait and sync 6 times (5 s each, plus up
+    /// to 5 s per sync) so the key requests reach your other devices and
+    /// their keys arrive, then read again.
+    /// matrix-sdk asks only when one of your other devices is verified.
+    #[arg(short = 'k', long)]
+    pub request_keys: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FetchKeysArgs {
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
+    pub room: String,
+    /// Number of timeline events to scan.
+    #[arg(long, default_value_t = 100)]
+    pub limit: u32,
+    /// Seconds to sync and wait for keys from your other devices.
+    #[arg(long, default_value_t = 60, value_name = "SECONDS")]
+    pub sync_time: u64,
 }
 
 #[derive(Debug, Args)]
@@ -283,6 +304,7 @@ async fn main() {
         Command::Verify(args) => commands::verify::run(args).await,
         Command::Send(args) => commands::send::run(args).await,
         Command::Read(args) => commands::read::run(args).await,
+        Command::FetchKeys(args) => commands::fetch_keys::run(args).await,
         Command::Edit(args) => commands::edit::run(args).await,
         Command::React(args) => commands::react::run(args).await,
         Command::Redact(args) => commands::redact::run(args).await,
@@ -338,6 +360,69 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn read_takes_the_callers_arguments() {
+        // netresearch-jira claiming-a-ticket.md, through the thin
+        // matrix-read-e2ee.py: '#it:netresearch.de' --limit 400 --json
+        let Command::Read(args) = Cli::try_parse_from([
+            "m",
+            "read",
+            "#it:netresearch.de",
+            "--limit",
+            "400",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("not read")
+        };
+        assert_eq!(
+            (args.room.as_str(), args.limit, args.json, args.request_keys),
+            ("#it:netresearch.de", 400, true, false)
+        );
+        // it-maintenance ticket-flow.py: ROOM --limit N --json
+        assert!(Cli::try_parse_from(["m", "read", "!r:e", "--limit", "20", "--json"]).is_ok());
+        // Python's short forms and default.
+        let Command::Read(args) = Cli::try_parse_from(["m", "read", "r", "-l", "5", "-k"])
+            .unwrap()
+            .command
+        else {
+            panic!("not read")
+        };
+        assert_eq!((args.limit, args.request_keys, args.json), (5, true, false));
+        let Command::Read(args) = Cli::try_parse_from(["m", "read", "r"]).unwrap().command else {
+            panic!("not read")
+        };
+        assert_eq!((args.limit, args.request_keys), (10, false));
+        assert!(Cli::try_parse_from(["m", "read", "r", "--request-keys"]).is_ok());
+    }
+
+    #[test]
+    fn fetch_keys_takes_pythons_options() {
+        // matrix-fetch-keys.py ROOM --sync-time 60 (the skill's CLAUDE.md)
+        let Command::FetchKeys(args) =
+            Cli::try_parse_from(["m", "fetch-keys", "ROOM", "--sync-time", "60"])
+                .unwrap()
+                .command
+        else {
+            panic!("not fetch-keys")
+        };
+        assert_eq!(
+            (args.room.as_str(), args.limit, args.sync_time),
+            ("ROOM", 100, 60)
+        );
+        let Command::FetchKeys(args) =
+            Cli::try_parse_from(["m", "fetch-keys", "r", "--limit", "50", "--sync-time", "5"])
+                .unwrap()
+                .command
+        else {
+            panic!("not fetch-keys")
+        };
+        assert_eq!((args.limit, args.sync_time), (50, 5));
+        assert!(Cli::try_parse_from(["m", "fetch-keys"]).is_err());
     }
 
     #[test]
