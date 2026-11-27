@@ -2,9 +2,16 @@
 //!
 //! A sync loop runs in the background for the whole flow, because every
 //! verification step arrives as a to-device event.
+//!
+//! With a terminal on stdin and stderr, a person confirms the emoji at the
+//! prompt. Without one (an agent runs the command), the emoji go to stdout as
+//! one JSON line and to an owner-only file, and the verification is confirmed
+//! only after a second process, `verify --confirm`, handed over the person's
+//! decision; the CLI never confirms on its own.
 
 use std::future::Future;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,13 +25,17 @@ use matrix_sdk::encryption::verification::{
 };
 use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
 use matrix_sdk::ruma::{OwnedDeviceId, OwnedUserId};
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::VerifyArgs;
+use crate::commands::verify_handover::{
+    Comparison, Decision, EmojiItem, Pending, hand_over, handover_dir, sweep,
+};
 use crate::commands::{confirm_fresh_on, discard_typeahead_stdin, sync_once};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
-use crate::text::term;
+use crate::text::{json_line, term};
 
 const MATCH_QUESTION: &str = "Do they match exactly?";
 
@@ -94,23 +105,220 @@ const SETTLE_TIME: Duration = Duration::from_secs(5);
 /// How long the cancellation after a timeout may take.
 const CANCEL_LIMIT: Duration = Duration::from_secs(10);
 
+/// How often a waiting verification looks for a handed-over decision.
+const DECISION_POLL: Duration = Duration::from_millis(250);
+
 /// Run a best-effort step for at most `limit`: a responsive server still
 /// gets it, a stalled one cannot keep the command from ending.
 async fn best_effort(step: impl Future, limit: Duration) {
     let _ = tokio::time::timeout(limit, step).await;
 }
 
-pub async fn run(args: VerifyArgs) -> Result<()> {
-    // stdin: the answer comes from a person. stderr: the emoji and the
-    // question are shown to that person, not written to a file.
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        bail!(
-            "verify needs a terminal on stdin and stderr: the emoji comparison must be seen and confirmed by a person; no verification was started"
-        );
+/// Who confirms the emoji.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirmer {
+    /// A person at the terminal (stdin and stderr are terminals).
+    Person,
+    /// An agent: the decision comes from `verify --confirm` / `--cancel`.
+    Agent,
+}
+
+/// stdin: the person's answer. stderr: the emoji and the question. Both
+/// must be a terminal for the prompt; otherwise the agent hand-over is used.
+fn confirmer(stdin_is_terminal: bool, stderr_is_terminal: bool) -> Confirmer {
+    if stdin_is_terminal && stderr_is_terminal {
+        Confirmer::Person
+    } else {
+        Confirmer::Agent
     }
+}
+
+/// How the waiting process gets the answer.
+enum Answer {
+    Prompt,
+    HandOver { dir: PathBuf, timeout: u64 },
+}
+
+impl Answer {
+    /// The result lines: stdout at a terminal, as before; stderr for an
+    /// agent, whose stdout carries only the emoji line.
+    fn report(&self, line: &str) {
+        match self {
+            Answer::Prompt => println!("{line}"),
+            Answer::HandOver { .. } => eprintln!("{line}"),
+        }
+    }
+}
+
+/// `verify --confirm` / `--cancel`: hand the decision to the waiting
+/// process. Takes neither the data-directory lock (the waiting process holds
+/// it) nor the store.
+fn decide(transaction_id: Option<&str>, decision: Decision) -> Result<()> {
+    let paths = Paths::from_env()?;
+    let target = hand_over(&handover_dir(&paths.data_dir), transaction_id, decision)?;
+    eprintln!(
+        "Handed {} to verification {} with device {} (process {}); that process reports the result.",
+        match decision {
+            Decision::Confirm => "the confirmation",
+            Decision::Cancel => "the cancellation",
+        },
+        term(&target.comparison.transaction_id),
+        term(&target.comparison.other_device),
+        target.pid
+    );
+    Ok(())
+}
+
+/// The JSON line for the emoji of transaction `transaction_id`.
+fn comparison_record(transaction_id: &str, other_device: &str, emojis: &[Emoji]) -> Comparison {
+    Comparison {
+        transaction_id: transaction_id.to_owned(),
+        other_device: other_device.to_owned(),
+        emojis: emojis
+            .iter()
+            .map(|e| EmojiItem {
+                symbol: e.symbol.to_owned(),
+                description: e.description.to_owned(),
+            })
+            .collect(),
+    }
+}
+
+/// How to answer, on stderr, after the emoji line.
+fn hand_over_instructions(transaction_id: &str, other_device: &str, timeout: u64) -> String {
+    let id = term(transaction_id);
+    format!(
+        "Compare the emoji on stdout with the ones device {} shows.\n\
+         If the person confirms they match exactly, run:\n  matrix-e2ee-cli verify --confirm {id}\n\
+         If they do not match, run:\n  matrix-e2ee-cli verify --cancel {id}\n\
+         Waiting for the decision (the verification gives up {timeout} s after it started).\n",
+        term(other_device)
+    )
+}
+
+/// Wait until a decision for `pending` was handed over; true for confirm.
+async fn wait_for_decision(pending: &Pending) -> Result<bool> {
+    loop {
+        if let Some(decision) = pending.poll()? {
+            return Ok(decision == Decision::Confirm);
+        }
+        tokio::time::sleep(DECISION_POLL).await;
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceRow {
+    device_id: String,
+    display_name: Option<String>,
+    verified: bool,
+    is_current: bool,
+}
+
+/// `verify --list`: the lines to print, as matrix-e2ee-verify.py `--list`
+/// with a verified column, or one JSON object per device.
+fn device_lines(rows: &[DeviceRow], json: bool) -> Result<Vec<String>> {
+    if json {
+        return rows
+            .iter()
+            .map(|row| json_line(row).map_err(Into::into))
+            .collect();
+    }
+    let mut lines = vec!["Your devices:".to_owned()];
+    for row in rows {
+        lines.push(format!(
+            "  {}: {} [{}]{}",
+            term(&row.device_id),
+            term(row.display_name.as_deref().unwrap_or("No name")),
+            if row.verified {
+                "verified"
+            } else {
+                "not verified"
+            },
+            if row.is_current {
+                " ← this device"
+            } else {
+                ""
+            }
+        ));
+    }
+    Ok(lines)
+}
+
+async fn list_devices(json: bool) -> Result<()> {
     let config = load_config()?;
     let paths = Paths::from_env()?;
     let _lock = paths.lock().await?;
+    let client = restore(&config, &paths, KeySharing::VerifiedOnly)
+        .await?
+        .client;
+    let own_user = client
+        .user_id()
+        .context("no user id after restore")?
+        .to_owned();
+    // Device keys, and with them the verification state, arrive with a sync.
+    sync_once(&client).await?;
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
+    let devices = client
+        .devices()
+        .await
+        .context("cannot list the devices")?
+        .devices;
+    let mut rows = Vec::new();
+    for device in devices {
+        let verified = client
+            .encryption()
+            .get_device(&own_user, &device.device_id)
+            .await?
+            .is_some_and(|d| d.is_verified());
+        rows.push(DeviceRow {
+            is_current: client.device_id() == Some(&*device.device_id),
+            device_id: device.device_id.to_string(),
+            display_name: device.display_name,
+            verified,
+        });
+    }
+    if rows.is_empty() {
+        bail!("the server lists no devices for {own_user}");
+    }
+    for line in device_lines(&rows, json)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+pub async fn run(args: VerifyArgs) -> Result<()> {
+    if let Some(id) = &args.confirm {
+        return decide(id.as_deref(), Decision::Confirm);
+    }
+    if let Some(id) = &args.cancel {
+        return decide(id.as_deref(), Decision::Cancel);
+    }
+    if args.list {
+        return list_devices(args.json).await;
+    }
+    let who = confirmer(
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    );
+    let config = load_config()?;
+    let paths = Paths::from_env()?;
+    let _lock = paths.lock().await?;
+    let answer = match who {
+        Confirmer::Person => Answer::Prompt,
+        Confirmer::Agent => {
+            let dir = handover_dir(&paths.data_dir);
+            // This process holds the lock: no other one waits, so whatever
+            // is in the directory was left by a process that ended.
+            sweep(&dir)?;
+            Answer::HandOver {
+                dir,
+                timeout: args.timeout,
+            }
+        }
+    };
     let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
     let client = restored.client;
     let own_user: OwnedUserId = client
@@ -154,7 +362,7 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
     });
 
     let current: Arc<Mutex<Option<VerificationRequest>>> = Arc::default();
-    let flow = flow(&client, &own_user, &args, &mut rx, current.clone());
+    let flow = flow(&client, &own_user, &args, &mut rx, current.clone(), &answer);
     let outcome = match tokio::time::timeout(Duration::from_secs(args.timeout), flow).await {
         Ok(result) => result,
         Err(_) => {
@@ -168,13 +376,21 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
             ))
         }
     };
+    // Without a person at the terminal, any failure cancels what is still
+    // open: nothing is trusted unless a handed-over confirm completed.
+    if outcome.is_err() && matches!(answer, Answer::HandOver { .. }) {
+        let pending = current.lock().ok().and_then(|slot| slot.clone());
+        if let Some(request) = pending.filter(|r| !r.is_done() && !r.is_cancelled()) {
+            best_effort(request.cancel(), CANCEL_LIMIT).await;
+        }
+    }
 
     if outcome.is_ok() {
         tokio::time::sleep(SETTLE_TIME).await;
     }
     sync_task.abort();
     outcome?;
-    print_final_state(&client).await
+    print_final_state(&client, &answer).await
 }
 
 async fn flow(
@@ -183,6 +399,7 @@ async fn flow(
     args: &VerifyArgs,
     rx: &mut mpsc::UnboundedReceiver<(OwnedUserId, String)>,
     current: Arc<Mutex<Option<VerificationRequest>>>,
+    answer: &Answer,
 ) -> Result<()> {
     let encryption = client.encryption();
     let request = if let Some(device_id) = &args.request {
@@ -250,7 +467,7 @@ async fn flow(
     }
 
     let sas = wait_for_sas(&request).await?;
-    run_sas(&sas).await
+    run_sas(&sas, request.flow_id(), answer).await
 }
 
 /// Drive the request until it turns into a SAS verification.
@@ -355,7 +572,7 @@ fn into_sas(verification: Verification) -> Result<SasVerification> {
     }
 }
 
-async fn run_sas(sas: &SasVerification) -> Result<()> {
+async fn run_sas(sas: &SasVerification, flow_id: &str, how: &Answer) -> Result<()> {
     let mut changes = sas.changes();
     let mut state = sas.state();
     if matches!(state, SasState::Started { .. }) && !sas.we_started() {
@@ -364,26 +581,59 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
             .context("cannot accept the emoji verification")?;
     }
     let mut asked = false;
+    // The agent's emoji and decision files; removed when this ends, also
+    // when a timeout drops this future.
+    let mut _published: Option<Pending> = None;
     loop {
         match &state {
             SasState::KeysExchanged { emojis, decimals } if !asked => {
                 asked = true;
-                let comparison =
-                    comparison_text(emojis.as_ref().map(|short| &short.emojis[..]), *decimals);
-                // The prompt blocks on stdin, so it runs on its own thread; a
-                // prompt abandoned here ends with the process.
-                let prompt = async {
-                    tokio::task::spawn_blocking(move || confirm_emoji(&comparison))
-                        .await
-                        .unwrap_or_else(|err| {
-                            Err(anyhow::Error::new(err).context("the prompt failed"))
-                        })
-                };
                 let ends = |state: &SasState| match state {
                     SasState::Cancelled(info) => Some(cancelled(info)),
                     _ => None,
                 };
-                let answer = match answer_unless_ended(prompt, &mut changes, ends).await {
+                let outcome = match how {
+                    Answer::Prompt => {
+                        let comparison = comparison_text(
+                            emojis.as_ref().map(|short| &short.emojis[..]),
+                            *decimals,
+                        );
+                        // The prompt blocks on stdin, so it runs on its own thread; a
+                        // prompt abandoned here ends with the process.
+                        let prompt = async {
+                            tokio::task::spawn_blocking(move || confirm_emoji(&comparison))
+                                .await
+                                .unwrap_or_else(|err| {
+                                    Err(anyhow::Error::new(err).context("the prompt failed"))
+                                })
+                        };
+                        answer_unless_ended(prompt, &mut changes, ends).await
+                    }
+                    Answer::HandOver { dir, timeout } => {
+                        let Some(emojis) = emojis else {
+                            sas.cancel().await.ok();
+                            bail!(
+                                "the other device offers numbers only, no emoji; verification cancelled"
+                            );
+                        };
+                        let other = sas.other_device().device_id().as_str();
+                        let comparison = comparison_record(flow_id, other, &emojis.emojis);
+                        let published = Pending::publish(dir, &comparison)
+                            .and_then(|p| Ok((p, json_line(&comparison)?)));
+                        let (pending, line) = match published {
+                            Ok(published) => published,
+                            Err(err) => {
+                                sas.cancel().await.ok();
+                                return Err(err.context("verification cancelled"));
+                            }
+                        };
+                        let pending = _published.insert(pending);
+                        println!("{line}");
+                        eprint!("{}", hand_over_instructions(flow_id, other, *timeout));
+                        answer_unless_ended(wait_for_decision(pending), &mut changes, ends).await
+                    }
+                };
+                let answer = match outcome {
                     PromptOutcome::Ended(err) => return Err(err),
                     PromptOutcome::Answered(Ok(answer)) => answer,
                     PromptOutcome::Answered(Err(err)) => {
@@ -395,21 +645,36 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
                 if let Some(info) = sas.cancel_info() {
                     return Err(cancelled(&info));
                 }
-                if answer {
-                    sas.confirm()
-                        .await
-                        .context("cannot send the confirmation")?;
-                    eprintln!("Confirmed; waiting for the other device.");
-                } else {
-                    sas.mismatch().await.ok();
-                    bail!("the emoji do not match; verification cancelled");
+                match (answer, how) {
+                    (true, Answer::Prompt) => {
+                        sas.confirm()
+                            .await
+                            .context("cannot send the confirmation")?;
+                        eprintln!("Confirmed; waiting for the other device.");
+                    }
+                    (true, Answer::HandOver { .. }) => {
+                        if let Err(err) = sas.confirm().await {
+                            sas.cancel().await.ok();
+                            return Err(anyhow::Error::new(err)
+                                .context("cannot send the confirmation; verification cancelled"));
+                        }
+                        eprintln!("Confirmed; waiting for the other device.");
+                    }
+                    (false, Answer::Prompt) => {
+                        sas.mismatch().await.ok();
+                        bail!("the emoji do not match; verification cancelled");
+                    }
+                    (false, Answer::HandOver { .. }) => {
+                        sas.cancel().await.ok();
+                        bail!("verification cancelled with verify --cancel; nothing was trusted");
+                    }
                 }
             }
             SasState::Done { .. } => {
-                println!(
+                how.report(&format!(
                     "Verification done: device {} is verified.",
                     term(sas.other_device().device_id().as_str())
-                );
+                ));
                 return Ok(());
             }
             SasState::Cancelled(info) => return Err(cancelled(info)),
@@ -422,14 +687,14 @@ async fn run_sas(sas: &SasVerification) -> Result<()> {
     }
 }
 
-async fn print_final_state(client: &Client) -> Result<()> {
+async fn print_final_state(client: &Client, how: &Answer) -> Result<()> {
     let own = client.encryption().get_own_device().await?;
     let yn = |b: bool| if b { "yes" } else { "no" };
-    println!(
+    how.report(&format!(
         "This device: cross-signed {}, verified {}",
         yn(own.as_ref().is_some_and(|d| d.is_cross_signed_by_owner())),
         yn(own.as_ref().is_some_and(|d| d.is_verified()))
-    );
+    ));
     Ok(())
 }
 
@@ -501,6 +766,89 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome, PromptOutcome::Ended(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn without_a_terminal_the_agent_hand_over_is_chosen() {
+        assert_eq!(confirmer(true, true), Confirmer::Person);
+        assert_eq!(confirmer(false, true), Confirmer::Agent);
+        assert_eq!(confirmer(true, false), Confirmer::Agent);
+        assert_eq!(confirmer(false, false), Confirmer::Agent);
+    }
+
+    #[test]
+    fn emoji_line_has_the_documented_keys() {
+        let emojis = [
+            Emoji {
+                symbol: "🐶",
+                description: "Dog",
+            },
+            Emoji {
+                symbol: "\u{1b}[2J",
+                description: "Cat",
+            },
+        ];
+        let line = json_line(&comparison_record("tx1", "PHONE", &emojis)).unwrap();
+        assert_eq!(
+            line,
+            r#"{"transaction_id":"tx1","other_device":"PHONE","emojis":[{"symbol":"🐶","description":"Dog"},{"symbol":"\u001b[2J","description":"Cat"}]}"#
+        );
+        let text = hand_over_instructions("tx\u{1b}1", "PHONE", 180);
+        assert!(text.contains("verify --confirm tx\u{FFFD}1\n"), "{text}");
+        assert!(text.contains("verify --cancel tx\u{FFFD}1\n"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_wait_ends_only_with_a_handed_over_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let comparison = comparison_record("tx1", "PHONE", &[]);
+        let pending = Pending::publish(tmp.path(), &comparison).unwrap();
+        let undecided =
+            tokio::time::timeout(Duration::from_millis(600), wait_for_decision(&pending)).await;
+        assert!(
+            undecided.is_err(),
+            "decided without a hand-over: {undecided:?}"
+        );
+        hand_over(tmp.path(), None, Decision::Cancel).unwrap();
+        let answer = within_5s("the cancel was not read", wait_for_decision(&pending)).await;
+        assert!(!answer.unwrap());
+        hand_over(tmp.path(), None, Decision::Confirm).unwrap();
+        let answer = within_5s("the confirm was not read", wait_for_decision(&pending)).await;
+        assert!(answer.unwrap());
+    }
+
+    #[test]
+    fn device_list_matches_matrix_e2ee_verify_py() {
+        let rows = [
+            DeviceRow {
+                device_id: "ABC".to_owned(),
+                display_name: Some("Element Desktop".to_owned()),
+                verified: true,
+                is_current: false,
+            },
+            DeviceRow {
+                device_id: "RUST".to_owned(),
+                display_name: None,
+                verified: false,
+                is_current: true,
+            },
+        ];
+        assert_eq!(
+            device_lines(&rows, false).unwrap(),
+            vec![
+                "Your devices:",
+                "  ABC: Element Desktop [verified]",
+                "  RUST: No name [not verified] ← this device",
+            ]
+        );
+        assert_eq!(
+            device_lines(&rows, true).unwrap(),
+            vec![
+                r#"{"device_id":"ABC","display_name":"Element Desktop","verified":true,"is_current":false}"#,
+                r#"{"device_id":"RUST","display_name":null,"verified":false,"is_current":true}"#,
+            ]
+        );
     }
 
     #[test]

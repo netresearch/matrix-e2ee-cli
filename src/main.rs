@@ -104,14 +104,34 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("mode").required(true).args(["request", "listen"])))]
+#[command(group(clap::ArgGroup::new("mode").required(true).args(["request", "listen", "list", "confirm", "cancel"])))]
 pub struct VerifyArgs {
     /// Start verification towards this device of your own account.
+    ///
+    /// Without a terminal on stdin and stderr, the emoji are printed as one
+    /// JSON line and the command waits for `verify --confirm` or
+    /// `verify --cancel` from a second process; it never confirms on its own.
     #[arg(long, value_name = "DEVICE_ID")]
     pub request: Option<String>,
-    /// Wait for a verification request from one of your own devices.
+    /// Wait for a verification request from one of your own devices
+    /// (without a terminal: as for --request).
     #[arg(long)]
     pub listen: bool,
+    /// List your account's devices: id, name, verified or not, this device.
+    #[arg(long)]
+    pub list: bool,
+    /// With --list: one JSON object per device.
+    #[arg(long, conflicts_with_all = ["request", "listen", "confirm", "cancel"])]
+    pub json: bool,
+    /// Confirm the emoji of a verification that waits without a terminal,
+    /// after the person compared them and said they match. Without
+    /// TRANSACTION_ID: the only waiting verification.
+    #[arg(long, value_name = "TRANSACTION_ID", num_args = 0..=1)]
+    pub confirm: Option<Option<String>>,
+    /// Cancel a verification that waits without a terminal. Without
+    /// TRANSACTION_ID: the only waiting verification.
+    #[arg(long, value_name = "TRANSACTION_ID", num_args = 0..=1)]
+    pub cancel: Option<Option<String>>,
     /// Give up after this many seconds.
     #[arg(long, default_value_t = 180, value_name = "SECONDS")]
     pub timeout: u64,
@@ -523,6 +543,49 @@ mod tests {
         assert!(Cli::try_parse_from(["m", "verify"]).is_err());
         assert!(Cli::try_parse_from(["m", "verify", "--listen", "--request", "D"]).is_err());
         assert!(Cli::try_parse_from(["m", "verify", "--listen"]).is_ok());
+    }
+
+    fn verify(a: &[&str]) -> VerifyArgs {
+        match Cli::try_parse_from([&["m", "verify"][..], a].concat())
+            .unwrap_or_else(|e| panic!("{a:?}: {e}"))
+            .command
+        {
+            Command::Verify(args) => args,
+            _ => panic!("not verify"),
+        }
+    }
+
+    #[test]
+    fn verify_accepts_the_callers_invocations() {
+        // matrix-skill CLAUDE.md: matrix-e2ee-verify.py --request DEVICE --timeout 180
+        let request = verify(&["--request", "DEVICE", "--timeout", "180"]);
+        assert_eq!(request.request.as_deref(), Some("DEVICE"));
+        assert_eq!(request.timeout, 180);
+        // matrix-e2ee-verify.py --list
+        let list = verify(&["--list"]);
+        assert!(list.list && !list.json);
+        assert!(verify(&["--list", "--json"]).json);
+        assert_eq!(verify(&["--listen"]).timeout, 180);
+    }
+
+    #[test]
+    fn verify_confirm_and_cancel_take_an_optional_transaction_id() {
+        assert_eq!(verify(&["--confirm"]).confirm, Some(None));
+        assert_eq!(
+            verify(&["--confirm", "tx1"]).confirm,
+            Some(Some("tx1".to_owned()))
+        );
+        assert_eq!(verify(&["--cancel"]).cancel, Some(None));
+        assert_eq!(
+            verify(&["--cancel", "tx1"]).cancel,
+            Some(Some("tx1".to_owned()))
+        );
+        let parse = |a: &[&str]| Cli::try_parse_from([&["m", "verify"][..], a].concat());
+        assert!(parse(&["--confirm", "--cancel"]).is_err());
+        assert!(parse(&["--confirm", "--listen"]).is_err());
+        assert!(parse(&["--list", "--request", "D"]).is_err());
+        assert!(parse(&["--json"]).is_err(), "--json only with --list");
+        assert!(parse(&["--listen", "--json"]).is_err());
     }
 
     #[test]
