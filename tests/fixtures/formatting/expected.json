@@ -1,0 +1,416 @@
+{
+ "render": [
+  {
+   "name": "heading levels",
+   "text": "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\n####### Seven",
+   "mentions": [],
+   "html": "<h1>One</h1><h2>Two</h2><h3>Three</h3><h4>Four</h4><h5>Five</h5><h6>Six</h6>####### Seven"
+  },
+  {
+   "name": "heading then text",
+   "text": "## Release 1.2\nThe text after it.\n\nA second paragraph.",
+   "mentions": [],
+   "html": "<h2>Release 1.2</h2>The text after it.<br>A second paragraph."
+  },
+  {
+   "name": "dash list",
+   "text": "- one\n- two\n- three",
+   "mentions": [],
+   "html": "<ul><li>one</li><li>two</li><li>three</li></ul>"
+  },
+  {
+   "name": "star and plus list",
+   "text": "* one\n+ two\n* three\nafter",
+   "mentions": [],
+   "html": "<ul><li>one</li><li>two</li><li>three</li></ul>after"
+  },
+  {
+   "name": "list then heading",
+   "text": "- a\n- b\n## H\ntext",
+   "mentions": [],
+   "html": "<ul><li>a</li><li>b</li></ul><h2>H</h2>text"
+  },
+  {
+   "name": "code block with lang",
+   "text": "before\n```python\nprint(\"<x> & 'y'\")\n**not bold**\n```\nafter",
+   "mentions": [],
+   "html": "before<br><pre><code class=\"language-python\">print(&quot;&lt;x&gt; &amp; &#x27;y&#x27;&quot;)\n**not bold**\n</code></pre><br>after"
+  },
+  {
+   "name": "code block without lang",
+   "text": "```\nplain *code*\n\n\nkept blank lines\n```",
+   "mentions": [],
+   "html": "<pre><code>plain *code*\n\n\nkept blank lines\n</code></pre>"
+  },
+  {
+   "name": "unclosed code block",
+   "text": "```sh\nnever closed *x*",
+   "mentions": [],
+   "html": "<code>`</code>sh<br>never closed <em>x</em>"
+  },
+  {
+   "name": "inline code",
+   "text": "run `make test` and `a < b`",
+   "mentions": [],
+   "html": "run <code>make test</code> and <code>a &lt; b</code>"
+  },
+  {
+   "name": "links",
+   "text": "[docs](https://example.org/a?b=1&c=2) and [mail](mailto:a@example.org) and [room](matrix:r/x:example.org)",
+   "mentions": [],
+   "html": "<a href=\"https://example.org/a?b=1&amp;c=2\">docs</a> and <a href=\"mailto:a@example.org\">mail</a> and <a href=\"matrix:r/x:example.org\">room</a>"
+  },
+  {
+   "name": "link with parentheses",
+   "text": "[jql](https://jira.example.org/issues/?jql=assignee=currentUser())",
+   "mentions": [],
+   "html": "<a href=\"https://jira.example.org/issues/?jql=assignee=currentUser()\">jql</a>"
+  },
+  {
+   "name": "javascript link",
+   "text": "[click](javascript:alert(1)) [x](  JavaScript:void(0)) [d](data:text/html,x)",
+   "mentions": [],
+   "html": "click x d"
+  },
+  {
+   "name": "emphasis",
+   "text": "**bold** *italic* ~~gone~~ ||spoiler|| ** not ** * not *",
+   "mentions": [],
+   "html": "<strong>bold</strong> <em>italic</em> <del>gone</del> <span data-mx-spoiler>spoiler</span> ** not ** * not *"
+  },
+  {
+   "name": "nested emphasis",
+   "text": "***both*** and **bold with *italic* inside**",
+   "mentions": [],
+   "html": "<strong><em>both</strong></em> and <strong>bold with <em>italic</em> inside</strong>"
+  },
+  {
+   "name": "spoiler next to pipes",
+   "text": "|||x||| and ||a|| ||b||",
+   "mentions": [],
+   "html": "<span data-mx-spoiler>|x|</span> and <span data-mx-spoiler>a</span> <span data-mx-spoiler>b</span>"
+  },
+  {
+   "name": "blockquote",
+   "text": "> quoted line\n> second\nafter\n\n> again",
+   "mentions": [],
+   "html": "<blockquote>quoted line<br>second</blockquote>after<blockquote>again</blockquote>"
+  },
+  {
+   "name": "table",
+   "text": "| Name | Value |\n|------|:-----:|\n| a | 1 |\n| b | 2 |\nafter",
+   "mentions": [],
+   "html": "<table><tr><th>Name</th><th>Value</th></tr><tr><td>a</td><td>1</td></tr><tr><td>b</td><td>2</td></tr></table>after"
+  },
+  {
+   "name": "table edge rows",
+   "text": "||\n|\n| only |",
+   "mentions": [],
+   "html": "<table><tr><th>only</th></tr></table>"
+  },
+  {
+   "name": "html escaping",
+   "text": "<b>not bold</b> & \"quotes\" 'single' <script>x</script>",
+   "mentions": [],
+   "html": "&lt;b&gt;not bold&lt;/b&gt; &amp; &quot;quotes&quot; &#x27;single&#x27; &lt;script&gt;x&lt;/script&gt;"
+  },
+  {
+   "name": "escaped entity stays escaped",
+   "text": "&amp; &lt; &#106;",
+   "mentions": [],
+   "html": "&amp;amp; &amp;lt; &amp;#106;"
+  },
+  {
+   "name": "forged placeholders",
+   "text": "{{BR}} {{CODEBLOCK_0}} \u0000MDLINK0\u0000 \u0000MDLINK99\u0000",
+   "mentions": [],
+   "html": "<br> {{CODEBLOCK_0}} \u0000MDLINK0\u0000 \u0000MDLINK99\u0000"
+  },
+  {
+   "name": "service urls",
+   "text": "See https://jira.example.org/browse/OPS-123 and https://github.com/netresearch/matrix-skill/pull/231 and https://github.com/netresearch/matrix-skill/commit/9f5663b0 and https://git.example.org/group/project/-/merge_requests/7 and https://gitlab.example.org/a/b/-/issues/3",
+   "mentions": [],
+   "html": "See <a href=\"https://jira.example.org/browse/OPS-123\">OPS-123</a> and <a href=\"https://github.com/netresearch/matrix-skill/pull/231\">netresearch/matrix-skill#231</a> and <a href=\"https://github.com/netresearch/matrix-skill/commit/9f5663b0\">netresearch/matrix-skill@9f5663b0</a> and <a href=\"https://git.example.org/group/project/-/merge_requests/7\">group/project#7</a> and <a href=\"https://gitlab.example.org/a/b/-/issues/3\">a/b#3</a>"
+  },
+  {
+   "name": "service url inside markdown link",
+   "text": "[the PR](https://github.com/o/r/pull/1)",
+   "mentions": [],
+   "html": "<a href=\"https://github.com/o/r/pull/1\">the PR</a>"
+  },
+  {
+   "name": "double scheme",
+   "text": "(https://http://example.org)",
+   "mentions": [],
+   "html": "(https://example.org)"
+  },
+  {
+   "name": "matrix ids",
+   "text": "ping @alice:example.org in #ops:example.org, not \"@bob:example.org\" or /@carol:example.org",
+   "mentions": [],
+   "html": "ping <a href=\"https://matrix.to/#/@alice:example.org\">@alice:example.org</a> in <a href=\"https://matrix.to/#/#ops:example.org\">#ops:example.org</a>, not &quot;<a href=\"https://matrix.to/#/@bob:example.org\">@bob:example.org</a>&quot; or /@carol:example.org"
+  },
+  {
+   "name": "newlines",
+   "text": "a\nb\n\n\nc\r\nd",
+   "mentions": [],
+   "html": "a<br>b<br>c\r<br>d"
+  },
+  {
+   "name": "python whitespace",
+   "text": "\u001c- item\u001d\n\u001f## H\u001e\n**\u001cx**",
+   "mentions": [],
+   "html": "<ul><li>item</li></ul><h2>H</h2>**\u001cx**"
+  },
+  {
+   "name": "unicode",
+   "text": "Grüße 🎁 **fett** *kursiv* `ç` @jörg:example.org #räum:example.org",
+   "mentions": [],
+   "html": "Grüße 🎁 <strong>fett</strong> <em>kursiv</em> <code>ç</code> @jörg:example.org #räum:example.org"
+  },
+  {
+   "name": "plain",
+   "text": "just text",
+   "mentions": [],
+   "html": "just text"
+  },
+  {
+   "name": "empty",
+   "text": "",
+   "mentions": [],
+   "html": ""
+  },
+  {
+   "name": "pill bare localpart",
+   "text": "thanks alice for the review",
+   "mentions": [
+    "@alice:example.org"
+   ],
+   "html": "thanks <a href=\"https://matrix.to/#/@alice:example.org\">alice</a> for the review"
+  },
+  {
+   "name": "pill with at sign",
+   "text": "thanks @alice for the review",
+   "mentions": [
+    "@alice:example.org"
+   ],
+   "html": "thanks <a href=\"https://matrix.to/#/@alice:example.org\">alice</a> for the review"
+  },
+  {
+   "name": "pill full id",
+   "text": "thanks @alice:example.org",
+   "mentions": [
+    "@alice:example.org"
+   ],
+   "html": "thanks <a href=\"https://matrix.to/#/@alice:example.org\">alice</a>:example.org"
+  },
+  {
+   "name": "pill already linked",
+   "text": "thanks [Alice](https://matrix.to/#/@alice:example.org)",
+   "mentions": [
+    "@alice:example.org"
+   ],
+   "html": "thanks <a href=\"https://matrix.to/#/@alice:example.org\">Alice</a>"
+  },
+  {
+   "name": "pill only first",
+   "text": "alice and alice again",
+   "mentions": [
+    "@alice:example.org"
+   ],
+   "html": "<a href=\"https://matrix.to/#/@alice:example.org\">alice</a> and alice again"
+  },
+  {
+   "name": "pill absent",
+   "text": "nobody named here",
+   "mentions": [
+    "@alice:example.org"
+   ],
+   "html": "nobody named here"
+  },
+  {
+   "name": "pill dotted localpart",
+   "text": "ping bjoern.marten and bjoern",
+   "mentions": [
+    "@bjoern.marten:example.org",
+    "@bjoern:example.org"
+   ],
+   "html": "ping <a href=\"https://matrix.to/#/@bjoern:example.org\">[bjoern</a>.marten](https://matrix.to/#/@bjoern.marten:example.org) and bjoern"
+  },
+  {
+   "name": "pill duplicate mention",
+   "text": "hi alice",
+   "mentions": [
+    "@alice:example.org",
+    "@alice:example.org"
+   ],
+   "html": "hi <a href=\"https://matrix.to/#/@alice:example.org\">alice</a>"
+  },
+  {
+   "name": "pill word boundary",
+   "text": "alicex alice_ alice",
+   "mentions": [
+    "@alice:example.org"
+   ],
+   "html": "alicex alice_ <a href=\"https://matrix.to/#/@alice:example.org\">alice</a>"
+  },
+  {
+   "name": "pill regex characters",
+   "text": "hi a+b and a.b",
+   "mentions": [
+    "@a+b:example.org",
+    "@a.b:example.org"
+   ],
+   "html": "hi <a href=\"https://matrix.to/#/@a+b:example.org\">a+b</a> and <a href=\"https://matrix.to/#/@a.b:example.org\">a.b</a>"
+  },
+  {
+   "name": "pill inside markdown",
+   "text": "**alice** said `alice`",
+   "mentions": [
+    "@alice:example.org"
+   ],
+   "html": "<strong><a href=\"https://matrix.to/#/@alice:example.org\">alice</a></strong> said <code>alice</code>"
+  },
+  {
+   "name": "document/release announcement",
+   "text": "## 📦 Release: matrix-e2ee-cli 0.3.0\n\n**What changed** for @alice:example.org and everyone in #ops:example.org:\n\n- *Markdown* in messages, rendered as HTML\n- Mentions: ping bob directly\n  - nested item with `inline code`\n  * nested star item\n    + deeper plus item\n- ~~removed~~ the old flag\n\n| Area | Before | After |\n|:-----|:------:|------:|\n| send | plain | **HTML** |\n| edit | plain | *HTML* |\n\nUpgrade with:\n```sh\ncargo install --locked matrix-e2ee-cli\necho \"done\" && exit 0\n```\n\nDetails: https://github.com/example/tool/pull/42, fix https://github.com/example/tool/commit/0123abcd\nand [the changelog](https://example.org/changelog#0.3.0).",
+   "mentions": [
+    "@bob:example.org"
+   ],
+   "html": "<h2>📦 Release: matrix-e2ee-cli 0.3.0</h2><strong>What changed</strong> for <a href=\"https://matrix.to/#/@alice:example.org\">@alice:example.org</a> and everyone in <a href=\"https://matrix.to/#/#ops:example.org\">#ops:example.org</a>:<ul><li><em>Markdown</em> in messages, rendered as HTML</li><li>Mentions: ping <a href=\"https://matrix.to/#/@bob:example.org\">bob</a> directly</li><li>nested item with <code>inline code</code></li><li>nested star item</li><li>deeper plus item</li><li><del>removed</del> the old flag</li></ul><table><tr><th>Area</th><th>Before</th><th>After</th></tr><tr><td>send</td><td>plain</td><td><strong>HTML</strong></td></tr><tr><td>edit</td><td>plain</td><td><em>HTML</em></td></tr></table>Upgrade with:<br><pre><code class=\"language-sh\">cargo install --locked matrix-e2ee-cli\necho &quot;done&quot; &amp;&amp; exit 0\n</code></pre><br>Details: <a href=\"https://github.com/example/tool/pull/42\">example/tool#42</a>, fix <a href=\"https://github.com/example/tool/commit/0123abcd\">example/tool@0123abcd</a><br>and <a href=\"https://example.org/changelog#0.3.0\">the changelog</a>."
+  },
+  {
+   "name": "document/release announcement fence 1",
+   "text": "cargo install --locked matrix-e2ee-cli\necho \"done\" && exit 0\n",
+   "mentions": [],
+   "html": "cargo install --locked matrix-e2ee-cli<br>echo &quot;done&quot; &amp;&amp; exit 0"
+  },
+  {
+   "name": "document/weekly digest",
+   "text": "# Weekly digest, week 47\n### Done\n1. OPS-12 closed: https://jira.example.org/browse/OPS-12\n2. MR https://git.example.org/infra/proxy/-/merge_requests/88 merged\n### Open\n* https://gitlab.example.org/team/app/-/issues/5 waits for carol\n* review by @dave:example.org\n\n> Note: the maintenance window moves\n> to Thursday 18:00.\n\n||spoiler: cake on Friday||\nLine one\nline two directly below\n\n\nafter two blank lines",
+   "mentions": [
+    "@carol:example.org"
+   ],
+   "html": "<h1>Weekly digest, week 47</h1><h3>Done</h3>1. OPS-12 closed: <a href=\"https://jira.example.org/browse/OPS-12\">OPS-12</a><br>2. MR <a href=\"https://git.example.org/infra/proxy/-/merge_requests/88\">infra/proxy#88</a> merged<h3>Open</h3><ul><li><a href=\"https://gitlab.example.org/team/app/-/issues/5\">team/app#5</a> waits for <a href=\"https://matrix.to/#/@carol:example.org\">carol</a></li><li>review by <a href=\"https://matrix.to/#/@dave:example.org\">@dave:example.org</a></li></ul><blockquote>Note: the maintenance window moves<br>to Thursday 18:00.</blockquote><span data-mx-spoiler>spoiler: cake on Friday</span><br>Line one<br>line two directly below<br>after two blank lines"
+  },
+  {
+   "name": "document/postmortem",
+   "text": "## Postmortem: proxy outage\n**Impact:** 14 minutes, *all* sites behind the proxy.\n**Cause:** a config line `listen 443 ssl;` was missing; see [runbook](https://wiki.example.org/proxy(v2)).\n\n### Timeline\n| Time | Event |\n|------|-------|\n| 10:02 | alert fired |\n| 10:16 | fix deployed by @erin:example.org |\n\n### Config before\n```\nserver {\n    # listen 443 ssl;   <- missing\n    server_name example.org;\n}\n```\n### Follow-ups\n- [ ] add a check\n- [x] restore service\n> \"Never again\" - the team",
+   "mentions": [],
+   "html": "<h2>Postmortem: proxy outage</h2><strong>Impact:</strong> 14 minutes, <em>all</em> sites behind the proxy.<br><strong>Cause:</strong> a config line <code>listen 443 ssl;</code> was missing; see <a href=\"https://wiki.example.org/proxy(v2)\">runbook</a>.<h3>Timeline</h3><table><tr><th>Time</th><th>Event</th></tr><tr><td>10:02</td><td>alert fired</td></tr><tr><td>10:16</td><td>fix deployed by <a href=\"https://matrix.to/#/@erin:example.org\">@erin:example.org</a></td></tr></table><h3>Config before</h3><pre><code>server {\n    # listen 443 ssl;   &lt;- missing\n    server_name example.org;\n}\n</code></pre><h3>Follow-ups</h3><ul><li>[ ] add a check</li><li>[x] restore service</li></ul><blockquote>&quot;Never again&quot; - the team</blockquote>"
+  },
+  {
+   "name": "document/postmortem fence 1",
+   "text": "server {\n    # listen 443 ssl;   <- missing\n    server_name example.org;\n}\n",
+   "mentions": [],
+   "html": "server {<h1>listen 443 ssl;   &lt;- missing</h1>    server_name example.org;<br>}"
+  },
+  {
+   "name": "document/heads-up with risky input",
+   "text": "⚠️ **Heads-up** <script>alert('x')</script> & friends\n[bad link](javascript:alert(1)) and [ok](mailto:ops@example.org) and [room](matrix:r/ops:example.org)\n*not italic * and ** not bold ** and a * bullet-like star\nText with a trailing backslash \\\ntab\tseparated\tvalues\n\n- list right before a heading\n## Heading after a list\n| table | right after heading |\nplain line ends the table",
+   "mentions": [
+    "@frank:example.org"
+   ],
+   "html": "⚠️ <strong>Heads-up</strong> &lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt; &amp; friends<br>bad link and <a href=\"mailto:ops@example.org\">ok</a> and <a href=\"matrix:r/ops:example.org\">room</a><br>*not italic * and ** not bold ** and a * bullet-like star<br>Text with a trailing backslash \\<br>tab\tseparated\tvalues<ul><li>list right before a heading</li></ul><h2>Heading after a list</h2><table><tr><th>table</th><th>right after heading</th></tr></table>plain line ends the table"
+  },
+  {
+   "name": "document/comparison",
+   "text": "## Option A vs. option B\n| | A | B |\n|---|---|---|\n| cost | ~~high~~ low | **medium** |\n| owner | @gina:example.org | hank |\n| link | [spec](https://example.org/a) | https://github.com/example/b/issues/9 |\n\nRecommendation: **A**, because *speed* matters more.",
+   "mentions": [
+    "@hank:example.org"
+   ],
+   "html": "<h2>Option A vs. option B</h2><table><tr><th></th><th>A</th><th>B</th></tr><tr><td>cost</td><td><del>high</del> low</td><td><strong>medium</strong></td></tr><tr><td>owner</td><td><a href=\"https://matrix.to/#/@gina:example.org\">@gina:example.org</a></td><td><a href=\"https://matrix.to/#/@hank:example.org\">hank</a></td></tr><tr><td>link</td><td><a href=\"https://example.org/a\">spec</a></td><td><a href=\"https://github.com/example/b/issues/9\">example/b#9</a></td></tr></table>Recommendation: <strong>A</strong>, because <em>speed</em> matters more."
+  },
+  {
+   "name": "document/incident update",
+   "text": "### 🔴 Incident ongoing\n> Status: investigating\n- affected: #web:example.org\n- not affected: #mail:example.org\n> back to a quote after the list\n\nNext update at 12:00. Ping ivan or @ivan if you see errors.\n```json\n{\"error\": \"<timeout>\", \"code\": 504}\n```\nThanks, ivan!",
+   "mentions": [
+    "@ivan:example.org"
+   ],
+   "html": "<h3>🔴 Incident ongoing</h3><blockquote>Status: investigating</blockquote><ul><li>affected: <a href=\"https://matrix.to/#/#web:example.org\">#web:example.org</a></li><li>not affected: <a href=\"https://matrix.to/#/#mail:example.org\">#mail:example.org</a></li></ul><blockquote>back to a quote after the list</blockquote>Next update at 12:00. Ping <a href=\"https://matrix.to/#/@ivan:example.org\">ivan</a> or @ivan if you see errors.<br><pre><code class=\"language-json\">{&quot;error&quot;: &quot;&lt;timeout&gt;&quot;, &quot;code&quot;: 504}\n</code></pre><br>Thanks, ivan!"
+  },
+  {
+   "name": "document/incident update fence 1",
+   "text": "{\"error\": \"<timeout>\", \"code\": 504}\n",
+   "mentions": [],
+   "html": "{&quot;error&quot;: &quot;&lt;timeout&gt;&quot;, &quot;code&quot;: 504}"
+  },
+  {
+   "name": "document/deployment notice",
+   "text": "# Deployment\n\nDeploying **api** 2.4.1 to *production*:\n+ step 1: drain\n+ step 2: switch\n+ step 3: verify `/health`\n\nRollback: `kubectl rollout undo deploy/api`\nTracking: https://jira.example.org/browse/DEP-7 and https://git.example.org/ops/deploy/-/issues/31\n#### Contacts\njulia (on call), @kurt:example.org (backup)",
+   "mentions": [
+    "@julia:example.org",
+    "@kurt:example.org"
+   ],
+   "html": "<h1>Deployment</h1>Deploying <strong>api</strong> 2.4.1 to <em>production</em>:<ul><li>step 1: drain</li><li>step 2: switch</li><li>step 3: verify <code>/health</code></li></ul>Rollback: <code>kubectl rollout undo deploy/api</code><br>Tracking: <a href=\"https://jira.example.org/browse/DEP-7\">DEP-7</a> and <a href=\"https://git.example.org/ops/deploy/-/issues/31\">ops/deploy#31</a><h4>Contacts</h4><a href=\"https://matrix.to/#/@julia:example.org\">julia</a> (on call), <a href=\"https://matrix.to/#/@kurt:example.org\">kurt</a>:example.org (backup)"
+  }
+ ],
+ "prefix": [
+  {
+   "name": "plain",
+   "text": "hello",
+   "prefix": "🤖",
+   "out": "🤖 hello"
+  },
+  {
+   "name": "heading only",
+   "text": "## Title",
+   "prefix": "🤖",
+   "out": "## Title\n\n🤖"
+  },
+  {
+   "name": "heading and body",
+   "text": "## Title\nbody",
+   "prefix": "🤖",
+   "out": "## Title\n\n🤖\nbody"
+  },
+  {
+   "name": "heading, blank, body",
+   "text": "## Title\n\nbody",
+   "prefix": "🤖",
+   "out": "## Title\n\n🤖\n\nbody"
+  },
+  {
+   "name": "already prefixed",
+   "text": "🤖 hello",
+   "prefix": "🤖",
+   "out": "🤖 hello"
+  },
+  {
+   "name": "prefix with spaces",
+   "text": "  🤖 hello",
+   "prefix": " 🤖 ",
+   "out": "  🤖 hello"
+  },
+  {
+   "name": "prefixed after heading",
+   "text": "## Title\n\n🤖 body",
+   "prefix": "🤖",
+   "out": "## Title\n\n🤖 body"
+  },
+  {
+   "name": "indented heading",
+   "text": "  ## Title\nbody",
+   "prefix": "[bot]",
+   "out": "## Title\n\n[bot]\nbody"
+  },
+  {
+   "name": "not a heading",
+   "text": "##Title",
+   "prefix": "[bot]",
+   "out": "[bot] ##Title"
+  },
+  {
+   "name": "blank prefix",
+   "text": "hello",
+   "prefix": "   ",
+   "out": "    hello"
+  },
+  {
+   "name": "python whitespace",
+   "text": "\u001c🤖 hi",
+   "prefix": "🤖",
+   "out": "\u001c🤖 hi"
+  }
+ ]
+}
