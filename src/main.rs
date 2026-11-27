@@ -165,19 +165,33 @@ pub struct ReactArgs {
     pub room: String,
     /// The event to react to ($...).
     pub event_id: String,
-    /// The reaction key, usually an emoji. Sent unencrypted, also in an
-    /// encrypted room (matrix-sdk 0.20.0): the homeserver can read it.
-    #[arg(required_unless_present = "list", conflicts_with = "list")]
-    pub key: Option<String>,
-    /// Remove your own KEY reaction instead of adding one.
+    /// The reaction key, usually an emoji; several are set in one call, in
+    /// the order given. Sent unencrypted, also in an encrypted room
+    /// (matrix-sdk 0.20.0): the homeserver can read it.
+    #[arg(
+        value_name = "KEY",
+        required_unless_present = "list",
+        conflicts_with = "list"
+    )]
+    pub keys: Vec<String>,
+    /// Remove your own KEY reactions instead of adding them.
     #[arg(long, conflicts_with_all = ["replace", "list"])]
     pub remove: bool,
-    /// Status swap: set KEY, then remove your own reactions with any of OLD.
+    /// Status swap: set KEY, then remove your own reactions with any of OLD;
+    /// with several KEYs, after the last one is set.
     #[arg(long, num_args = 1.., value_name = "OLD", conflicts_with = "list")]
     pub replace: Option<Vec<String>>,
     /// List your own reactions on the event (key and reaction event id).
     #[arg(long)]
     pub list: bool,
+    /// Accepted for callers of matrix-react.py; has no effect: reactions
+    /// are sent unencrypted, so no room key is shared with any device.
+    #[arg(long)]
+    pub trust_unverified_devices: bool,
+    /// Print only the reaction event id, one line per KEY (an empty line
+    /// for --remove).
+    #[arg(short, long)]
+    pub quiet: bool,
     /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,
@@ -189,11 +203,25 @@ pub struct RedactArgs {
     pub room: String,
     /// The event to redact ($...).
     pub event_id: String,
-    /// Why; shown to the room's members.
+    /// Why; shown to the room's members (the same as --reason).
+    #[arg(value_name = "REASON", conflicts_with = "reason_option")]
     pub reason: Option<String>,
+    /// Why; shown to the room's members.
+    #[arg(long = "reason", id = "reason_option", value_name = "REASON")]
+    pub reason_option: Option<String>,
+    /// Print only the redaction's event id.
+    #[arg(short, long)]
+    pub quiet: bool,
     /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+impl RedactArgs {
+    /// The reason, from --reason or the positional REASON.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason_option.as_deref().or(self.reason.as_deref())
+    }
 }
 
 #[derive(Debug, Args)]
@@ -362,7 +390,7 @@ mod tests {
         else {
             panic!("not react")
         };
-        assert_eq!(args.key.as_deref(), Some("✅"));
+        assert_eq!(args.keys, vec!["✅".to_owned()]);
         assert_eq!(args.replace, Some(vec!["▶️".to_owned(), "🩹".to_owned()]));
     }
 
@@ -372,7 +400,7 @@ mod tests {
         let react = cli.find_subcommand("react").expect("react subcommand");
         let key = react
             .get_arguments()
-            .find(|a| a.get_id() == "key")
+            .find(|a| a.get_id() == "keys")
             .expect("KEY argument");
         let help = key.get_help().expect("KEY help").to_string();
         assert!(
@@ -390,8 +418,68 @@ mod tests {
         else {
             panic!("not redact")
         };
-        assert_eq!(args.reason.as_deref(), Some("spam"));
+        assert_eq!(args.reason(), Some("spam"));
         assert!(Cli::try_parse_from(["m", "redact", "r", "$e", "a", "b"]).is_err());
+    }
+
+    #[test]
+    fn redact_takes_the_reason_as_matrix_redact_py_does() {
+        // it-maintenance ticket-flow.py:
+        // _matrix("matrix-redact.py", room, state["play_reaction"], "--reason", "abgeschlossen")
+        let parse = |a: &[&str]| {
+            Cli::try_parse_from([&["m", "redact", "#it:netresearch.de", "$r"][..], a].concat())
+        };
+        let Command::Redact(args) = parse(&["--reason", "abgeschlossen"]).unwrap().command else {
+            panic!("not redact")
+        };
+        assert_eq!(args.reason(), Some("abgeschlossen"));
+        assert!(!args.quiet && !args.json);
+        assert!(
+            parse(&["spam", "--reason", "x"]).is_err(),
+            "one reason only"
+        );
+        let Command::Redact(args) = parse(&["-q"]).unwrap().command else {
+            panic!("not redact")
+        };
+        assert!(args.quiet);
+        assert_eq!(args.reason(), None);
+    }
+
+    #[test]
+    fn react_accepts_the_callers_invocations() {
+        let parse = |a: &[&str]| {
+            Cli::try_parse_from([&["m", "react", "#it:netresearch.de", "$eventId"][..], a].concat())
+        };
+        let react = |a: &[&str]| match parse(a).unwrap_or_else(|e| panic!("{a:?}: {e}")).command {
+            Command::React(args) => args,
+            _ => panic!("not react"),
+        };
+        // netresearch-jira claiming-a-ticket.md
+        let swap = react(&["🩹", "--replace", "▶️", "✅"]);
+        assert_eq!(swap.keys, vec!["🩹".to_owned()]);
+        assert_eq!(swap.replace, Some(vec!["▶️".to_owned(), "✅".to_owned()]));
+        assert_eq!(react(&["🤖"]).keys, vec!["🤖".to_owned()]);
+        let remove = react(&["✅", "--remove"]);
+        assert!(remove.remove && remove.keys == vec!["✅".to_owned()]);
+        let list = react(&["--list"]);
+        assert!(list.list && list.keys.is_empty());
+        // it-maintenance ticket-flow.py: room, event_id, emoji, *extra, *_trust_args()
+        let flow = react(&["✅", "--replace", "▶️", "--trust-unverified-devices"]);
+        assert!(flow.trust_unverified_devices);
+        assert_eq!(flow.replace, Some(vec!["▶️".to_owned()]));
+        assert!(react(&["▶️", "--trust-unverified-devices"]).trust_unverified_devices);
+        // Several keys, as matrix-react.py's EMOJI with nargs "*".
+        let many = react(&["▶️", "🤖"]);
+        assert_eq!(many.keys, vec!["▶️".to_owned(), "🤖".to_owned()]);
+        let many = react(&["✅", "🤖", "--replace", "▶️", "🩹"]);
+        assert_eq!(many.keys.len(), 2);
+        assert_eq!(many.replace.map(|r| r.len()), Some(2));
+        assert_eq!(react(&["✅", "🤖", "--remove"]).keys.len(), 2);
+        assert!(react(&["✅", "-q"]).quiet);
+        assert!(
+            parse(&["✅", "🤖", "--list"]).is_err(),
+            "--list takes no KEY"
+        );
     }
 
     #[test]

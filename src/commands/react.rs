@@ -26,7 +26,7 @@ use crate::ReactArgs;
 use crate::commands::send::request_str;
 use crate::commands::{fetch_event, parse_event_id, resolve_room, sync_once, via_daemon};
 use crate::config::load_config;
-use crate::session::{KeySharing, Paths, restore};
+use crate::session::{DataDirLock, KeySharing, Paths, Restored, restore};
 use crate::text::{json_line, term};
 
 /// Guard against a server that never stops paging (100 reactions a page).
@@ -101,85 +101,169 @@ pub fn check_key(key: &str) -> Result<()> {
 
 pub async fn run(args: ReactArgs) -> Result<()> {
     let paths = Paths::from_env()?;
-    let request = request_for(&args)?;
-    let outcome = match via_daemon::<ReactOutcome>(&paths, request.clone(), "reaction").await? {
-        Some(outcome) => outcome,
-        None => {
-            let config = load_config()?;
-            let _lock = paths.lock().await?;
-            // Reactions are sent unencrypted (see the module comment): no room key.
-            let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
-            sync_once(&restored.client).await?;
-            execute(&restored.client, &request).await?
+    // Every KEY is checked before the first one is sent.
+    let requests = requests_for(&args)?;
+    let mut direct: Option<(Restored, DataDirLock)> = None;
+    let mut outcomes = Vec::new();
+    for request in &requests {
+        match carry_out(&paths, request, &mut direct).await {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(err) => {
+                if let Some(note) = applied_note(&args.keys[..outcomes.len()]) {
+                    eprintln!("{note}");
+                }
+                return Err(err);
+            }
         }
-    };
-    let skipped = outcome.skipped_unconfirmed;
+    }
+    let skipped: usize = outcomes.iter().map(|o| o.skipped_unconfirmed).sum();
     if skipped > 0 {
         eprintln!("{}", skipped_note(skipped));
     }
-
-    if args.list {
-        let found = outcome.reactions.unwrap_or_default();
-        if args.json {
-            println!(
-                "{}",
-                json_line(&json!({
-                    "reactions": found,
-                    "skipped_unconfirmed": skipped,
-                }))?
-            );
-        } else {
-            for reaction in &found {
-                println!("{}\t{}", term(&reaction.key), term(&reaction.event_id));
-            }
-        }
-        return Ok(());
-    }
-    let key = outcome.key.unwrap_or_default();
-    if args.json {
-        println!(
-            "{}",
-            json_line(&json!({
-                "event_id": outcome.event_id,
-                "key": key,
-                "removed": outcome.removed,
-                "skipped_unconfirmed": skipped,
-            }))?
-        );
-    } else {
-        if let Some(id) = &outcome.event_id {
-            println!("{}", term(id));
-        }
-        for done in &outcome.removed {
-            println!("removed\t{}\t{}", term(&done.key), term(&done.event_id));
-        }
-        if args.remove && outcome.removed.is_empty() {
-            let event_id = parse_event_id(&args.event_id)?;
-            eprintln!("no {} reaction of yours on {event_id}", term(&key));
-        }
+    for line in render(&args, &outcomes)? {
+        println!("{line}");
     }
     Ok(())
 }
 
-/// The request for the watch daemon. Without `--list`, `--remove` and
-/// `--replace` it is matrix-watchd.py's "react" (`room`, `event_id`,
-/// `key`); those three options travel as the extra fields `list`,
-/// `remove` and `replace`, which only this tool's daemon reads. The
-/// keys are checked as [`parse_mode`] checks them before anything is sent.
-pub fn request_for(args: &ReactArgs) -> Result<Value> {
-    let mut request = json!({"op": "react", "room": args.room, "event_id": args.event_id});
+/// One request, through the watch daemon while it answers, else directly;
+/// the direct client is opened once and kept for the following requests.
+async fn carry_out(
+    paths: &Paths,
+    request: &Value,
+    direct: &mut Option<(Restored, DataDirLock)>,
+) -> Result<ReactOutcome> {
+    if direct.is_none() {
+        if let Some(outcome) =
+            via_daemon::<ReactOutcome>(paths, request.clone(), "reaction").await?
+        {
+            return Ok(outcome);
+        }
+        let config = load_config()?;
+        let lock = paths.lock().await?;
+        // Reactions are sent unencrypted (see the module comment): no room key.
+        let restored = restore(&config, paths, KeySharing::VerifiedOnly).await?;
+        sync_once(&restored.client).await?;
+        *direct = Some((restored, lock));
+    }
+    let (restored, _) = direct.as_ref().context("no client")?;
+    execute(&restored.client, request).await
+}
+
+/// matrix-react.py's stderr line for the keys set before a failure.
+pub fn applied_note(done: &[String]) -> Option<String> {
+    if done.is_empty() {
+        return None;
+    }
+    let keys: Vec<_> = done.iter().map(|k| term(k).into_owned()).collect();
+    Some(format!("Applied before the error: {}", keys.join(" ")))
+}
+
+/// The stdout lines for the outcomes, one outcome per KEY in argument
+/// order, as matrix-react.py prints them.
+pub fn render(args: &ReactArgs, outcomes: &[ReactOutcome]) -> Result<Vec<String>> {
     if args.list {
+        let found = outcomes
+            .first()
+            .and_then(|o| o.reactions.clone())
+            .unwrap_or_default();
+        if args.json {
+            return Ok(vec![json_line(&json!({"reactions": found}))?]);
+        }
+        return Ok(found
+            .iter()
+            .map(|r| format!("{}\t{}", term(&r.key), term(&r.event_id)))
+            .collect());
+    }
+    // Python reports "removed" only when it looked reactions up.
+    let swap = args.remove || args.replace.is_some();
+    let result = |o: &ReactOutcome| {
+        if swap {
+            json!({"event_id": o.event_id, "removed": removed_keys(o)})
+        } else {
+            json!({"event_id": o.event_id})
+        }
+    };
+    if args.json {
+        let value = match outcomes {
+            [one] => result(one),
+            many => json!({"results": many.iter().map(result).collect::<Vec<_>>()}),
+        };
+        return Ok(vec![json_line(&value)?]);
+    }
+    let target = term(&args.event_id);
+    let mut lines = Vec::new();
+    for (key, outcome) in args.keys.iter().zip(outcomes) {
+        let id = outcome.event_id.as_deref().map(term).unwrap_or_default();
+        if args.quiet {
+            lines.push(id.into_owned());
+        } else if args.remove {
+            lines.push(format!(
+                "Removed {} {} reaction(s) from {target}",
+                outcome.removed.len(),
+                term(key)
+            ));
+        } else {
+            lines.push(format!("Reacted with {} to {target}", term(key)));
+            lines.push(format!("Event ID: {id}"));
+            if !outcome.removed.is_empty() {
+                let removed: Vec<_> = removed_keys(outcome)
+                    .iter()
+                    .map(|k| term(k).into_owned())
+                    .collect();
+                lines.push(format!("Removed: {}", removed.join(" ")));
+            }
+        }
+    }
+    Ok(lines)
+}
+
+fn removed_keys(outcome: &ReactOutcome) -> Vec<String> {
+    outcome.removed.iter().map(|r| r.key.clone()).collect()
+}
+
+/// The requests for the watch daemon (or the direct path), one per KEY in
+/// argument order, as matrix-react.py's `apply_reactions` applies them.
+/// Without `--list`, `--remove` and `--replace` each is matrix-watchd.py's
+/// "react" (`room`, `event_id`, `key`); those three options travel as the
+/// extra fields `list`, `remove` and `replace`, which only this tool's
+/// daemon reads. `replace` goes with the last KEY only and leaves out the
+/// keys being set, so an earlier failure removes nothing and a key that is
+/// both set and replaced is kept. Every key is checked as [`parse_mode`]
+/// checks it before anything is sent.
+pub fn requests_for(args: &ReactArgs) -> Result<Vec<Value>> {
+    let base = json!({"op": "react", "room": args.room, "event_id": args.event_id});
+    if args.list {
+        let mut request = base;
         request["list"] = json!(true);
-        return Ok(request);
+        return Ok(vec![request]);
     }
-    let (key, _) = parse_mode(args.key.clone(), args.remove, args.replace.clone())?;
-    request["key"] = json!(key);
-    if args.remove {
-        request["remove"] = json!(true);
-    } else if let Some(old) = &args.replace {
-        request["replace"] = json!(old);
+    if args.keys.is_empty() {
+        bail!("KEY is required unless --list is given");
     }
-    Ok(request)
+    let keep: Option<Vec<String>> = args.replace.as_ref().map(|old| {
+        old.iter()
+            .filter(|k| !args.keys.contains(k))
+            .cloned()
+            .collect()
+    });
+    let last = args.keys.len() - 1;
+    args.keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let replace = keep.clone().filter(|old| index == last && !old.is_empty());
+            let (key, _) = parse_mode(Some(key.clone()), args.remove, replace.clone())?;
+            let mut request = base.clone();
+            request["key"] = json!(key);
+            if args.remove {
+                request["remove"] = json!(true);
+            } else if let Some(old) = replace {
+                request["replace"] = json!(old);
+            }
+            Ok(request)
+        })
+        .collect()
 }
 
 /// KEY and the mode a "react" request asks for, checked by [`parse_mode`].
@@ -599,14 +683,12 @@ mod tests {
     #[test]
     fn the_daemon_request_checks_keys_as_parse_mode_does() {
         let args = |key: &str, remove: bool, replace: Option<Vec<String>>| ReactArgs {
-            room: "!r:e".into(),
-            event_id: "$e".into(),
-            key: Some(key.into()),
+            keys: vec![key.into()],
             remove,
             replace,
-            list: false,
-            json: false,
+            ..react_args(&[])
         };
+        let request_for = |a: &ReactArgs| requests_for(a).map(|mut r| r.remove(0));
         // --remove and the OLD keys of --replace name existing reactions.
         let request = request_for(&args("a\nb", true, None)).unwrap();
         assert_eq!(
@@ -679,6 +761,279 @@ mod tests {
         let encrypted_annotation = json!({"type": "m.room.encrypted", "content": {"ciphertext": "x",
             "m.relates_to": {"rel_type": "m.annotation", "event_id": "$o", "key": "✅"}}});
         assert!(check_reactable(&encrypted_annotation).is_err());
+    }
+
+    fn react_args(keys: &[&str]) -> ReactArgs {
+        ReactArgs {
+            room: "#it:netresearch.de".into(),
+            event_id: "$eventId".into(),
+            keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+            remove: false,
+            replace: None,
+            list: false,
+            trust_unverified_devices: false,
+            quiet: false,
+            json: false,
+        }
+    }
+
+    fn outcome(event_id: Option<&str>, removed: &[(&str, &str)]) -> ReactOutcome {
+        ReactOutcome {
+            reactions: None,
+            event_id: event_id.map(str::to_owned),
+            key: None,
+            removed: removed
+                .iter()
+                .map(|(k, id)| OwnReaction {
+                    key: (*k).into(),
+                    event_id: (*id).into(),
+                })
+                .collect(),
+            skipped_unconfirmed: 0,
+        }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn several_keys_are_one_request_each_with_the_swap_after_the_last() {
+        // claiming-a-ticket.md: '🩹' --replace '▶️' '✅'
+        let swap = ReactArgs {
+            replace: Some(strs(&["▶️", "✅"])),
+            ..react_args(&["🩹"])
+        };
+        assert_eq!(
+            requests_for(&swap).unwrap(),
+            vec![
+                json!({"op": "react", "room": "#it:netresearch.de", "event_id": "$eventId",
+                        "key": "🩹", "replace": ["▶️", "✅"]})
+            ]
+        );
+        // matrix-react.py: "✅" "🤖" --replace "▶️" "🤖": the swap runs after
+        // the last key, and a key that is set is never removed.
+        let many = ReactArgs {
+            replace: Some(strs(&["▶️", "🤖"])),
+            ..react_args(&["✅", "🤖"])
+        };
+        let requests = requests_for(&many).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["key"], json!("✅"));
+        assert!(requests[0].get("replace").is_none(), "{}", requests[0]);
+        assert_eq!(requests[1]["key"], json!("🤖"));
+        assert_eq!(requests[1]["replace"], json!(["▶️"]));
+        // All OLD keys are set again: nothing to remove.
+        let kept = ReactArgs {
+            replace: Some(strs(&["✅"])),
+            ..react_args(&["✅", "🤖"])
+        };
+        assert!(
+            requests_for(&kept)
+                .unwrap()
+                .iter()
+                .all(|r| r.get("replace").is_none())
+        );
+        // --remove takes each key back.
+        let remove = ReactArgs {
+            remove: true,
+            ..react_args(&["✅", "🤖"])
+        };
+        let requests = requests_for(&remove).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r["remove"] == json!(true)));
+        assert_eq!(requests[1]["key"], json!("🤖"));
+        let list = ReactArgs {
+            list: true,
+            ..react_args(&[])
+        };
+        assert_eq!(
+            requests_for(&list).unwrap(),
+            vec![
+                json!({"op": "react", "room": "#it:netresearch.de", "event_id": "$eventId", "list": true})
+            ]
+        );
+        assert!(requests_for(&react_args(&[])).is_err());
+    }
+
+    #[test]
+    fn a_bad_key_anywhere_stops_the_call_before_anything_is_sent() {
+        assert!(requests_for(&react_args(&["✅", "a\nb"])).is_err());
+        assert!(requests_for(&react_args(&["✅", " "])).is_err());
+    }
+
+    #[test]
+    fn default_output_is_matrix_react_py_s() {
+        // ticket-flow.py parses r"Event ID: (\$\S+)" from stdout + stderr and
+        // takes the first match: it must be the first key's.
+        let lines = render(
+            &react_args(&["▶️", "🤖"]),
+            &[outcome(Some("$r1"), &[]), outcome(Some("$r2"), &[])],
+        )
+        .unwrap();
+        assert_eq!(
+            lines,
+            strs(&[
+                "Reacted with ▶️ to $eventId",
+                "Event ID: $r1",
+                "Reacted with 🤖 to $eventId",
+                "Event ID: $r2",
+            ])
+        );
+        let first = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("Event ID: "))
+            .unwrap();
+        assert!(first.starts_with('$') && !first.contains(char::is_whitespace));
+        assert_eq!(first, "$r1");
+
+        let swap = ReactArgs {
+            replace: Some(strs(&["▶️", "✅"])),
+            ..react_args(&["🩹"])
+        };
+        assert_eq!(
+            render(
+                &swap,
+                &[outcome(Some("$r3"), &[("▶️", "$o1"), ("✅", "$o2")])]
+            )
+            .unwrap(),
+            strs(&[
+                "Reacted with 🩹 to $eventId",
+                "Event ID: $r3",
+                "Removed: ▶️ ✅"
+            ])
+        );
+        let remove = ReactArgs {
+            remove: true,
+            ..react_args(&["✅", "🤖"])
+        };
+        assert_eq!(
+            render(
+                &remove,
+                &[outcome(None, &[("✅", "$o")]), outcome(None, &[])]
+            )
+            .unwrap(),
+            strs(&[
+                "Removed 1 ✅ reaction(s) from $eventId",
+                "Removed 0 🤖 reaction(s) from $eventId",
+            ])
+        );
+    }
+
+    #[test]
+    fn quiet_prints_the_event_ids_only() {
+        let quiet = ReactArgs {
+            quiet: true,
+            ..react_args(&["▶️", "🤖"])
+        };
+        assert_eq!(
+            render(
+                &quiet,
+                &[outcome(Some("$r1"), &[]), outcome(Some("$r2"), &[])]
+            )
+            .unwrap(),
+            strs(&["$r1", "$r2"])
+        );
+        let quiet_remove = ReactArgs {
+            quiet: true,
+            remove: true,
+            ..react_args(&["✅"])
+        };
+        assert_eq!(
+            render(&quiet_remove, &[outcome(None, &[("✅", "$o")])]).unwrap(),
+            strs(&[""])
+        );
+    }
+
+    #[test]
+    fn json_is_matrix_react_py_s() {
+        let parse = |a: &ReactArgs, o: &[ReactOutcome]| -> Value {
+            let lines = render(a, o).unwrap();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            serde_json::from_str(&lines[0]).unwrap()
+        };
+        let json_args = |keys: &[&str]| ReactArgs {
+            json: true,
+            ..react_args(keys)
+        };
+        // A plain reaction: what the server answered.
+        assert_eq!(
+            parse(&json_args(&["✅"]), &[outcome(Some("$r1"), &[])]),
+            json!({"event_id": "$r1"})
+        );
+        // --json wins over -q.
+        let both = ReactArgs {
+            quiet: true,
+            ..json_args(&["✅"])
+        };
+        assert_eq!(
+            parse(&both, &[outcome(Some("$r1"), &[])]),
+            json!({"event_id": "$r1"})
+        );
+        // A swap reports the removed keys, also when there were none.
+        let swap = ReactArgs {
+            replace: Some(strs(&["▶️"])),
+            ..json_args(&["✅"])
+        };
+        assert_eq!(
+            parse(&swap, &[outcome(Some("$r1"), &[("▶️", "$o")])]),
+            json!({"event_id": "$r1", "removed": ["▶️"]})
+        );
+        assert_eq!(
+            parse(&swap, &[outcome(Some("$r1"), &[])]),
+            json!({"event_id": "$r1", "removed": []})
+        );
+        let remove = ReactArgs {
+            remove: true,
+            ..json_args(&["✅"])
+        };
+        assert_eq!(
+            parse(&remove, &[outcome(None, &[("✅", "$o")])]),
+            json!({"event_id": null, "removed": ["✅"]})
+        );
+        // Several keys: one result each.
+        assert_eq!(
+            parse(
+                &json_args(&["▶️", "🤖"]),
+                &[outcome(Some("$r1"), &[]), outcome(Some("$r2"), &[])]
+            ),
+            json!({"results": [{"event_id": "$r1"}, {"event_id": "$r2"}]})
+        );
+    }
+
+    #[test]
+    fn list_output_is_matrix_react_py_s() {
+        let listed = ReactOutcome {
+            reactions: Some(vec![OwnReaction {
+                key: "✅".into(),
+                event_id: "$r1".into(),
+            }]),
+            skipped_unconfirmed: 1,
+            ..outcome(None, &[])
+        };
+        let list = ReactArgs {
+            list: true,
+            ..react_args(&[])
+        };
+        assert_eq!(
+            render(&list, std::slice::from_ref(&listed)).unwrap(),
+            strs(&["✅\t$r1"])
+        );
+        let json_list = ReactArgs { json: true, ..list };
+        let line = render(&json_list, &[listed]).unwrap().remove(0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"reactions": [{"key": "✅", "event_id": "$r1"}]})
+        );
+    }
+
+    #[test]
+    fn the_applied_note_names_the_keys_set_before_the_error() {
+        assert_eq!(applied_note(&[]), None);
+        assert_eq!(
+            applied_note(&strs(&["▶️", "🤖"])).as_deref(),
+            Some("Applied before the error: ▶️ 🤖")
+        );
     }
 
     #[test]
