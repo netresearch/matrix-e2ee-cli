@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 
 use crate::VerifyArgs;
 use crate::commands::verify_handover::{
-    Ack, Decision, EmojiItem, Pending, TAKEN_STALE, TAKEN_WAIT, Taken, await_taken, hand_over,
+    Decision, EmojiItem, Pending, TAKEN_STALE, TAKEN_WAIT, Taken, await_taken, hand_over,
     handover_dir, sweep,
 };
 use crate::commands::{confirm_fresh_on, discard_typeahead_stdin, sync_once};
@@ -200,7 +200,7 @@ fn decide(token: &str, decision: Decision) -> Result<()> {
 /// What the waiting process did with the decision this process handed over.
 fn taken_report(
     sent: Decision,
-    taken: Option<Ack>,
+    taken: Option<Taken>,
     transaction_id: &str,
     other_device: &str,
     pid: u32,
@@ -214,31 +214,20 @@ fn taken_report(
         term_id(transaction_id),
         term_id(other_device)
     );
-    let kind = |taken: Taken| match taken {
-        Taken::Confirm => "a confirmation",
-        Taken::Cancel => "a cancellation",
-        Taken::Ignored => "an ignored decision",
-    };
     match (sent, taken) {
-        (Decision::Confirm, Some(Ack::Mine(Taken::Confirm))) => Ok(format!(
+        (Decision::Confirm, Some(Taken::Confirm)) => Ok(format!(
             "The {which} took the confirmation; it confirms the emoji and reports the result."
         )),
-        (Decision::Cancel, Some(Ack::Mine(Taken::Cancel))) => Ok(format!(
+        (Decision::Cancel, Some(Taken::Cancel)) => Ok(format!(
             "The {which} took the cancellation; it cancels and reports the result."
         )),
-        (Decision::Cancel, Some(Ack::Mine(Taken::Confirm))) => {
+        (Decision::Cancel, Some(Taken::Confirm)) => {
             bail!("the {which} acted on a confirmation, not on this cancellation")
         }
-        (Decision::Confirm, Some(Ack::Mine(Taken::Cancel))) => {
+        (Decision::Confirm, Some(Taken::Cancel)) => {
             bail!("the {which} acted on a cancellation, not on this confirmation")
         }
-        (_, Some(Ack::Other(taken))) => bail!(
-            "the {which} handled another decision for this token ({}); {} was not acknowledged within {} s",
-            kind(taken),
-            name(sent),
-            TAKEN_WAIT.as_secs()
-        ),
-        (_, Some(Ack::Mine(Taken::Ignored))) => bail!(
+        (_, Some(Taken::Ignored)) => bail!(
             "the {which} ignored {}: it did not name its transaction",
             name(sent)
         ),
@@ -311,6 +300,52 @@ struct FlowState {
     /// This comparison called `sas.confirm()` (set before the call, so a
     /// confirmation interrupted while it is sent counts).
     confirmed: AtomicBool,
+    /// The flow's own cancellation of the comparison (`sas.cancel()`,
+    /// `sas.mismatch()`). The SDK marks the request cancelled before it
+    /// sends, so only this tells the cleanup that a send was cut off.
+    sas_cancel: SendTracker,
+}
+
+/// Whether a send started and whether it ended; kept outside the flow, so a
+/// timeout or a signal that drops the send midway leaves "started, not
+/// finished" behind.
+#[derive(Default)]
+struct SendTracker {
+    started: AtomicBool,
+    finished: AtomicBool,
+}
+
+impl SendTracker {
+    async fn track<F: Future>(&self, send: F) -> F::Output {
+        self.started.store(true, Ordering::SeqCst);
+        let sent = send.await;
+        self.finished.store(true, Ordering::SeqCst);
+        sent
+    }
+
+    /// The outcome to report when the flow stopped while the send ran.
+    fn interrupted(&self) -> Option<CancelOutcome> {
+        (self.started.load(Ordering::SeqCst) && !self.finished.load(Ordering::SeqCst))
+            .then_some(CancelOutcome::SendInterrupted)
+    }
+}
+
+/// Send a verification request. `requesting` is set for the send and
+/// cleared only once it succeeded and its handle is stored in `slot`: an
+/// error from the send can come after the request reached the server, so
+/// the cleanup must still say that its cancellation could not be confirmed.
+async fn send_request<T: Clone, E>(
+    requesting: &AtomicBool,
+    slot: &Mutex<Option<T>>,
+    send: impl Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, E> {
+    requesting.store(true, Ordering::SeqCst);
+    let sent = send.await;
+    if let (Ok(request), Ok(mut slot)) = (&sent, slot.lock()) {
+        *slot = Some(request.clone());
+        requesting.store(false, Ordering::SeqCst);
+    }
+    sent
 }
 
 /// Why a device the store holds as verified is not counted as verified by
@@ -389,9 +424,11 @@ enum CancelOutcome {
     Failed(String),
     /// Cancelled here; sending the cancellation did not end in time.
     TimedOut,
-    /// The request was still being sent when the flow stopped: there is no
-    /// handle to cancel it with.
+    /// The request was still being sent when the flow stopped, or its send
+    /// failed: there is no handle to cancel it with.
     RequestInFlight,
+    /// Cancelled here; the flow stopped while the cancellation was sent.
+    SendInterrupted,
 }
 
 /// The outcome when there is no request handle to cancel.
@@ -456,7 +493,10 @@ fn failure_context(trust: &TrustAfterFailure, cancel: &CancelOutcome, device: &s
             CANCEL_LIMIT.as_secs()
         ),
         CancelOutcome::RequestInFlight => format!(
-            "{trust}; the verification request was still being sent: its cancellation could not be confirmed, and the other device may still show the request"
+            "{trust}; the verification request was still being sent or its send failed: there is no handle to cancel it, its cancellation could not be confirmed, and the other device may still show the request"
+        ),
+        CancelOutcome::SendInterrupted => format!(
+            "{trust}; cancelled here; the other device may not have been notified: the verification stopped while the cancellation was being sent"
         ),
     }
 }
@@ -473,8 +513,13 @@ fn cancel_context(sent: &std::result::Result<(), String>) -> String {
 }
 
 /// Cancel `sas` and describe the outcome (see [`cancel_context`]).
-async fn cancel_sas(sas: &SasVerification) -> String {
-    cancel_context(&sas.cancel().await.map_err(|err| err.to_string()))
+async fn cancel_sas(sas: &SasVerification, send: &SendTracker) -> String {
+    cancel_context(
+        &send
+            .track(sas.cancel())
+            .await
+            .map_err(|err| err.to_string()),
+    )
 }
 
 /// What ended the verification flow.
@@ -748,7 +793,9 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
                 }
                 None => (TrustAfterFailure::NoComparison, String::new()),
             };
-            let cancel = if trust.needs_cancel() {
+            let cancel = if let Some(interrupted) = state.sas_cancel.interrupted() {
+                interrupted
+            } else if trust.needs_cancel() {
                 let request = state.request.lock().ok().and_then(|slot| slot.clone());
                 match request {
                     Some(request) if !request.is_done() && !request.is_cancelled() => {
@@ -820,15 +867,15 @@ async fn flow(
             "Requesting verification with {}; accept it on that device.",
             term_id(device_id.as_str())
         );
-        // Until the send succeeded there is no handle; a timeout or a
-        // signal meanwhile cannot cancel, and must not claim it did.
-        state.requesting.store(true, Ordering::SeqCst);
-        let sent = device.request_verification().await;
-        if let (Ok(request), Ok(mut slot)) = (&sent, state.request.lock()) {
-            *slot = Some(request.clone());
-        }
-        state.requesting.store(false, Ordering::SeqCst);
-        sent.context("cannot send the verification request")?
+        // Until the send succeeded there is no handle; a timeout, a signal
+        // or a failed send cannot cancel, and must not claim it did.
+        send_request(
+            &state.requesting,
+            &state.request,
+            device.request_verification(),
+        )
+        .await
+        .context("cannot send the verification request")?
     } else {
         note!("Waiting for a verification request from one of your devices...");
         let request = loop {
@@ -862,7 +909,14 @@ async fn flow(
     if let Ok(mut slot) = state.sas.lock() {
         *slot = Some((sas.clone(), verified_before));
     }
-    run_sas(&sas, request.flow_id(), answer, &state.confirmed).await
+    run_sas(
+        &sas,
+        request.flow_id(),
+        answer,
+        &state.confirmed,
+        &state.sas_cancel,
+    )
+    .await
 }
 
 /// Drive the request until it turns into a SAS verification.
@@ -972,6 +1026,7 @@ async fn run_sas(
     flow_id: &str,
     how: &Answer,
     confirmed: &AtomicBool,
+    cancel_send: &SendTracker,
 ) -> Result<()> {
     let mut changes = sas.changes();
     let mut state = sas.state();
@@ -1013,7 +1068,7 @@ async fn run_sas(
                         let Some(emojis) = emojis else {
                             bail!(
                                 "the other device offers numbers only, no emoji; {}",
-                                cancel_sas(sas).await
+                                cancel_sas(sas, cancel_send).await
                             );
                         };
                         let other = sas.other_device().device_id().as_str();
@@ -1025,11 +1080,11 @@ async fn run_sas(
                         ) {
                             Ok(pending) => _published.insert(pending),
                             Err(err) => {
-                                return Err(err.context(cancel_sas(sas).await));
+                                return Err(err.context(cancel_sas(sas, cancel_send).await));
                             }
                         };
                         if let Err(err) = emit_line(&mut std::io::stdout(), pending.line()) {
-                            return Err(err.context(cancel_sas(sas).await));
+                            return Err(err.context(cancel_sas(sas, cancel_send).await));
                         }
                         {
                             use std::io::Write as _;
@@ -1046,7 +1101,7 @@ async fn run_sas(
                     PromptOutcome::Ended(err) => return Err(err),
                     PromptOutcome::Answered(Ok(answer)) => answer,
                     PromptOutcome::Answered(Err(err)) => {
-                        return Err(err.context(cancel_sas(sas).await));
+                        return Err(err.context(cancel_sas(sas, cancel_send).await));
                     }
                 };
                 // A cancellation that arrived together with the answer.
@@ -1071,10 +1126,11 @@ async fn run_sas(
                         note!("Confirmed; waiting for the other device.");
                     }
                     (false, Answer::Prompt) => {
-                        sas.mismatch().await.ok();
+                        cancel_send.track(sas.mismatch()).await.ok();
                         bail!("the emoji do not match; verification cancelled");
                     }
-                    (false, Answer::HandOver { .. }) => match sas.cancel().await {
+                    (false, Answer::HandOver { .. }) => match cancel_send.track(sas.cancel()).await
+                    {
                         Ok(()) => bail!("the person cancelled with verify --cancel"),
                         Err(err) => bail!(
                             "the person cancelled with verify --cancel; {}",
@@ -1475,39 +1531,77 @@ mod tests {
         use Decision::{Cancel, Confirm};
         let report = |sent, taken| taken_report(sent, taken, "tx1", "PHONE", 42);
         assert!(
-            report(Confirm, Some(Ack::Mine(Taken::Confirm)))
+            report(Confirm, Some(Taken::Confirm))
                 .unwrap()
                 .contains("took the confirmation")
         );
         assert!(
-            report(Cancel, Some(Ack::Mine(Taken::Cancel)))
+            report(Cancel, Some(Taken::Cancel))
                 .unwrap()
                 .contains("took the cancellation")
         );
         for (sent, taken) in [
-            (Cancel, Some(Ack::Mine(Taken::Confirm))),
-            (Confirm, Some(Ack::Mine(Taken::Cancel))),
-            (Confirm, Some(Ack::Mine(Taken::Ignored))),
-            (Cancel, Some(Ack::Other(Taken::Cancel))),
-            (Confirm, Some(Ack::Other(Taken::Confirm))),
+            (Cancel, Some(Taken::Confirm)),
+            (Confirm, Some(Taken::Cancel)),
+            (Confirm, Some(Taken::Ignored)),
             (Cancel, None),
         ] {
             assert!(report(sent, taken).is_err(), "{sent:?} {taken:?}");
         }
         let late = report(Cancel, None).unwrap_err().to_string();
         assert!(late.contains("did not acknowledge"), "{late}");
-        // Another decision's acknowledgement is never this one's.
-        let other = report(Cancel, Some(Ack::Other(Taken::Confirm)))
-            .unwrap_err()
-            .to_string();
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_cut_off_while_sent_is_reported() {
+        let done = SendTracker::default();
+        done.track(std::future::ready(())).await;
+        assert_eq!(done.interrupted(), None);
+        assert_eq!(SendTracker::default().interrupted(), None, "never sent");
+        let cut = SendTracker::default();
         assert!(
-            other.contains("handled another decision for this token (a confirmation)"),
-            "{other}"
+            best_effort(
+                cut.track(std::future::pending::<()>()),
+                Duration::from_millis(20)
+            )
+            .await
+            .is_none()
         );
+        assert_eq!(cut.interrupted(), Some(CancelOutcome::SendInterrupted));
+        let msg = failure_context(
+            &TrustAfterFailure::NotVerified,
+            &CancelOutcome::SendInterrupted,
+            "PHONE",
+        );
+        assert_eq!(
+            msg,
+            "nothing was trusted on this device; cancelled here; the other device may not have been notified: the verification stopped while the cancellation was being sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_send_stays_in_flight() {
+        let requesting = AtomicBool::new(false);
+        let slot = Mutex::new(None);
+        let failed = send_request(
+            &requesting,
+            &slot,
+            std::future::ready(Err::<u8, _>("reset")),
+        );
+        assert_eq!(failed.await, Err("reset"));
         assert!(
-            other.contains("the cancellation was not acknowledged"),
-            "{other}"
+            requesting.load(Ordering::SeqCst),
+            "a failed send was taken as never sent"
         );
+        assert_eq!(*slot.lock().unwrap(), None);
+        assert_eq!(
+            without_request(requesting.load(Ordering::SeqCst)),
+            CancelOutcome::RequestInFlight
+        );
+        let sent = send_request(&requesting, &slot, std::future::ready(Ok::<u8, &str>(7)));
+        assert_eq!(sent.await, Ok(7));
+        assert!(!requesting.load(Ordering::SeqCst));
+        assert_eq!(*slot.lock().unwrap(), Some(7));
     }
 
     #[tokio::test]

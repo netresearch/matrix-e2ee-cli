@@ -14,11 +14,13 @@
 //!   of that decision process. It is published with a hard link, so a
 //!   second decision never replaces the first: the data directory's file
 //!   system must support hard links.
-//! - `<token>.taken.json`: the waiting process's acknowledgement, naming
-//!   what it did with the decision and that decision's nonce. The decision
-//!   process whose nonce it names removes it after reading it; one of
-//!   another nonce is left alone. The next `verify` sweeps an
-//!   acknowledgement nobody removed once it is older than [`TAKEN_STALE`].
+//! - `<token>.<nonce>.taken.json`: the waiting process's acknowledgement of
+//!   the decision with that nonce, naming what it did with it. Each decision
+//!   has its own file, so a decision process reads and removes only its own
+//!   acknowledgement, never another decider's. A decision whose nonce is not
+//!   lowercase hex of the generated length names no file: it is ignored and
+//!   not acknowledged. The next `verify` sweeps an acknowledgement nobody
+//!   removed once it is older than [`TAKEN_STALE`].
 //!
 //! A decision is bound to the comparison the person saw by its token, not
 //! by the transaction id (the other side chooses that in `--listen`); the
@@ -105,19 +107,8 @@ struct DecisionFile {
 #[derive(Debug, Serialize, Deserialize)]
 struct TakenFile {
     taken: Taken,
-    /// The nonce of the decision file this answers; none when that file
-    /// could not be read as a decision.
-    #[serde(default)]
-    nonce: Option<String>,
-}
-
-/// An acknowledgement, as a decision process reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ack {
-    /// The waiting process answered this process's decision.
-    Mine(Taken),
-    /// The acknowledgement answers another decision for the same token.
-    Other(Taken),
+    /// The nonce of the decision file this answers (also in the file name).
+    nonce: String,
 }
 
 fn random_nonce() -> String {
@@ -126,16 +117,26 @@ fn random_nonce() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Whether `nonce` has the form [`random_nonce`] generates: lowercase hex
+/// of `2 * NONCE_BYTES` digits. Only such a nonce reaches a file name.
+fn valid_nonce(nonce: &str) -> bool {
+    nonce.len() == 2 * NONCE_BYTES
+        && nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The acknowledgement file of the decision with `nonce` for `token`.
+fn taken_path(dir: &Path, token: &str, nonce: &str) -> PathBuf {
+    dir.join(format!("{token}.{nonce}{TAKEN_SUFFIX}"))
+}
+
 /// The process id in a well-formed token `<pid>-<32 lowercase hex>`; anything
 /// else (a path, a guess) is refused before it reaches a file name.
 fn token_pid(token: &str) -> Option<u32> {
     let (pid, nonce) = token.split_once('-')?;
     let digits = !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit());
-    let hex = nonce.len() == 2 * NONCE_BYTES
-        && nonce
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    if digits && hex {
+    if digits && valid_nonce(nonce) {
         pid.parse().ok()
     } else {
         None
@@ -148,44 +149,58 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     write_through_tmp(path, bytes, |tmp, path| fs::rename(tmp, path))
 }
 
-/// Whether a failed `fs::hard_link` means the file system has no hard links:
-/// `EPERM` from link(2) on Linux (e.g. FAT), `ENOTSUP` / `EOPNOTSUPP`, or on
-/// Windows `ERROR_INVALID_FUNCTION` / `ERROR_NOT_SUPPORTED`.
-fn hard_links_unsupported(err: &std::io::Error) -> bool {
+/// Why a failed `fs::hard_link` may have failed, when the cause is the link
+/// itself rather than the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkFailure {
+    /// The file system has no hard links: `ENOTSUP` / `EOPNOTSUPP`, or on
+    /// Windows `ERROR_INVALID_FUNCTION` / `ERROR_NOT_SUPPORTED`.
+    Unsupported,
+    /// `EPERM` from link(2): a file system without hard links (e.g. FAT),
+    /// but also a policy (seccomp, an LSM, `protected_hardlinks`).
+    DeniedOrUnsupported,
+}
+
+fn link_failure(err: &std::io::Error) -> Option<LinkFailure> {
     if err.kind() == std::io::ErrorKind::Unsupported {
-        return true;
+        return Some(LinkFailure::Unsupported);
     }
     #[cfg(unix)]
     {
-        matches!(
-            err.raw_os_error(),
-            Some(code) if code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
-        )
+        match err.raw_os_error() {
+            Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP => {
+                Some(LinkFailure::Unsupported)
+            }
+            Some(code) if code == libc::EPERM => Some(LinkFailure::DeniedOrUnsupported),
+            _ => None,
+        }
     }
     #[cfg(windows)]
     {
-        matches!(err.raw_os_error(), Some(1 | 50))
+        matches!(err.raw_os_error(), Some(1 | 50)).then_some(LinkFailure::Unsupported)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        false
+        None
     }
 }
 
-/// A failed hard link, with the cause named when the file system has no
-/// hard links; the kind stays, so `AlreadyExists` still means "exists".
+/// A failed hard link, with the cause named when it lies in the link
+/// itself; the kind stays, so `AlreadyExists` still means "exists".
 fn explain_link_error(err: std::io::Error) -> std::io::Error {
-    if hard_links_unsupported(&err) {
-        std::io::Error::new(
-            err.kind(),
-            format!(
-                "the file system of the data directory does not support hard links, \
-                 which verify --confirm and --cancel need ({err})"
-            ),
-        )
-    } else {
-        err
-    }
+    let cause = match link_failure(&err) {
+        Some(LinkFailure::Unsupported) => {
+            "the file system of the data directory does not support hard links"
+        }
+        Some(LinkFailure::DeniedOrUnsupported) => {
+            "creating a hard link in the data directory was denied or is not supported here"
+        }
+        None => return err,
+    };
+    std::io::Error::new(
+        err.kind(),
+        format!("{cause}, which verify --confirm and --cancel need ({err})"),
+    )
 }
 
 /// Like [`write_private`], but never replaces an existing `path`: the
@@ -306,8 +321,8 @@ pub fn sweep(dir: &Path, stale: Duration) -> Result<()> {
 
 /// A comparison published by the waiting process. Dropping it removes its
 /// emoji and decision files, on every exit path (a timeout drops the future
-/// that owns it). The acknowledgement stays for `--confirm` / `--cancel`
-/// to read; the decision process whose nonce it names removes it, and the
+/// that owns it). An acknowledgement stays for `--confirm` / `--cancel`
+/// to read; the decision process whose nonce names it removes it, and the
 /// next `verify` sweeps it once it is stale if nobody did.
 #[derive(Debug)]
 pub struct Pending {
@@ -316,9 +331,9 @@ pub struct Pending {
     taken: std::sync::Mutex<Option<Decision>>,
     comparison: Comparison,
     line: String,
+    dir: PathBuf,
     emoji_file: PathBuf,
     decision_file: PathBuf,
-    taken_file: PathBuf,
 }
 
 impl Pending {
@@ -342,12 +357,11 @@ impl Pending {
             line: json_line(&comparison)?,
             emoji_file: dir.join(format!("{token}{EMOJI_SUFFIX}")),
             decision_file: dir.join(format!("{token}{DECISION_SUFFIX}")),
-            taken_file: dir.join(format!("{token}{TAKEN_SUFFIX}")),
+            dir: dir.to_owned(),
             comparison,
         };
-        // Removed before the emoji file exists, so neither can predate it.
+        // Removed before the emoji file exists, so it cannot predate it.
         let _ = fs::remove_file(&pending.decision_file);
-        let _ = fs::remove_file(&pending.taken_file);
         write_private(
             &pending.emoji_file,
             format!("{}\n", pending.line).as_bytes(),
@@ -364,9 +378,11 @@ impl Pending {
         &self.comparison.token
     }
 
-    fn acknowledge(&self, taken: Taken, nonce: Option<String>) -> Result<()> {
+    /// Write the acknowledgement of the decision with `nonce` (a valid one)
+    /// to that decision's own file.
+    fn acknowledge(&self, taken: Taken, nonce: String) -> Result<()> {
         write_private(
-            &self.taken_file,
+            &taken_path(&self.dir, self.token(), &nonce),
             serde_json::to_string(&TakenFile { taken, nonce })?.as_bytes(),
         )
     }
@@ -375,7 +391,9 @@ impl Pending {
     /// acknowledged. The first decision counts: it is kept and returned by
     /// every later poll, and its file stays, so no second hand-over can be
     /// placed. A file under this token that names another transaction is
-    /// removed and acknowledged as ignored. Once a decision is taken the
+    /// removed and acknowledged as ignored; one without a valid nonce is
+    /// removed and ignored without an acknowledgement (it names no file).
+    /// Once a decision is taken the
     /// emoji file goes too: the verification no longer waits, so a later
     /// --confirm or --cancel finds nothing.
     pub fn poll(&self) -> Result<Option<Decision>> {
@@ -389,16 +407,20 @@ impl Pending {
         let Some(text) = read_private(&self.decision_file)? else {
             return Ok(None);
         };
-        let file = serde_json::from_str::<DecisionFile>(&text).ok();
-        let nonce = file.as_ref().map(|file| file.nonce.clone());
-        let decision = file
-            .filter(|file| file.transaction_id == self.comparison.transaction_id)
-            .map(|file| file.decision);
-        let Some(decision) = decision else {
+        let file = serde_json::from_str::<DecisionFile>(&text)
+            .ok()
+            .filter(|file| valid_nonce(&file.nonce));
+        let Some(file) = file else {
+            let _ = fs::remove_file(&self.decision_file);
+            return Ok(None);
+        };
+        let nonce = file.nonce;
+        if file.transaction_id != self.comparison.transaction_id {
             let _ = fs::remove_file(&self.decision_file);
             self.acknowledge(Taken::Ignored, nonce)?;
             return Ok(None);
-        };
+        }
+        let decision = file.decision;
         *taken = Some(decision);
         let _ = fs::remove_file(&self.emoji_file);
         self.acknowledge(
@@ -424,8 +446,8 @@ impl Drop for Pending {
 pub struct Waiting {
     pub pid: u32,
     pub comparison: Comparison,
+    /// This decision's own acknowledgement file, named after its nonce.
     taken_file: PathBuf,
-    /// This decision's nonce; only an acknowledgement naming it is ours.
     nonce: String,
 }
 
@@ -472,9 +494,8 @@ pub fn hand_over(dir: &Path, token: &str, decision: Decision) -> Result<Waiting>
     if comparison.token != token {
         bail!("the emoji file of token {token} names another token");
     }
-    // The acknowledgement of an earlier decider stays for that decider.
-    let taken_file = dir.join(format!("{token}{TAKEN_SUFFIX}"));
     let nonce = random_nonce();
+    let taken_file = taken_path(dir, token, &nonce);
     let file = DecisionFile {
         transaction_id: comparison.transaction_id.clone(),
         decision,
@@ -498,27 +519,24 @@ pub fn hand_over(dir: &Path, token: &str, decision: Decision) -> Result<Waiting>
     })
 }
 
-/// Wait up to `within` for the waiting process to acknowledge this decision.
-/// An acknowledgement naming this decision's nonce is `Ack::Mine` and is
-/// removed once read. One naming another nonce answers another decision for
-/// the token; it is left for that decider and may still be replaced by the
-/// answer to this one, so it is reported (`Ack::Other`) only when the time
-/// is up. `None` when there was no acknowledgement at all.
-pub fn await_taken(waiting: &Waiting, within: Duration, every: Duration) -> Result<Option<Ack>> {
+/// Wait up to `within` for the waiting process to acknowledge this decision
+/// in the decision's own file, which is removed once read; no other
+/// decider's acknowledgement is read or removed. `None` when there was no
+/// acknowledgement in time.
+pub fn await_taken(waiting: &Waiting, within: Duration, every: Duration) -> Result<Option<Taken>> {
     let deadline = Instant::now() + within;
-    let mut other = None;
     loop {
         if let Some(text) = read_private(&waiting.taken_file)? {
             let file: TakenFile =
                 serde_json::from_str(&text).context("the acknowledgement is not valid")?;
-            if file.nonce.as_deref() == Some(waiting.nonce.as_str()) {
-                let _ = fs::remove_file(&waiting.taken_file);
-                return Ok(Some(Ack::Mine(file.taken)));
+            let _ = fs::remove_file(&waiting.taken_file);
+            if file.nonce != waiting.nonce {
+                bail!("the acknowledgement of this decision names another decision");
             }
-            other = Some(file.taken);
+            return Ok(Some(file.taken));
         }
         if Instant::now() >= deadline {
-            return Ok(other.map(Ack::Other));
+            return Ok(None);
         }
         std::thread::sleep(every);
     }
@@ -562,7 +580,7 @@ mod tests {
         assert_eq!(pending.poll().unwrap(), Some(Decision::Confirm));
         assert_eq!(
             await_taken(&target, QUICK, QUICK).unwrap(),
-            Some(Ack::Mine(Taken::Confirm))
+            Some(Taken::Confirm)
         );
         // Decided: a later --cancel must not report a hand-over nobody reads.
         let err = hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap_err();
@@ -580,7 +598,7 @@ mod tests {
         assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
         assert_eq!(
             await_taken(&first, QUICK, QUICK).unwrap(),
-            Some(Ack::Mine(Taken::Cancel))
+            Some(Taken::Cancel)
         );
     }
 
@@ -614,9 +632,9 @@ mod tests {
         assert!(hand_over(tmp.path(), pending.token(), Decision::Cancel).is_err());
         assert_eq!(
             await_taken(&first, QUICK, QUICK).unwrap(),
-            Some(Ack::Mine(Taken::Confirm))
+            Some(Taken::Confirm)
         );
-        assert!(!pending.taken_file.exists(), "the acknowledgement stayed");
+        assert!(!first.taken_file.exists(), "the acknowledgement stayed");
         assert_eq!(await_taken(&first, QUICK, QUICK).unwrap(), None);
     }
 
@@ -629,7 +647,7 @@ mod tests {
         let emoji = fs::read(&pending.emoji_file).unwrap();
         let first = hand_over(tmp.path(), pending.token(), Decision::Confirm).unwrap();
         assert_eq!(pending.poll().unwrap(), Some(Decision::Confirm));
-        let (emoji_file, taken_file) = (pending.emoji_file.clone(), pending.taken_file.clone());
+        let emoji_file = pending.emoji_file.clone();
         // ... and publishes after the waiting process dropped the comparison.
         drop(pending);
         write_private(&emoji_file, &emoji).unwrap();
@@ -640,18 +658,19 @@ mod tests {
         )
         .unwrap();
         fs::remove_file(&emoji_file).unwrap();
+        assert_ne!(second.taken_file, first.taken_file);
         assert_eq!(
             await_taken(&second, QUICK, QUICK).unwrap(),
-            Some(Ack::Other(Taken::Confirm)),
+            None,
             "the second decision took the first one's acknowledgement"
         );
         assert!(
-            taken_file.exists(),
+            first.taken_file.exists(),
             "the first one's acknowledgement was removed"
         );
         assert_eq!(
             await_taken(&first, QUICK, QUICK).unwrap(),
-            Some(Ack::Mine(Taken::Confirm))
+            Some(Taken::Confirm)
         );
     }
 
@@ -672,17 +691,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pending.poll().unwrap(), None);
-        // A second decider may hand over now, and leaves the answer alone.
+        // A second decider may hand over now, and its decision is taken
+        // before the first decider read its answer.
         let second = hand_over(tmp.path(), pending.token(), Decision::Cancel).unwrap();
+        assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
+        // Each gets its own acknowledgement, never the other one's.
         assert_eq!(
             await_taken(&first, QUICK, QUICK).unwrap(),
-            Some(Ack::Mine(Taken::Ignored))
+            Some(Taken::Ignored)
         );
-        // The second decision gets its own acknowledgement.
-        assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
         assert_eq!(
             await_taken(&second, QUICK, QUICK).unwrap(),
-            Some(Ack::Mine(Taken::Cancel))
+            Some(Taken::Cancel)
         );
     }
 
@@ -694,7 +714,7 @@ mod tests {
         assert_eq!(pending.poll().unwrap(), Some(Decision::Cancel));
         assert_eq!(
             await_taken(&target, QUICK, QUICK).unwrap(),
-            Some(Ack::Mine(Taken::Cancel))
+            Some(Taken::Cancel)
         );
     }
 
@@ -771,10 +791,11 @@ mod tests {
         assert_eq!(pending.poll().unwrap(), None, "a stale decision confirmed");
 
         // A decision under this token that names another transaction.
+        let nonce = "ab".repeat(NONCE_BYTES);
         let other = DecisionFile {
             transaction_id: "tx0".to_owned(),
             decision: Decision::Confirm,
-            nonce: "n".to_owned(),
+            nonce: nonce.clone(),
         };
         write_private(
             &pending.decision_file,
@@ -788,8 +809,53 @@ mod tests {
         );
         assert!(!pending.decision_file.exists());
         assert!(pending.emoji_file.exists(), "it stopped waiting");
-        let text = fs::read_to_string(&pending.taken_file).unwrap();
-        assert_eq!(text, r#"{"taken":"ignored","nonce":"n"}"#);
+        let text = fs::read_to_string(taken_path(tmp.path(), pending.token(), &nonce)).unwrap();
+        assert_eq!(text, format!(r#"{{"taken":"ignored","nonce":"{nonce}"}}"#));
+    }
+
+    #[test]
+    fn a_decision_without_a_valid_nonce_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = publish(tmp.path(), "tx1");
+        let valid = "ab".repeat(NONCE_BYTES);
+        for nonce in [
+            String::new(),
+            "n".to_owned(),
+            valid.to_uppercase(),
+            format!("{valid}0"),
+            valid[1..].to_owned(),
+            format!("{}g", &valid[1..]),
+        ] {
+            // The right transaction, so only the nonce can refuse it.
+            let file = DecisionFile {
+                transaction_id: "tx1".to_owned(),
+                decision: Decision::Confirm,
+                nonce: nonce.clone(),
+            };
+            write_private(
+                &pending.decision_file,
+                serde_json::to_string(&file).unwrap().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(pending.poll().unwrap(), None, "{nonce:?} was taken");
+            assert!(!pending.decision_file.exists(), "{nonce:?} stayed");
+            assert!(pending.emoji_file.exists(), "it stopped waiting");
+        }
+        let names: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.ends_with(TAKEN_SUFFIX)),
+            "{names:?}"
+        );
+        // A valid decision is still taken afterwards.
+        let target = hand_over(tmp.path(), pending.token(), Decision::Confirm).unwrap();
+        assert_eq!(pending.poll().unwrap(), Some(Decision::Confirm));
+        assert_eq!(
+            await_taken(&target, QUICK, QUICK).unwrap(),
+            Some(Taken::Confirm)
+        );
     }
 
     #[test]
@@ -814,9 +880,10 @@ mod tests {
     fn sweep_removes_what_an_ended_process_left() {
         let tmp = tempfile::tempdir().unwrap();
         let earlier = publish(tmp.path(), "tx1");
-        hand_over(tmp.path(), earlier.token(), Decision::Confirm).unwrap();
-        write_private(&earlier.taken_file, b"{}").unwrap();
-        age(&earlier.taken_file, TAKEN_STALE);
+        let target = hand_over(tmp.path(), earlier.token(), Decision::Confirm).unwrap();
+        assert_eq!(earlier.poll().unwrap(), Some(Decision::Confirm));
+        assert!(target.taken_file.exists());
+        age(&target.taken_file, TAKEN_STALE);
         std::mem::forget(earlier);
         fs::write(tmp.path().join("unrelated"), "x").unwrap();
         sweep(tmp.path(), TAKEN_STALE).unwrap();
@@ -840,17 +907,18 @@ mod tests {
         sweep(tmp.path(), TAKEN_STALE).unwrap();
         assert_eq!(
             await_taken(&target, QUICK, QUICK).unwrap(),
-            Some(Ack::Mine(Taken::Cancel))
+            Some(Taken::Cancel)
         );
         assert!(TAKEN_STALE > TAKEN_WAIT);
     }
 
     #[test]
-    fn a_file_system_without_hard_links_is_named() {
+    fn a_failed_hard_link_names_its_cause() {
         use std::io::{Error, ErrorKind};
+        const NO_LINKS: &str = "the file system of the data directory does not support hard links, which verify --confirm and --cancel need";
         #[cfg(unix)]
         let unsupported = [
-            Error::from_raw_os_error(libc::EPERM),
+            Error::from_raw_os_error(libc::ENOTSUP),
             Error::from_raw_os_error(libc::EOPNOTSUPP),
             Error::from(ErrorKind::Unsupported),
         ];
@@ -860,12 +928,22 @@ mod tests {
             let kind = err.kind();
             let explained = explain_link_error(err);
             assert_eq!(explained.kind(), kind);
+            assert!(explained.to_string().contains(NO_LINKS), "{explained}");
+        }
+        // EPERM also comes from a policy (seccomp, an LSM,
+        // protected_hardlinks): never blamed on the file system alone.
+        #[cfg(unix)]
+        {
+            let explained = explain_link_error(Error::from_raw_os_error(libc::EPERM));
+            assert_eq!(explained.kind(), ErrorKind::PermissionDenied);
+            let text = explained.to_string();
             assert!(
-                explained.to_string().contains(
-                    "the file system of the data directory does not support hard links, which verify --confirm and --cancel need"
+                text.contains(
+                    "creating a hard link in the data directory was denied or is not supported here, which verify --confirm and --cancel need"
                 ),
-                "{explained}"
+                "{text}"
             );
+            assert!(!text.contains("file system"), "{text}");
         }
         // An existing decision file stays "exists": the first one counts.
         for err in [
@@ -875,7 +953,7 @@ mod tests {
             let kind = err.kind();
             let explained = explain_link_error(err);
             assert_eq!(explained.kind(), kind);
-            assert!(!explained.to_string().contains("hard links"), "{explained}");
+            assert!(!explained.to_string().contains("hard link"), "{explained}");
         }
     }
 
@@ -937,13 +1015,13 @@ mod tests {
         let pending = publish(&dir, "tx1");
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&pending.emoji_file), 0o600);
-        hand_over(&dir, pending.token(), Decision::Confirm).unwrap();
+        let target = hand_over(&dir, pending.token(), Decision::Confirm).unwrap();
         assert_eq!(mode(&pending.decision_file), 0o600);
         // A decision file others could have written is refused.
         fs::set_permissions(&pending.decision_file, fs::Permissions::from_mode(0o622)).unwrap();
         assert!(pending.poll().is_err());
         fs::set_permissions(&pending.decision_file, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(pending.poll().unwrap(), Some(Decision::Confirm));
-        assert_eq!(mode(&pending.taken_file), 0o600);
+        assert_eq!(mode(&target.taken_file), 0o600);
     }
 }
