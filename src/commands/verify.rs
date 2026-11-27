@@ -4,10 +4,12 @@
 //! verification step arrives as a to-device event.
 //!
 //! With a terminal on stdin and stderr, a person confirms the emoji at the
-//! prompt. Without one (an agent runs the command), the emoji go to stdout as
-//! one JSON line and to an owner-only file, and the verification is confirmed
-//! only after a second process, `verify --confirm`, handed over the person's
-//! decision; the CLI never confirms on its own.
+//! prompt. With `--hand-over` (an agent runs the command, with or without a
+//! terminal), the emoji go to stdout as one JSON line and to an owner-only
+//! file, and the verification is confirmed only after a second process,
+//! `verify --confirm`, handed over the person's decision; the CLI never
+//! confirms on its own. Without a terminal and without `--hand-over` it
+//! refuses.
 
 use std::future::Future;
 use std::io::IsTerminal;
@@ -135,13 +137,25 @@ enum Confirmer {
     Agent,
 }
 
-/// stdin: the person's answer. stderr: the emoji and the question. Both
-/// must be a terminal for the prompt; otherwise the agent hand-over is used.
-fn confirmer(stdin_is_terminal: bool, stderr_is_terminal: bool) -> Confirmer {
-    if stdin_is_terminal && stderr_is_terminal {
-        Confirmer::Person
+const NEEDS_TERMINAL: &str = "verify needs a terminal on stdin and stderr: the emoji comparison must be seen and confirmed by a person; no verification was started";
+
+/// The hand-over only when asked for (`--hand-over`), with or without a
+/// terminal. Otherwise the prompt, whose answer comes from stdin and whose
+/// emoji and question go to stderr: both must be a terminal, or verify
+/// refuses as before; it never falls back to the hand-over on its own.
+fn confirmer(
+    hand_over: bool,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> Result<Confirmer> {
+    if hand_over {
+        Ok(Confirmer::Agent)
+    } else if stdin_is_terminal && stderr_is_terminal {
+        Ok(Confirmer::Person)
     } else {
-        Confirmer::Agent
+        bail!(
+            "{NEEDS_TERMINAL}. An agent that has the person compare the emoji passes --hand-over."
+        )
     }
 }
 
@@ -452,9 +466,10 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
         return list_devices(args.json).await;
     }
     let who = confirmer(
+        args.hand_over,
         std::io::stdin().is_terminal(),
         std::io::stderr().is_terminal(),
-    );
+    )?;
     let config = load_config()?;
     let paths = Paths::from_env()?;
     let _lock = paths.lock().await?;
@@ -977,11 +992,22 @@ mod tests {
     }
 
     #[test]
-    fn without_a_terminal_the_agent_hand_over_is_chosen() {
-        assert_eq!(confirmer(true, true), Confirmer::Person);
-        assert_eq!(confirmer(false, true), Confirmer::Agent);
-        assert_eq!(confirmer(true, false), Confirmer::Agent);
-        assert_eq!(confirmer(false, false), Confirmer::Agent);
+    fn the_hand_over_is_opt_in() {
+        // Without --hand-over: the prompt at a terminal, else refused.
+        assert_eq!(confirmer(false, true, true).unwrap(), Confirmer::Person);
+        for (stdin, stderr) in [(false, true), (true, false), (false, false)] {
+            let err = confirmer(false, stdin, stderr).unwrap_err().to_string();
+            assert!(err.starts_with(NEEDS_TERMINAL), "{err}");
+            assert!(err.contains("--hand-over"), "{err}");
+        }
+        // --hand-over: the hand-over, with and without a terminal.
+        for (stdin, stderr) in [(true, true), (false, true), (true, false), (false, false)] {
+            assert_eq!(
+                confirmer(true, stdin, stderr).unwrap(),
+                Confirmer::Agent,
+                "{stdin} {stderr}"
+            );
+        }
     }
 
     #[test]

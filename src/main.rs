@@ -106,31 +106,36 @@ enum Command {
 #[derive(Debug, Args)]
 #[command(group(clap::ArgGroup::new("mode").required(true).args(["request", "listen", "list", "confirm", "cancel"])))]
 pub struct VerifyArgs {
-    /// Start verification towards this device of your own account.
-    ///
-    /// Without a terminal on stdin and stderr, the emoji are printed as one
-    /// JSON line with a token, and the command waits for
-    /// `verify --confirm TOKEN` or `verify --cancel TOKEN` from a second
-    /// process; it never confirms on its own.
+    /// Start verification towards this device of your own account. Needs a
+    /// terminal on stdin and stderr, unless --hand-over is given.
     #[arg(long, value_name = "DEVICE_ID")]
     pub request: Option<String>,
-    /// Wait for a verification request from one of your own devices
-    /// (without a terminal: as for --request).
+    /// Wait for a verification request from one of your own devices. Needs
+    /// a terminal on stdin and stderr, unless --hand-over is given.
     #[arg(long)]
     pub listen: bool,
+    /// With --request or --listen: let another process decide. The emoji are
+    /// printed as one JSON line with a token, and the process that runs
+    /// `verify --confirm TOKEN` confirms them: the device is then trusted.
+    /// Run --confirm only after the person compared the emoji with the other
+    /// device and said they match; otherwise run `verify --cancel TOKEN`.
+    /// This process never confirms on its own. Works with or without a
+    /// terminal.
+    #[arg(long, conflicts_with_all = ["list", "confirm", "cancel"])]
+    pub hand_over: bool,
     /// List your account's devices: id, name, verified or not, this device.
     #[arg(long)]
     pub list: bool,
     /// With --list: one JSON object per device.
     #[arg(long, conflicts_with_all = ["request", "listen", "confirm", "cancel"])]
     pub json: bool,
-    /// Confirm the emoji of a verification that waits without a terminal,
+    /// Confirm the emoji of a verification that waits with --hand-over,
     /// after the person compared them and said they match. TOKEN is the
     /// "token" of the emoji line that person saw; it names that comparison
     /// and no other.
     #[arg(long, value_name = "TOKEN")]
     pub confirm: Option<String>,
-    /// Cancel a verification that waits without a terminal. TOKEN is the
+    /// Cancel a verification that waits with --hand-over. TOKEN is the
     /// "token" of its emoji line.
     #[arg(long, value_name = "TOKEN")]
     pub cancel: Option<String>,
@@ -568,6 +573,19 @@ mod tests {
         assert!(list.list && !list.json);
         assert!(verify(&["--list", "--json"]).json);
         assert_eq!(verify(&["--listen"]).timeout, 180);
+    }
+
+    #[test]
+    fn verify_hand_over_goes_with_request_or_listen() {
+        assert!(verify(&["--request", "DEVICE", "--hand-over"]).hand_over);
+        assert!(verify(&["--listen", "--hand-over"]).hand_over);
+        assert!(!verify(&["--listen"]).hand_over);
+        let parse = |a: &[&str]| Cli::try_parse_from([&["m", "verify"][..], a].concat());
+        assert!(parse(&["--hand-over"]).is_err());
+        assert!(parse(&["--list", "--hand-over"]).is_err());
+        let token = "4242-0123456789abcdef0123456789abcdef";
+        assert!(parse(&["--confirm", token, "--hand-over"]).is_err());
+        assert!(parse(&["--cancel", token, "--hand-over"]).is_err());
     }
 
     #[test]
