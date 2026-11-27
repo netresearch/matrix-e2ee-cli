@@ -255,18 +255,23 @@ fn hand_over_instructions(token: &str, other_device: &str, timeout: u64) -> Stri
     )
 }
 
-/// The other device's id when the store holds it as verified: then the
-/// trust is in place, whatever ended the flow.
-async fn verified_in_store(client: &Client, sas: &SasVerification) -> Option<String> {
+/// Whether the store holds the other device of `sas` as verified.
+async fn stored_as_verified(client: &Client, sas: &SasVerification) -> bool {
     let device = sas.other_device();
-    match client
-        .encryption()
-        .get_device(device.user_id(), device.device_id())
-        .await
-    {
-        Ok(Some(stored)) if stored.is_verified() => Some(device.device_id().to_string()),
-        _ => None,
-    }
+    matches!(
+        client
+            .encryption()
+            .get_device(device.user_id(), device.device_id())
+            .await,
+        Ok(Some(stored)) if stored.is_verified()
+    )
+}
+
+/// Whether this flow verified the device: it was not verified when the SAS
+/// began, is now, and this SAS was not cancelled. A device verified before
+/// (a re-verification) does not count; that flow is cancelled as usual.
+fn verified_by_this_flow(verified_before: bool, verified_now: bool, sas_cancelled: bool) -> bool {
+    !verified_before && verified_now && !sas_cancelled
 }
 
 /// The error to report after a failed, timed-out or interrupted flow, and
@@ -509,7 +514,8 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
     });
 
     let current: Arc<Mutex<Option<VerificationRequest>>> = Arc::default();
-    let sas_slot: Arc<Mutex<Option<SasVerification>>> = Arc::default();
+    // The SAS, and whether its device was verified before this flow.
+    let sas_slot: Arc<Mutex<Option<(SasVerification, bool)>>> = Arc::default();
     let flow = flow(
         &client,
         &own_user,
@@ -551,7 +557,11 @@ pub async fn run(args: VerifyArgs) -> Result<()> {
         Err(err) if stopped || agent => {
             let sas = sas_slot.lock().ok().and_then(|slot| slot.clone());
             let verified = match &sas {
-                Some(sas) => verified_in_store(&client, sas).await,
+                Some((sas, verified_before)) => {
+                    let now = stored_as_verified(&client, sas).await;
+                    verified_by_this_flow(*verified_before, now, sas.is_cancelled())
+                        .then(|| sas.other_device().device_id().to_string())
+                }
                 None => None,
             };
             let (err, cancel) = after_failure(err, verified.as_deref());
@@ -580,7 +590,7 @@ async fn flow(
     args: &VerifyArgs,
     rx: &mut mpsc::UnboundedReceiver<(OwnedUserId, String)>,
     current: Arc<Mutex<Option<VerificationRequest>>>,
-    sas_slot: Arc<Mutex<Option<SasVerification>>>,
+    sas_slot: Arc<Mutex<Option<(SasVerification, bool)>>>,
     answer: &Answer,
 ) -> Result<()> {
     let encryption = client.encryption();
@@ -649,8 +659,10 @@ async fn flow(
     }
 
     let sas = wait_for_sas(&request).await?;
+    // Before any confirm: only a change from here counts as this flow's.
+    let verified_before = stored_as_verified(client, &sas).await;
     if let Ok(mut slot) = sas_slot.lock() {
-        *slot = Some(sas.clone());
+        *slot = Some((sas.clone(), verified_before));
     }
     run_sas(&sas, request.flow_id(), answer).await
 }
@@ -1078,6 +1090,25 @@ mod tests {
         let finished =
             run_until_stopped(async { 7 }, Duration::from_secs(60), std::future::pending()).await;
         assert!(matches!(finished, Stop::Finished(7)), "{finished:?}");
+    }
+
+    #[test]
+    fn a_device_verified_before_the_flow_is_cancelled_after_a_timeout() {
+        // Re-verifying a known device: verified before and after, then a
+        // timeout. Not this flow's trust: cancel and say so.
+        let verified = verified_by_this_flow(true, true, false).then_some("PHONE");
+        let (err, cancel) = after_failure(anyhow::anyhow!("verification timed out"), verified);
+        let msg = format!("{err:#}");
+        assert!(cancel, "the request would not be cancelled");
+        assert!(
+            msg.contains("verification cancelled; nothing was trusted"),
+            "{msg}"
+        );
+        assert!(!msg.contains("verified locally"), "{msg}");
+        // Only a change to verified by a SAS that was not cancelled counts.
+        assert!(verified_by_this_flow(false, true, false));
+        assert!(!verified_by_this_flow(false, false, false));
+        assert!(!verified_by_this_flow(false, true, true));
     }
 
     #[test]
