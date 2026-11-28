@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-28
+
+Commands that let the matrix-skill run every script through this tool's one session, a plaintext send for bots that cannot decrypt, and reads while the watch daemon runs. The new room commands that write (`create-room`, `invite`, `power-level --set`) have not run against a homeserver yet.
+
+### Added
+
+- `rooms [--json] [--search TERM] [--lookup NAME]`, `resolve ALIAS`, `create-room NAME`, `invite ROOM USER_ID` and `power-level ROOM (--show | --get USER | --set USER LEVEL)`, with the output of the matrix-skill's scripts of the same names; while the watch daemon runs they go through it ([#16](https://github.com/netresearch/matrix-e2ee-cli/pull/16)).
+- `send --plaintext` sends an unencrypted `m.room.message` even in an encrypted room, after a warning, for bots without encryption such as a matrix-hookshot bridge ([#17](https://github.com/netresearch/matrix-e2ee-cli/pull/17)).
+- `read` goes through the watch daemon while it runs; `read --request-keys` there waits for two of the daemon's syncs instead of syncing itself ([#17](https://github.com/netresearch/matrix-e2ee-cli/pull/17)).
+
+### Changed
+
+- **Breaking:** a watch daemon started from 0.3.0 or earlier answers `rooms`, `resolve`, `create-room`, `invite`, `power-level`, `read` and `send --plaintext` with `unknown op`, and these commands then stop instead of taking the direct path. Restart the daemon after the upgrade ([#16](https://github.com/netresearch/matrix-e2ee-cli/pull/16), [#17](https://github.com/netresearch/matrix-e2ee-cli/pull/17)).
+
 ## [0.3.0] - 2026-11-27
 
 The behaviour of the matrix-skill's E2EE scripts, so the skill can call this CLI in their place, and device verification that an agent can drive. Key requests and agent verification have not run against a second, live device yet.
