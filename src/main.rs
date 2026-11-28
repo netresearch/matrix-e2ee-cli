@@ -10,6 +10,8 @@ mod daemon_client;
 #[cfg(all(test, unix))]
 mod daemon_test_support;
 mod formatting;
+#[cfg(test)]
+mod mock_homeserver;
 mod room_arg;
 mod roomlog;
 mod session;
@@ -62,9 +64,20 @@ enum Command {
     Redact(RedactArgs),
     /// Download the attachment of a file, image, video or audio message.
     Download(DownloadArgs),
+    /// List the joined rooms with name, alias and room id.
+    Rooms(RoomsArgs),
+    /// Resolve a room alias to its room id.
+    Resolve(ResolveArgs),
+    /// Create a room (unencrypted unless the homeserver's defaults encrypt it).
+    CreateRoom(CreateRoomArgs),
+    /// Invite a user to a room.
+    Invite(InviteArgs),
+    /// Show the power levels of a room, or get or set one user's level.
+    PowerLevel(PowerLevelArgs),
     /// Run the watch daemon: it holds the store, logs the rooms in
-    /// config.json's "watch_rooms" and carries out send, react, redact and
-    /// edit for the other commands while it runs (Linux and macOS).
+    /// config.json's "watch_rooms" and carries out the other commands that
+    /// need the store (send, react, redact, edit, rooms, resolve,
+    /// create-room, invite, power-level) while it runs (Linux and macOS).
     WatchDaemon(WatchDaemonArgs),
     /// Follow a watched room's log: a summary of what is new since the
     /// cursor, then one line per event. Needs no store and no lock.
@@ -307,6 +320,90 @@ impl RedactArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct RoomsArgs {
+    /// Print the rooms as one JSON array.
+    #[arg(long)]
+    pub json: bool,
+    /// Filter rooms by name, alias or member user id (a room without a name
+    /// is named after its members and also matches on their user ids).
+    #[arg(short, long, value_name = "TERM")]
+    pub search: Option<String>,
+    /// Find one room by alias or name and print its room id (for scripts).
+    #[arg(short, long, value_name = "NAME")]
+    pub lookup: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ResolveArgs {
+    /// Room alias (e.g. #myroom:matrix.org).
+    pub alias: String,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CreateRoomArgs {
+    /// Room display name.
+    pub name: String,
+    /// Room alias localpart, e.g. "lsb" for #lsb:server (fails if the alias is taken).
+    #[arg(long, value_name = "LOCALPART")]
+    pub alias: Option<String>,
+    /// Room topic.
+    #[arg(long)]
+    pub topic: Option<String>,
+    /// Invite a user on creation (repeatable).
+    #[arg(long, value_name = "USER_ID")]
+    pub invite: Vec<String>,
+    /// Room preset.
+    #[arg(long, value_enum, default_value = "private_chat")]
+    pub preset: commands::create_room::Preset,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Print only the room id.
+    #[arg(short, long)]
+    pub quiet: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct InviteArgs {
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
+    pub room: String,
+    /// Full Matrix user id to invite (@user:server).
+    pub user_id: String,
+    /// Print the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Print only the room id.
+    #[arg(short, long)]
+    pub quiet: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("action").required(true).args(["show", "get", "set"])))]
+pub struct PowerLevelArgs {
+    /// Room id (!x:server, or !x in room version 12), alias (#x:server) or room name.
+    pub room: String,
+    /// Print the whole m.room.power_levels content.
+    #[arg(long)]
+    pub show: bool,
+    /// Print this user's level (users_default when not listed).
+    #[arg(long, value_name = "USER_ID")]
+    pub get: Option<String>,
+    /// Set this user's level to LEVEL (an integer); the whole content is
+    /// read and written back with only that entry changed.
+    #[arg(long, num_args = 2, value_names = ["USER_ID", "LEVEL"], allow_negative_numbers = true)]
+    pub set: Option<Vec<String>>,
+    /// Print the result as JSON (--show prints the content either way).
+    #[arg(long)]
+    pub json: bool,
+    /// Minimal output (--show: the content on one line).
+    #[arg(short, long)]
+    pub quiet: bool,
+}
+
+#[derive(Debug, Args)]
 #[command(group(clap::ArgGroup::new("action").required(true).args(["start", "stop", "status", "foreground"])))]
 pub struct WatchDaemonArgs {
     /// Start in the background (output in daemon.log in the data directory).
@@ -370,6 +467,11 @@ async fn main() {
         Command::React(args) => commands::react::run(args).await,
         Command::Redact(args) => commands::redact::run(args).await,
         Command::Download(args) => commands::download::run(args).await,
+        Command::Rooms(args) => commands::rooms::run(args).await,
+        Command::Resolve(args) => commands::resolve::run(args).await,
+        Command::CreateRoom(args) => commands::create_room::run(args).await,
+        Command::Invite(args) => commands::invite::run(args).await,
+        Command::PowerLevel(args) => commands::power_level::run(args).await,
         Command::WatchDaemon(args) => commands::watch_daemon::run(args).await,
         Command::Watch(args) => commands::watch::run(args).await,
         Command::BackupRestore => commands::backup::run().await,

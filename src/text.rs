@@ -91,6 +91,62 @@ pub fn python_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Resul
     Ok(String::from_utf8(out).expect("python_json writes ASCII only"))
 }
 
+/// `value` as Python's `json.dumps(value)` prints it: one line, `", "`
+/// between items, `": "` after keys, and ensure_ascii as in [`python_json`].
+pub fn python_json_line<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<String> {
+    let mut out = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, AsciiLine);
+    value.serialize(&mut serializer)?;
+    // Only ASCII is written.
+    Ok(String::from_utf8(out).expect("python_json_line writes ASCII only"))
+}
+
+/// Python's default separators on one line, with its ensure_ascii escaping.
+struct AsciiLine;
+
+impl serde_json::ser::Formatter for AsciiLine {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first { Ok(()) } else { w.write_all(b", ") }
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first { Ok(()) } else { w.write_all(b", ") }
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+    fn write_string_fragment<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        fragment: &str,
+    ) -> std::io::Result<()> {
+        write_ascii(w, fragment)
+    }
+}
+
+/// A string fragment as Python's ensure_ascii writes it: U+0020-U+007E as
+/// is, every other character as `\uXXXX`, beyond the BMP as a surrogate pair.
+fn write_ascii<W: ?Sized + std::io::Write>(w: &mut W, fragment: &str) -> std::io::Result<()> {
+    for c in fragment.chars() {
+        if (' '..='~').contains(&c) {
+            w.write_all(&[c as u8])?;
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                write!(w, "\\u{unit:04x}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// serde_json's pretty layout, with Python's ensure_ascii escaping.
 struct AsciiPretty<'a>(serde_json::ser::PrettyFormatter<'a>);
 
@@ -135,17 +191,7 @@ impl serde_json::ser::Formatter for AsciiPretty<'_> {
         w: &mut W,
         fragment: &str,
     ) -> std::io::Result<()> {
-        for c in fragment.chars() {
-            if (' '..='~').contains(&c) {
-                w.write_all(&[c as u8])?;
-            } else {
-                let mut units = [0u16; 2];
-                for unit in c.encode_utf16(&mut units) {
-                    write!(w, "\\u{unit:04x}")?;
-                }
-            }
-        }
-        Ok(())
+        write_ascii(w, fragment)
     }
 }
 
@@ -166,6 +212,32 @@ mod tests {
         let expected = "[\n  {\n    \"a\": \"Gr\\u00fc\\u00dfe \\ud83d\\ude42\",\n    \"e\": {},\n    \"l\": [],\n    \"n\": 5,\n    \"o\": {\n      \"w\": 2\n    }\n  },\n  null,\n  true\n]";
         assert_eq!(python_json(&value).unwrap(), expected);
         assert_eq!(python_json(&Vec::<u8>::new()).unwrap(), "[]");
+    }
+
+    #[test]
+    fn python_json_line_matches_json_dumps() {
+        // python3: json.dumps({"a": "Grüße 🙂\x7f", "l": [1, None, True, 1.5],
+        //   "o": {}, "e": [], "n": {"x": "y"}}); json!() sorts the keys, so
+        //   the struct below keeps them in the Python order.
+        #[derive(serde::Serialize)]
+        struct Sample {
+            a: &'static str,
+            l: serde_json::Value,
+            o: serde_json::Value,
+            e: serde_json::Value,
+            n: serde_json::Value,
+        }
+        let sample = Sample {
+            a: "Grüße 🙂\u{7f}",
+            l: serde_json::json!([1, null, true, 1.5]),
+            o: serde_json::json!({}),
+            e: serde_json::json!([]),
+            n: serde_json::json!({"x": "y"}),
+        };
+        assert_eq!(
+            python_json_line(&sample).unwrap(),
+            r#"{"a": "Gr\u00fc\u00dfe \ud83d\ude42\u007f", "l": [1, null, true, 1.5], "o": {}, "e": [], "n": {"x": "y"}}"#
+        );
     }
 
     #[test]

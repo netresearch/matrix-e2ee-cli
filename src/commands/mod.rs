@@ -1,18 +1,23 @@
 //! The subcommands and the helpers they share.
 
 pub mod backup;
+pub mod create_room;
 pub mod download;
 pub mod edit;
 pub mod fetch_keys;
+pub mod invite;
 pub mod login;
 pub mod logout;
 // Unix only: the matrix-skill's nio store and its flock exist on Linux and
 // macOS, and the command uses flock and O_NOFOLLOW.
 #[cfg(unix)]
 pub mod migrate_nio;
+pub mod power_level;
 pub mod react;
 pub mod read;
 pub mod redact;
+pub mod resolve;
+pub mod rooms;
 pub mod send;
 pub mod status;
 pub mod verify;
@@ -77,6 +82,21 @@ pub async fn via_daemon_at<T: serde::de::DeserializeOwned>(
                 .map(Some)
                 .context("the watch daemon's answer is incomplete")
         }
+    }
+}
+
+/// The server's own text for a failed request (the `error` field of a
+/// Matrix error answer), which the matrix-skill's scripts print after
+/// "Error: "; any other failure (no answer, an answer that is no Matrix
+/// error) as matrix-sdk describes it.
+pub fn server_message(
+    api: Option<&matrix_sdk::ruma::api::error::Error>,
+    fallback: &dyn std::fmt::Display,
+) -> String {
+    use matrix_sdk::ruma::api::error::{ErrorBody, StandardErrorBody};
+    match api.map(|e| &e.body) {
+        Some(ErrorBody::Standard(StandardErrorBody { message, .. })) => message.clone(),
+        _ => fallback.to_string(),
     }
 }
 
