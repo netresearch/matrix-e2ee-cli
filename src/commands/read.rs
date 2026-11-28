@@ -3,6 +3,10 @@
 //! Output at parity with the matrix-skill's `matrix-read-e2ee.py` (matrix-nio):
 //! the same order (newest first), the same JSON fields and values, and the
 //! same text line layout.
+//!
+//! Like the writing commands, `read` goes through the watch daemon when one
+//! answers on its socket (the daemon holds the store and its lock), and
+//! takes the direct path otherwise. Both paths render the same lines here.
 
 use std::future::Future;
 use std::time::Duration;
@@ -19,11 +23,11 @@ use matrix_sdk::{Client, EncryptionState, Room};
 use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
 use serde_json::value::RawValue;
+use serde_json::{Value, json};
 
 use crate::ReadArgs;
-use crate::commands::{resolve_room, sync_once};
+use crate::commands::{resolve_room, sync_once, via_daemon};
 use crate::config::load_config;
 use crate::session::{KeySharing, Paths, restore};
 use crate::text::{python_json, term, term_body};
@@ -128,32 +132,202 @@ pub const KEY_WAIT_INTERVAL: Duration = Duration::from_secs(5);
 pub const KEY_WAIT_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn run(args: ReadArgs) -> Result<()> {
-    let config = load_config()?;
     let paths = Paths::from_env()?;
-    let _lock = paths.lock().await?;
-    let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
-    let client = restored.client;
-    sync_once(&client).await?;
-    let room = resolve_room(&client, &args.room).await?;
-    let room_encrypted = room_encrypted(&room).await?;
+    let request = read_request(&args);
+    let lines = match via_daemon::<ReadOutcome>(&paths, request.clone(), "read").await? {
+        Some(outcome) => {
+            for line in &outcome.warnings {
+                eprintln!("{}", term(line));
+            }
+            outcome.lines()
+        }
+        None => {
+            let config = load_config()?;
+            let _lock = paths.lock().await?;
+            let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
+            let client = restored.client;
+            sync_once(&client).await?;
+            let key_wait = key_wait_rounds(
+                KEY_WAIT_ROUNDS,
+                KEY_WAIT_INTERVAL,
+                || sync_with_timeout(&client, KEY_WAIT_SYNC_TIMEOUT),
+                |line| eprintln!("{line}"),
+            );
+            execute(&client, &request, |line| eprintln!("{line}"), key_wait).await?
+        }
+    };
+    // Rendered here on both paths, so the output (and the local time of
+    // the text lines) is this process's.
+    print!("{}", render(&lines, args.json)?);
+    Ok(())
+}
+
+/// The "read" request the watch daemon takes. `--json` is not part of it:
+/// the output is rendered by the calling process on both paths.
+pub fn read_request(args: &ReadArgs) -> Value {
+    json!({
+        "op": "read",
+        "room": args.room,
+        "limit": args.limit,
+        "request_keys": args.request_keys,
+    })
+}
+
+/// Carry out a "read" request with `client`: the messages, newest first.
+///
+/// Warning lines (whole, with "warning: ") go to `warn`. With
+/// `request_keys` and an undecryptable message, `key_wait` runs (it is
+/// polled first then, after the first read) before the second read: on the
+/// direct path [`key_wait_rounds`], in the daemon a wait for its syncs.
+pub async fn execute<W>(
+    client: &Client,
+    request: &Value,
+    mut warn: W,
+    key_wait: impl Future<Output = ()>,
+) -> Result<Vec<Line>>
+where
+    W: FnMut(String),
+{
+    let room_arg = request
+        .get("room")
+        .and_then(Value::as_str)
+        .context("the request has no \"room\"")?;
+    let limit = request
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|l| u32::try_from(l).ok())
+        .context("the request has no valid \"limit\"")?;
+    let request_keys = request
+        .get("request_keys")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let room = resolve_room(client, room_arg).await?;
+    let (room_encrypted, unknown) = room_encryption(&room).await?;
+    if let Some(line) = unknown {
+        warn(line);
+    }
 
     // Room::messages() decrypts each event; for one without its key,
     // matrix-sdk queues a key request to our other devices
     // (automatic-room-key-forwarding), which the next sync sends.
-    let mut lines = fetch_lines(&room, args.limit, room_encrypted).await?;
-    if args.request_keys && lines.iter().any(Line::is_undecryptable) {
-        warn_without_verified_device(&client).await;
-        key_wait_rounds(
-            KEY_WAIT_ROUNDS,
-            KEY_WAIT_INTERVAL,
-            || sync_with_timeout(&client, KEY_WAIT_SYNC_TIMEOUT),
-            |line| eprintln!("{line}"),
-        )
-        .await;
-        lines = fetch_lines(&room, args.limit, room_encrypted).await?;
+    let mut lines = fetch_lines(&room, limit, room_encrypted).await?;
+    if request_keys && lines.iter().any(Line::is_undecryptable) {
+        if let Some(line) = without_verified_device_warning(client).await {
+            warn(line);
+        }
+        key_wait.await;
+        lines = fetch_lines(&room, limit, room_encrypted).await?;
     }
-    print!("{}", render(&lines, args.json)?);
-    Ok(())
+    Ok(lines)
+}
+
+/// [`execute`] in the watch daemon: the warnings go into the answer.
+/// `key_wait` must not sync: the daemon's own sync loop syncs (a second
+/// sync on the same client would race it), so it waits for that loop.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub async fn daemon_execute(
+    client: &Client,
+    request: &Value,
+    key_wait: impl Future<Output = ()>,
+) -> Result<ReadOutcome> {
+    let mut warnings = Vec::new();
+    let lines = execute(client, request, |line| warnings.push(line), key_wait).await?;
+    Ok(ReadOutcome {
+        messages: lines.iter().map(WireLine::from).collect(),
+        warnings,
+    })
+}
+
+/// The watch daemon's answer to "read".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadOutcome {
+    pub messages: Vec<WireLine>,
+    /// Whole warning lines, printed to stderr by the caller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl ReadOutcome {
+    pub fn lines(&self) -> Vec<Line> {
+        self.messages.iter().cloned().map(Line::from).collect()
+    }
+}
+
+/// A [`Line`] on the daemon socket: every field, also the ones the JSON
+/// output skips (`was_encrypted`) or leaves out when empty, and
+/// `session_id`'s two levels as two fields (JSON `null` cannot tell
+/// "undecryptable, no session named" from "not undecryptable").
+///
+/// The daemon's answer passes through `serde_json::Value` on both ends
+/// (`to_answer`, the client's decode), which sorts object keys and reads a
+/// `null` into `None`. So `url` has a `has_url` beside it (a `file.url`
+/// of `null` prints `"url": null`), and `info` travels as a list of pairs,
+/// which keeps the sender's key order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireLine {
+    pub sender: String,
+    pub body: String,
+    pub msgtype: String,
+    pub timestamp: u64,
+    pub event_id: String,
+    pub encrypted: bool,
+    pub format: Option<String>,
+    pub formatted_body: Option<String>,
+    pub has_url: bool,
+    pub url: Option<Value>,
+    pub info: Option<Vec<(String, Value)>>,
+    pub undecryptable: bool,
+    pub session_id: Option<String>,
+    pub decrypted: bool,
+    pub sender_verified: bool,
+    pub room_encrypted: bool,
+    pub was_encrypted: bool,
+}
+
+impl From<&Line> for WireLine {
+    fn from(line: &Line) -> Self {
+        Self {
+            sender: line.sender.clone(),
+            body: line.body.clone(),
+            msgtype: line.msgtype.clone(),
+            timestamp: line.timestamp,
+            event_id: line.event_id.clone(),
+            encrypted: line.encrypted,
+            format: line.format.clone(),
+            formatted_body: line.formatted_body.clone(),
+            has_url: line.url.is_some(),
+            url: line.url.clone(),
+            info: line.info.clone().map(|OrderedMap(pairs)| pairs),
+            undecryptable: line.session_id.is_some(),
+            session_id: line.session_id.clone().flatten(),
+            decrypted: line.decrypted,
+            sender_verified: line.sender_verified,
+            room_encrypted: line.room_encrypted,
+            was_encrypted: line.was_encrypted,
+        }
+    }
+}
+
+impl From<WireLine> for Line {
+    fn from(wire: WireLine) -> Self {
+        Self {
+            sender: wire.sender,
+            body: wire.body,
+            msgtype: wire.msgtype,
+            timestamp: wire.timestamp,
+            event_id: wire.event_id,
+            encrypted: wire.encrypted,
+            format: wire.format,
+            formatted_body: wire.formatted_body,
+            url: wire.has_url.then(|| wire.url.unwrap_or(Value::Null)),
+            info: wire.info.map(OrderedMap),
+            session_id: wire.undecryptable.then_some(wire.session_id),
+            decrypted: wire.decrypted,
+            sender_verified: wire.sender_verified,
+            room_encrypted: wire.room_encrypted,
+            was_encrypted: wire.was_encrypted,
+        }
+    }
 }
 
 /// The whole output: one JSON array (Python's `json.dumps(messages, indent=2)`),
@@ -168,23 +342,25 @@ pub fn render(lines: &[Line], json: bool) -> Result<String> {
     Ok(lines.iter().map(|l| text_line(l) + "\n").collect())
 }
 
-pub async fn room_encrypted(room: &Room) -> Result<bool> {
+/// Whether the room is encrypted, and the warning line for an unknown
+/// state, which counts as encrypted.
+pub async fn room_encryption(room: &Room) -> Result<(bool, Option<String>)> {
     Ok(
         match room
             .latest_encryption_state()
             .await
             .context("cannot read the room's encryption state")?
         {
-            EncryptionState::Encrypted => true,
-            EncryptionState::NotEncrypted => false,
+            EncryptionState::Encrypted => (true, None),
+            EncryptionState::NotEncrypted => (false, None),
             // Treat it as encrypted, so unencrypted events get marked.
-            EncryptionState::Unknown => {
-                eprintln!(
+            EncryptionState::Unknown => (
+                true,
+                Some(format!(
                     "warning: the encryption state of {} is unknown; treating it as encrypted",
                     term(room.room_id().as_str())
-                );
-                true
-            }
+                )),
+            ),
         },
     )
 }
@@ -261,20 +437,26 @@ where
 /// verified (matrix-sdk-crypto gossiping/machine.rs, should_request_key).
 /// Say so instead of waiting in silence for keys nobody was asked for.
 pub async fn warn_without_verified_device(client: &Client) {
+    if let Some(line) = without_verified_device_warning(client).await {
+        eprintln!("{line}");
+    }
+}
+
+/// The warning line of [`warn_without_verified_device`], if it applies.
+pub async fn without_verified_device_warning(client: &Client) -> Option<String> {
     let (Some(user), Some(own)) = (client.user_id(), client.device_id()) else {
-        return;
+        return None;
     };
     let any = match client.encryption().get_user_devices(user).await {
         Ok(devices) => devices
             .devices()
             .any(|d| d.device_id() != own && d.is_verified()),
-        Err(_) => return,
+        Err(_) => return None,
     };
-    if !any {
-        eprintln!(
-            "warning: none of your other devices is verified; matrix-sdk sends no key request without one"
-        );
-    }
+    (!any).then(|| {
+        "warning: none of your other devices is verified; matrix-sdk sends no key request without one"
+            .to_owned()
+    })
 }
 
 /// Python's `format_timestamp`: local time `YYYY-MM-DD HH:MM`, `unknown` for 0.
@@ -465,7 +647,7 @@ pub fn to_line(event: &TimelineEvent, room_encrypted: bool) -> Option<Line> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use matrix_sdk::deserialized_responses::{
         AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, UnableToDecryptInfo,
@@ -542,6 +724,266 @@ mod tests {
 
     fn json_of(event: &TimelineEvent) -> serde_json::Value {
         serde_json::to_value(to_line(event, true).expect("a line")).unwrap()
+    }
+
+    /// The timeline the read tests serve, newest first: a text message, a
+    /// notice with HTML, an image with info, and (in an encrypted room) an
+    /// event nobody can decrypt.
+    /// The timeline the read tests serve, newest first, as the bytes the
+    /// server sends: a text message, a notice with HTML, an image whose
+    /// `info` keys are not sorted, a file whose `file.url` is null, and (in
+    /// an encrypted room) an event nobody can decrypt.
+    pub fn timeline(encrypted: bool) -> String {
+        let mut chunk = vec![
+            json!({"type": "m.room.message", "event_id": "$t:example.org", "sender": "@a:example.org",
+                "origin_server_ts": 1_700_000_300_000u64, "room_id": "!r:example.org",
+                "content": {"msgtype": "m.text", "body": "hello\nworld"}})
+            .to_string(),
+            json!({"type": "m.room.message", "event_id": "$n:example.org", "sender": "@bot:example.org",
+                "origin_server_ts": 1_700_000_200_000u64, "room_id": "!r:example.org",
+                "content": {"msgtype": "m.notice", "body": "**done**",
+                    "format": "org.matrix.custom.html", "formatted_body": "<strong>done</strong>"}})
+            .to_string(),
+            // Written out: json! would sort the info keys.
+            r#"{"type": "m.room.message", "event_id": "$i:example.org", "sender": "@a:example.org",
+                "origin_server_ts": 1700000100000, "room_id": "!r:example.org",
+                "content": {"msgtype": "m.image", "body": "p.png", "url": "mxc://example.org/p",
+                    "info": {"w": 2, "mimetype": "image/png", "size": 3, "h": 1, "x": 9}}}"#
+                .to_owned(),
+            json!({"type": "m.room.message", "event_id": "$f:example.org", "sender": "@a:example.org",
+                "origin_server_ts": 1_700_000_050_000u64, "room_id": "!r:example.org",
+                "content": {"msgtype": "m.file", "body": "f.bin", "file": {"url": null}}})
+            .to_string(),
+        ];
+        if encrypted {
+            chunk.push(
+                json!({"type": "m.room.encrypted", "event_id": "$u:example.org",
+                "sender": "@b:example.org", "origin_server_ts": 1_700_000_000_000u64,
+                "room_id": "!r:example.org",
+                "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "AAAA",
+                    "session_id": "SESSION", "sender_key": "KEY", "device_id": "DEV"}})
+                .to_string(),
+            );
+        }
+        format!(
+            r#"{{"chunk": [{}], "start": "t0", "end": "t1"}}"#,
+            chunk.join(", ")
+        )
+    }
+
+    /// [`crate::commands::send::tests::room_server`] that also serves
+    /// [`timeline`].
+    pub fn read_server(encrypted: bool) -> crate::mock_homeserver::MockHomeserver {
+        let server = crate::commands::send::tests::room_server(encrypted);
+        server.route(
+            "GET",
+            "/_matrix/client/v3/rooms/!r:example.org/messages",
+            200,
+            &timeline(encrypted),
+        );
+        server
+    }
+
+    /// The queries of the /messages requests the server received.
+    pub fn messages_queries(server: &crate::mock_homeserver::MockHomeserver) -> Vec<String> {
+        server
+            .received()
+            .into_iter()
+            .filter(|r| r.path == "/_matrix/client/v3/rooms/!r:example.org/messages")
+            .map(|r| r.query)
+            .collect()
+    }
+
+    pub fn read_args(argv: &[&str]) -> ReadArgs {
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([&["m", "read"][..], argv].concat()).unwrap();
+        let crate::Command::Read(args) = cli.command else {
+            panic!("not read")
+        };
+        args
+    }
+
+    /// What the direct path prints for ARGV against [`read_server`]:
+    /// (stdout, stderr lines, /messages queries).
+    pub async fn direct_read(encrypted: bool, argv: &[&str]) -> (String, Vec<String>, Vec<String>) {
+        let args = read_args(argv);
+        let server = read_server(encrypted);
+        let client = server.client("@me:example.org").await;
+        sync_once(&client).await.unwrap();
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let key_wait = key_wait_rounds(
+            KEY_WAIT_ROUNDS,
+            Duration::ZERO,
+            || sync_with_timeout(&client, Duration::ZERO),
+            |line| warnings.borrow_mut().push(line),
+        );
+        let lines = execute(
+            &client,
+            &read_request(&args),
+            |line| warnings.borrow_mut().push(line),
+            key_wait,
+        )
+        .await
+        .unwrap();
+        (
+            render(&lines, args.json).unwrap(),
+            warnings.into_inner(),
+            messages_queries(&server),
+        )
+    }
+
+    #[test]
+    fn the_read_request_carries_room_limit_and_request_keys() {
+        assert_eq!(
+            read_request(&read_args(&["#ops:example.org"])),
+            json!({"op": "read", "room": "#ops:example.org", "limit": 10, "request_keys": false})
+        );
+        // --json is rendered by the caller, so the request is the same.
+        assert_eq!(
+            read_request(&read_args(&["r", "-l", "3", "-k", "--json"])),
+            json!({"op": "read", "room": "r", "limit": 3, "request_keys": true})
+        );
+    }
+
+    #[test]
+    fn a_line_survives_the_daemon_socket() {
+        let mut lines = vec![
+            to_line(&plain(message("m.text", "hi")), true).unwrap(),
+            to_line(&decrypted("hi", VerificationState::Verified), true).unwrap(),
+            to_line(&utd("$e2", "s"), true).unwrap(),
+        ];
+        // Undecryptable, without a session named: Some(None).
+        let mut nameless = lines[2].clone();
+        nameless.session_id = Some(None);
+        lines.push(nameless);
+        let mut image = message("m.image", "p.png");
+        image["content"]["url"] = json!("mxc://e/p");
+        image["content"]["info"] = json!({"w": 2, "mimetype": "image/png", "h": 1});
+        let mut html = message("m.notice", "b");
+        html["content"]["format"] = json!("org.matrix.custom.html");
+        html["content"]["formatted_body"] = json!("<b>b</b>");
+        lines.push(to_line(&plain(image), false).unwrap());
+        let mut null_url = message("m.file", "f");
+        null_url["content"]["file"] = json!({"url": null});
+        let null_url = to_line(&plain(null_url), false).unwrap();
+        // Info keys not sorted (json! would sort them).
+        let unsorted = TimelineEvent::from_plaintext(
+            Raw::from_json_string(
+                r#"{"type": "m.room.message", "event_id": "$o", "sender": "@a:example",
+                    "origin_server_ts": 1, "content": {"msgtype": "m.image", "body": "o",
+                    "url": "mxc://e/o", "info": {"w": 2, "mimetype": "image/png", "h": 1}}}"#
+                    .to_owned(),
+            )
+            .unwrap(),
+        );
+        let unsorted = to_line(&unsorted, false).unwrap();
+        let keys: Vec<_> = unsorted
+            .info
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(keys, ["w", "mimetype", "h"]);
+        lines.push(unsorted);
+        assert_eq!(null_url.url, Some(Value::Null));
+        lines.push(null_url);
+        lines.push(to_line(&plain(html), false).unwrap());
+        let outcome = ReadOutcome {
+            messages: lines.iter().map(WireLine::from).collect(),
+            warnings: vec!["warning: w".into()],
+        };
+        // As the daemon answers (to_answer: through serde_json::Value) and
+        // the client decodes (through Value again).
+        let wire = serde_json::to_string(&serde_json::to_value(&outcome).unwrap()).unwrap();
+        let back: ReadOutcome =
+            serde_json::from_value(serde_json::from_str::<Value>(&wire).unwrap()).unwrap();
+        // What the caller renders (a null url arrives as no url and
+        // has_url, so the wire structs differ).
+        assert_eq!(back.lines(), lines);
+        assert_eq!(back.warnings, outcome.warnings);
+        for json in [false, true] {
+            assert_eq!(
+                render(&back.lines(), json).unwrap(),
+                render(&lines, json).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_direct_path_reads_what_the_server_holds() {
+        let (out, warnings, queries) =
+            direct_read(false, &["!r:example.org", "-l", "3", "--json"]).await;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(queries.len(), 1);
+        assert!(queries[0].contains("limit=3"), "{queries:?}");
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        let ids: Vec<_> = parsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["event_id"].clone())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "$t:example.org",
+                "$n:example.org",
+                "$i:example.org",
+                "$f:example.org"
+            ]
+        );
+        // The image's info in the sender's order, without "x".
+        assert!(
+            out.contains("\"info\": {\n      \"w\": 2,\n      \"mimetype\": \"image/png\",\n      \"size\": 3,\n      \"h\": 1\n    }"),
+            "{out}"
+        );
+        // The file's null file.url stays a null url.
+        let file = parsed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["event_id"] == "$f:example.org")
+            .unwrap();
+        assert_eq!(file.get("url"), Some(&Value::Null), "{file}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_large_answer_arrives_whole() {
+        use crate::commands::via_daemon_at;
+        use crate::daemon_test_support::FakeDaemon;
+        // 200 messages of 10 000 characters: about 2 MB on one line.
+        let line = to_line(&plain(message("m.text", &"x\n".repeat(5_000))), false).unwrap();
+        let outcome = ReadOutcome {
+            messages: vec![WireLine::from(&line); 200],
+            warnings: Vec::new(),
+        };
+        let mut answer = serde_json::to_value(&outcome).unwrap();
+        answer["ok"] = json!(true);
+        let fake = FakeDaemon::start(Some(answer));
+        let got =
+            via_daemon_at::<ReadOutcome>(&fake.path, read_request(&read_args(&["r"])), "read")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(got, outcome);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_without_the_read_op_is_an_error() {
+        use crate::commands::via_daemon_at;
+        use crate::daemon_test_support::FakeDaemon;
+        let fake = FakeDaemon::start(Some(json!({"ok": false, "error": "unknown op: \"read\""})));
+        let err =
+            via_daemon_at::<ReadOutcome>(&fake.path, read_request(&read_args(&["r"])), "read")
+                .await
+                .unwrap_err()
+                .to_string();
+        assert_eq!(fake.received()["op"], "read");
+        assert!(err.contains("unknown op"), "{err}");
     }
 
     #[test]

@@ -193,6 +193,11 @@ pub struct SendArgs {
     /// Share this message's room key with unverified devices too (this message only).
     #[arg(long)]
     pub trust_unverified_devices: bool,
+    /// Send this message unencrypted, also in an encrypted room, where the homeserver and
+    /// everyone who joins later can read it. Meant for bots that cannot decrypt, such as a
+    /// matrix-hookshot bridge without encryption (`!hookshot webhook <name>`).
+    #[arg(long, conflicts_with = "trust_unverified_devices")]
+    pub plaintext: bool,
     /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,
@@ -213,7 +218,8 @@ pub struct ReadArgs {
     pub json: bool,
     /// For undecryptable messages: wait and sync 6 times (5 s each, plus up
     /// to 5 s per sync) so the key requests reach your other devices and
-    /// their keys arrive, then read again.
+    /// their keys arrive, then read again. Through the watch daemon: wait
+    /// until two of the daemon's own syncs have completed (at most 30 s).
     /// matrix-sdk asks only when one of your other devices is verified.
     /// A session already asked for is not asked again.
     #[arg(short = 'k', long)]

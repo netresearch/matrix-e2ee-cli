@@ -63,7 +63,7 @@ pub mod unix {
 
     use crate::WatchDaemonArgs;
     use crate::commands::{
-        create_room, edit, invite, power_level, react, redact, resolve, rooms, send,
+        create_room, edit, invite, power_level, react, read, redact, resolve, rooms, send,
     };
     use crate::config::{Config, config_path, load_config, load_watch_rooms};
     use crate::daemon_client::{REQUEST_TIMEOUT, Reply, request_async, running_daemon_pid};
@@ -531,6 +531,7 @@ pub mod unix {
             rooms,
             started: Instant::now(),
             last_sync: AtomicI64::new(0),
+            syncs: watch::Sender::new(0),
         });
         let result = serve_and_sync(&daemon, &paths, stop, &mut cleanup).await;
         // Every queued log write is done before the lock and the pid file go.
@@ -630,6 +631,26 @@ pub mod unix {
     /// How long the shutdown waits for the operation in flight. The SDK
     /// retries a send on 5xx and 429 for up to 15 minutes.
     const OP_WAIT: Duration = Duration::from_secs(30);
+
+    /// `read --request-keys` in the daemon: the second read comes after
+    /// this many of the sync loop's syncs have completed, counted from the
+    /// end of the first read. matrix-sdk sends the key request only inside
+    /// `sync_once` (before and after each sync request), so the sync in
+    /// flight sends it when it ends, and the next one can bring the key.
+    const READ_KEY_SYNCS: u64 = 2;
+
+    /// At most this long, the direct path's bound (6 rounds of 5 s).
+    const READ_KEY_WAIT_LIMIT: Duration =
+        Duration::from_secs(read::KEY_WAIT_ROUNDS as u64 * read::KEY_WAIT_INTERVAL.as_secs());
+
+    /// Wait until `count` more syncs than at the first poll have completed,
+    /// at most `limit`.
+    async fn syncs_completed(mut syncs: watch::Receiver<u64>, count: u64, limit: Duration) {
+        let start = *syncs.borrow_and_update();
+        tokio::time::timeout(limit, syncs.wait_for(|n| *n >= start + count))
+            .await
+            .ok();
+    }
 
     /// End serving without dropping an answer: stop accepting, let the
     /// operation in flight finish (later ones see `stopping` and refuse) for
@@ -1055,6 +1076,9 @@ pub mod unix {
         started: Instant,
         /// Unix seconds of the last successful sync, 0 for never.
         last_sync: AtomicI64,
+        /// Syncs of the sync loop completed so far (`read --request-keys`
+        /// waits for them).
+        syncs: watch::Sender<u64>,
     }
 
     impl Daemon {
@@ -1301,6 +1325,22 @@ pub mod unix {
                     })
                     .await
                 }
+                // Reading shares no room key.
+                "read" => {
+                    let syncs = self.syncs.subscribe();
+                    self.run_op(false, |c| async move {
+                        let key_wait = syncs_completed(syncs, READ_KEY_SYNCS, READ_KEY_WAIT_LIMIT);
+                        to_answer(read::daemon_execute(&c, &request, key_wait).await?)
+                    })
+                    .await
+                }
+                // Unencrypted on purpose (send --plaintext): no room key.
+                send::PLAINTEXT_OP => {
+                    self.run_op(false, |c| async move {
+                        to_answer(send::execute(&c, &request).await?)
+                    })
+                    .await
+                }
                 "edit" => {
                     let trust = send::request_trusts_unverified(&request);
                     self.run_op(trust, |c| async move {
@@ -1493,6 +1533,7 @@ pub mod unix {
                 match outcome {
                     Ok(()) => {
                         self.last_sync.store(now_ms() / 1000, Ordering::SeqCst);
+                        self.syncs.send_modify(|n| *n += 1);
                         backoff = Duration::from_secs(1);
                     }
                     Err(err)
@@ -3140,6 +3181,7 @@ pub mod unix {
                 rooms: vec![("!r:e".into(), "!r:e".into())],
                 started: Instant::now(),
                 last_sync: AtomicI64::new(0),
+                syncs: watch::Sender::new(0),
             });
             let now = Instant::now();
             daemon
@@ -3195,7 +3237,339 @@ pub mod unix {
                 rooms: Vec::new(),
                 started: Instant::now(),
                 last_sync: AtomicI64::new(0),
+                syncs: watch::Sender::new(0),
             })
+        }
+
+        /// `read -k` through the daemon, with the room key of the one
+        /// message arriving only in a sync after the first read: the second
+        /// read decrypts it.
+        #[tokio::test]
+        async fn read_request_keys_waits_for_the_daemon_s_syncs() {
+            use crate::commands::read::tests::read_args;
+            use crate::commands::read::{ReadOutcome, read_request};
+            use crate::commands::send::tests::room_server;
+            use matrix_sdk::ruma::api::client::keys::{claim_keys, get_keys};
+            use matrix_sdk::ruma::events::AnyMessageLikeEventContent;
+            use matrix_sdk_base::crypto::types::requests::AnyOutgoingRequest;
+            use matrix_sdk_base::crypto::{EncryptionSettings, OlmMachine};
+
+            let me = UserId::parse("@me:example.org").unwrap();
+            let bob = UserId::parse("@b:example.org").unwrap();
+            let room_id = RoomId::parse("!r:example.org").unwrap();
+            let server = room_server(true);
+            let client = server.client(me.as_str()).await;
+            crate::commands::sync_once(&client).await.unwrap();
+            // Our device and one-time keys, as the client uploaded them.
+            let upload: Value = server
+                .received()
+                .iter()
+                .find(|r| r.path.ends_with("/keys/upload"))
+                .map(|r| serde_json::from_str(&r.body).unwrap())
+                .expect("a key upload");
+            let (otk_id, otk) = upload["one_time_keys"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .next()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .expect("a one-time key");
+
+            // Bob's device: learns ours, opens an Olm session, encrypts one
+            // message and shares its room key with us.
+            let sender = OlmMachine::new(&bob, "SDEV".into()).await;
+            let mut bob_keys = Value::Null;
+            for request in sender.outgoing_requests().await.unwrap() {
+                if let AnyOutgoingRequest::KeysUpload(upload) = request.request() {
+                    bob_keys = serde_json::to_value(upload.device_keys.as_ref().unwrap()).unwrap();
+                }
+            }
+            sender.update_tracked_users([me.as_ref()]).await.unwrap();
+            for request in sender.outgoing_requests().await.unwrap() {
+                if let AnyOutgoingRequest::KeysQuery(_) = request.request() {
+                    let mut response = get_keys::v3::Response::new();
+                    response.device_keys = serde_json::from_value(
+                        json!({me.as_str(): {"TESTDEVICE": upload["device_keys"].clone()}}),
+                    )
+                    .unwrap();
+                    sender
+                        .mark_request_as_sent(request.request_id(), &response)
+                        .await
+                        .unwrap();
+                }
+            }
+            let (claim_id, _) = sender
+                .get_missing_sessions([me.as_ref()].into_iter())
+                .await
+                .unwrap()
+                .expect("a key claim");
+            let claimed = claim_keys::v3::Response::new(
+                serde_json::from_value(json!({me.as_str(): {"TESTDEVICE": {otk_id: otk}}}))
+                    .unwrap(),
+            );
+            sender
+                .mark_request_as_sent(&claim_id, &claimed)
+                .await
+                .unwrap();
+            let shares = sender
+                .share_room_key(
+                    &room_id,
+                    [me.as_ref()].into_iter(),
+                    EncryptionSettings::default(),
+                )
+                .await
+                .unwrap();
+            let to_device: Vec<Value> = shares
+                .iter()
+                .flat_map(|share| share.messages.values())
+                .flat_map(|devices| devices.values())
+                .map(|content| {
+                    json!({"type": "m.room.encrypted", "sender": bob.as_str(),
+                        "content": serde_json::to_value(content).unwrap()})
+                })
+                .collect();
+            assert_eq!(to_device.len(), 1, "{to_device:?}");
+            let content: Raw<AnyMessageLikeEventContent> =
+                Raw::new(&json!({"msgtype": "m.text", "body": "the secret"}))
+                    .unwrap()
+                    .cast_unchecked();
+            let encrypted = sender
+                .encrypt_room_event_raw(&room_id, "m.room.message", &content)
+                .await
+                .unwrap()
+                .content;
+
+            // Our client can look Bob's device up.
+            server.route(
+                "POST",
+                "/_matrix/client/v3/keys/query",
+                200,
+                &json!({"device_keys": {bob.as_str(): {"SDEV": bob_keys}}, "failures": {}})
+                    .to_string(),
+            );
+            let messages = "/_matrix/client/v3/rooms/!r:example.org/messages";
+            server.route(
+                "GET",
+                messages,
+                200,
+                &json!({"chunk": [{"type": "m.room.encrypted", "event_id": "$secret:example.org",
+                    "sender": bob.as_str(), "origin_server_ts": 1_700_000_000_000u64,
+                    "room_id": room_id.as_str(),
+                    "content": serde_json::to_value(&encrypted).unwrap()}],
+                    "start": "t0", "end": "t1"})
+                .to_string(),
+            );
+            // Every sync long-polls a while, so one is in flight, without the
+            // key, when the first read ends.
+            server.set_delay("GET", "/_matrix/client/v3/sync", Duration::from_millis(300));
+            // The key comes only in a sync that starts after the first read,
+            // and that sync takes a while.
+            server.route_once_after(
+                "GET",
+                "/_matrix/client/v3/sync",
+                messages,
+                &json!({"next_batch": "s2", "to_device": {"events": to_device}}).to_string(),
+                Duration::from_millis(500),
+            );
+
+            let dir = short_tempdir();
+            let daemon = daemon_with(
+                client,
+                &Paths {
+                    data_dir: dir.path().to_owned(),
+                },
+            );
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let looping = tokio::spawn({
+                let daemon = daemon.clone();
+                async move { daemon.sync_loop(stop_rx).await }
+            });
+            // Read while the loop's first sync is in flight.
+            let syncs_before = |server: &crate::mock_homeserver::MockHomeserver| {
+                server
+                    .received()
+                    .iter()
+                    .filter(|r| r.path.ends_with("/sync"))
+                    .count()
+            };
+            let before = syncs_before(&server);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while syncs_before(&server) == before {
+                assert!(Instant::now() < deadline, "the sync loop sent no sync");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let args = read_args(&["!r:example.org", "-k"]);
+            let started = Instant::now();
+            let answer = daemon.clone().dispatch(read_request(&args)).await;
+            // Answered after the syncs, not after the upper bound.
+            let took = started.elapsed();
+            assert!(took < READ_KEY_WAIT_LIMIT / 3, "{took:?}");
+            stop_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), looping)
+                .await
+                .expect("the sync loop did not stop")
+                .unwrap()
+                .unwrap();
+            assert_eq!(answer["ok"], true, "{answer}");
+            let outcome: ReadOutcome = serde_json::from_value(answer).unwrap();
+            let lines = outcome.lines();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0].body, "the secret", "{lines:?}");
+            assert!(lines[0].decrypted);
+            // Read, the sync with the key, read again.
+            let order: Vec<_> = server
+                .received()
+                .into_iter()
+                .filter(|r| r.path == messages || r.path.ends_with("/sync"))
+                .map(|r| r.path)
+                .collect();
+            let first = order.iter().position(|p| p == messages).unwrap();
+            let last = order.iter().rposition(|p| p == messages).unwrap();
+            assert!(first < last, "{order:?}");
+            assert!(
+                order[first..last].iter().any(|p| p.ends_with("/sync")),
+                "{order:?}"
+            );
+        }
+
+        /// `read` with each option, through the daemon and directly, against
+        /// the same server state: the same stdout, the same warnings, the
+        /// same /messages requests.
+        #[tokio::test]
+        async fn read_through_the_daemon_prints_what_the_direct_path_prints() {
+            use crate::commands::read::tests::{
+                direct_read, messages_queries, read_args, read_server,
+            };
+            use crate::commands::read::{ReadOutcome, read_request, render};
+            let cases: [(bool, &[&str]); 6] = [
+                (false, &["!r:example.org"]),
+                (false, &["!r:example.org", "--json"]),
+                (false, &["!r:example.org", "-l", "2"]),
+                (true, &["!r:example.org"]),
+                (true, &["!r:example.org", "--request-keys"]),
+                (true, &["!r:example.org", "-k", "--json", "-l", "4"]),
+            ];
+            for (encrypted, argv) in cases {
+                let args = read_args(argv);
+                let server = read_server(encrypted);
+                let client = server.client("@me:example.org").await;
+                crate::commands::sync_once(&client).await.unwrap();
+                let dir = short_tempdir();
+                let daemon = daemon_with(
+                    client,
+                    &Paths {
+                        data_dir: dir.path().to_owned(),
+                    },
+                );
+                // No sync loop here: count syncs as it would.
+                let ticker = tokio::spawn({
+                    let daemon = daemon.clone();
+                    async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            daemon.syncs.send_modify(|n| *n += 1);
+                        }
+                    }
+                });
+                let answer = daemon.clone().dispatch(read_request(&args)).await;
+                ticker.abort();
+                assert_eq!(answer["ok"], true, "{argv:?}: {answer}");
+                // The rest of the daemon's path: the answer onto the socket
+                // as handle_connection writes it, decoded by the client.
+                let fake = crate::daemon_test_support::FakeDaemon::start(Some(answer));
+                let outcome: ReadOutcome =
+                    crate::commands::via_daemon_at(&fake.path, read_request(&args), "read")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let via_daemon = (
+                    render(&outcome.lines(), args.json).unwrap(),
+                    outcome.warnings.clone(),
+                    messages_queries(&server),
+                );
+                let direct = direct_read(encrypted, argv).await;
+                assert_eq!(via_daemon, direct, "{argv:?}");
+                // Each option took effect.
+                let queries = &via_daemon.2;
+                // ruma leaves the default limit (10) out of the query.
+                let limit = format!("limit={}", args.limit);
+                assert!(
+                    queries.iter().all(|q| if args.limit == 10 {
+                        !q.contains("limit=")
+                    } else {
+                        q.contains(&limit)
+                    }),
+                    "{argv:?}: {queries:?}"
+                );
+                let undecryptable = outcome.lines().iter().any(|l| l.is_undecryptable());
+                assert_eq!(undecryptable, encrypted, "{argv:?}");
+                let reads = if args.request_keys && undecryptable {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(queries.len(), reads, "{argv:?}: {queries:?}");
+                assert_eq!(
+                    !via_daemon.1.is_empty(),
+                    reads == 2,
+                    "{argv:?}: {:?}",
+                    via_daemon.1
+                );
+                let out = &via_daemon.0;
+                if args.json {
+                    let parsed: Value = serde_json::from_str(out).unwrap();
+                    assert_eq!(parsed.as_array().unwrap().len(), outcome.messages.len());
+                } else {
+                    assert!(out.starts_with('[') && !out.starts_with("[\n"), "{out}");
+                    assert_eq!(
+                        out.lines().filter(|l| l.starts_with('[')).count(),
+                        outcome.messages.len()
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn plaintext_is_sent_unencrypted_by_the_daemon_and_send_stays_encrypted() {
+            use crate::commands::send::tests::{
+                plaintext_args, rich_args, rich_python_content, room_server, sends,
+            };
+            use crate::commands::send::{PLAINTEXT_OP, PLAINTEXT_WARNING, send_request};
+            let dir = short_tempdir();
+            let paths = Paths {
+                data_dir: dir.path().to_owned(),
+            };
+            let plaintext = send_request(&plaintext_args(), Some("🤖")).unwrap();
+            assert_eq!(plaintext["op"], PLAINTEXT_OP);
+            let server = room_server(true);
+            let client = server.client("@me:example.org").await;
+            crate::commands::sync_once(&client).await.unwrap();
+            let daemon = daemon_with(client, &paths);
+            assert_eq!(
+                daemon.clone().dispatch(plaintext).await,
+                json!({"ok": true, "event_id": "$sent:example.org", "room_id": "!r:example.org",
+                    "encrypted": false, "warnings": [PLAINTEXT_WARNING]})
+            );
+            assert_eq!(
+                sends(&server),
+                [("m.room.message".to_owned(), rich_python_content())]
+            );
+            assert!(
+                !server
+                    .received()
+                    .iter()
+                    .any(|r| r.path.contains("m.room.encrypted")),
+                "{:?}",
+                server.received()
+            );
+            // The same room, the same daemon, without --plaintext: encrypted.
+            let encrypted = send_request(&rich_args(), Some("🤖")).unwrap();
+            let answer = daemon.clone().dispatch(encrypted).await;
+            assert_eq!(answer["ok"], true, "{answer}");
+            assert_eq!(answer["encrypted"], true, "{answer}");
+            let sent = sends(&server);
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            assert_eq!(sent[1].0, "m.room.encrypted");
         }
 
         #[tokio::test]
