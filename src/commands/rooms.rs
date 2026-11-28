@@ -9,9 +9,11 @@
 //! The members of a room named after them are fetched from the server once
 //! per room (`Room::members`) and kept in the store.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use matrix_sdk::{Client, RoomMemberships};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,6 +26,9 @@ use crate::text::{python_json, term};
 
 /// matrix-nio's MatrixRoom.group_name() lists at most this many members by name.
 const GROUP_NAME_HEROES: usize = 5;
+
+/// How many member lists [`execute`] fetches at once.
+const MEMBER_FETCHES: usize = 8;
 
 pub async fn run(args: RoomsArgs) -> Result<()> {
     let paths = Paths::from_env()?;
@@ -75,7 +80,11 @@ pub struct Member {
     pub display_name: Option<String>,
 }
 
-/// List the joined rooms of `client`'s store.
+/// List the joined rooms of `client`'s store. The member lists of rooms
+/// named after their members are fetched [`MEMBER_FETCHES`] at a time: in
+/// the watch daemon this runs under the operation lock, and one request
+/// after another could keep a queued send waiting past its caller's
+/// deadline.
 pub async fn execute(client: &Client, _request: &Value) -> Result<RoomsOutcome> {
     let own = client
         .user_id()
@@ -83,35 +92,46 @@ pub async fn execute(client: &Client, _request: &Value) -> Result<RoomsOutcome> 
         .to_string();
     let mut joined = client.joined_rooms();
     joined.sort_by(|a, b| a.room_id().cmp(b.room_id()));
-    let mut rooms = Vec::with_capacity(joined.len());
+    // buffered, not buffer_unordered: the results come in room id order.
+    let looked_up: Vec<_> = futures_util::stream::iter(joined.iter().cloned())
+        .map(|room: matrix_sdk::Room| async move {
+            let name = room.name();
+            let alias = room.canonical_alias().map(|a| a.to_string());
+            let named = name.as_deref().is_some_and(|n| !n.is_empty()) || alias.is_some();
+            let members = if named {
+                None
+            } else {
+                Some(
+                    room.members(RoomMemberships::JOIN | RoomMemberships::INVITE)
+                        .await
+                        .map(|members| {
+                            members
+                                .iter()
+                                .map(|m| Member {
+                                    user_id: m.user_id().to_string(),
+                                    display_name: m.display_name().map(str::to_owned),
+                                })
+                                .collect::<Vec<_>>()
+                        }),
+                )
+            };
+            (room, name, alias, members)
+        })
+        .buffered(MEMBER_FETCHES)
+        .collect()
+        .await;
+    let mut rooms = Vec::with_capacity(looked_up.len());
     let mut warnings = Vec::new();
-    for room in &joined {
-        let name = room.name();
-        let alias = room.canonical_alias().map(|a| a.to_string());
-        let named = name.as_deref().is_some_and(|n| !n.is_empty()) || alias.is_some();
-        let members = if named {
-            None
-        } else {
-            match room
-                .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
-                .await
-            {
-                Ok(members) => Some(
-                    members
-                        .iter()
-                        .map(|m| Member {
-                            user_id: m.user_id().to_string(),
-                            display_name: m.display_name().map(str::to_owned),
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-                Err(err) => {
-                    warnings.push(format!(
-                        "cannot read the members of {}, listed under its room id: {err}",
-                        room.room_id()
-                    ));
-                    None
-                }
+    for (room, name, alias, members) in looked_up {
+        let members = match members {
+            None => None,
+            Some(Ok(members)) => Some(members),
+            Some(Err(err)) => {
+                warnings.push(format!(
+                    "cannot read the members of {}, listed under its room id: {err}",
+                    room.room_id()
+                ));
+                None
             }
         };
         rooms.push(joined_room(
@@ -170,19 +190,22 @@ pub fn joined_room(
 /// by, its display name or else its user id. A display name that two
 /// members share, `own` included, becomes "Name (@user:server)".
 pub fn member_names(members: &[Member], own: &str) -> Vec<(String, String)> {
-    let shown = |m: &Member| -> String {
-        m.display_name
-            .clone()
+    // How many members, `own` included, are shown by each name.
+    let mut taken: HashMap<&str, usize> = HashMap::new();
+    for m in members {
+        let shown = m
+            .display_name
+            .as_deref()
             .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| m.user_id.clone())
-    };
-    let taken = |name: &str| members.iter().filter(|m| shown(m) == name).count();
+            .unwrap_or(&m.user_id);
+        *taken.entry(shown).or_default() += 1;
+    }
     members
         .iter()
         .filter(|m| m.user_id != own)
         .map(|m| {
             let name = match m.display_name.as_deref().filter(|n| !n.is_empty()) {
-                Some(name) if taken(name) > 1 => format!("{name} ({})", m.user_id),
+                Some(name) if taken[name] > 1 => format!("{name} ({})", m.user_id),
                 Some(name) => name.to_owned(),
                 None => m.user_id.clone(),
             };
@@ -426,6 +449,107 @@ pub(crate) mod tests {
             .collect();
         built.sort_by(|a, b| a.room_id.cmp(&b.room_id));
         assert_eq!(built, python_rooms(&fixture));
+    }
+
+    #[test]
+    fn member_names_count_the_own_account() {
+        // python3, _lib/rooms.py get_room_members() at 3db40d3 for these
+        // members with user_id @me:e:
+        // {'@jane:e': 'Jane (@jane:e)', '@x:e': 'X', '@y:e': '@y:e'}
+        let member = |id: &str, name: Option<&str>| Member {
+            user_id: id.into(),
+            display_name: name.map(str::to_owned),
+        };
+        let members = [
+            member("@me:e", Some("Jane")),
+            member("@jane:e", Some("Jane")),
+            member("@x:e", Some("X")),
+            member("@y:e", None),
+        ];
+        let pair = |id: &str, name: &str| (id.to_owned(), name.to_owned());
+        assert_eq!(
+            member_names(&members, "@me:e"),
+            [
+                pair("@jane:e", "Jane (@jane:e)"),
+                pair("@x:e", "X"),
+                pair("@y:e", "@y:e")
+            ]
+        );
+    }
+
+    /// Eight unnamed rooms whose /members answers take 400 to 190 ms, one
+    /// of them refused.
+    #[tokio::test]
+    async fn member_lists_are_fetched_side_by_side_in_room_order() {
+        use std::time::Duration;
+        let server = crate::mock_homeserver::MockHomeserver::start();
+        let ids: Vec<String> = (0..8).map(|i| format!("!r{i}:example.org")).collect();
+        let join: serde_json::Map<String, Value> =
+            ids.iter().map(|id| (id.clone(), json!({}))).collect();
+        server.route(
+            "GET",
+            "/_matrix/client/v3/sync",
+            200,
+            &json!({"next_batch": "s1", "rooms": {"join": join}}).to_string(),
+        );
+        for (i, id) in ids.iter().enumerate() {
+            let path = format!("/_matrix/client/v3/rooms/{id}/members");
+            // Later rooms answer sooner: completion order is the reverse of
+            // room order.
+            let delay = Duration::from_millis(400 - 30 * i as u64);
+            if i == 5 {
+                server.route_delayed(
+                    "GET",
+                    &path,
+                    403,
+                    r#"{"errcode": "M_FORBIDDEN", "error": "no"}"#,
+                    delay,
+                );
+                continue;
+            }
+            let other = format!("@u{i}:example.org");
+            let chunk = json!({"chunk": [{"type": "m.room.member", "state_key": other, "room_id": id,
+                "sender": other, "event_id": format!("$m{i}"), "origin_server_ts": 1,
+                "content": {"membership": "join", "displayname": format!("User {i}")}}]});
+            server.route_delayed("GET", &path, 200, &chunk.to_string(), delay);
+        }
+        let client = server.client("@me:example.org").await;
+        sync_once(&client).await.unwrap();
+        let outcome = execute(&client, &json!({"op": "rooms"})).await.unwrap();
+        assert!(
+            server.most_in_flight() > 1,
+            "the member lists were fetched one after another"
+        );
+        let names: Vec<(&str, &str)> = outcome
+            .rooms
+            .iter()
+            .map(|r| (r.room_id.as_str(), r.name.as_str()))
+            .collect();
+        let expected: Vec<(String, String)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                (
+                    id.clone(),
+                    if i == 5 {
+                        id.clone()
+                    } else {
+                        format!("User {i}")
+                    },
+                )
+            })
+            .collect();
+        let expected: Vec<(&str, &str)> = expected
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(names, expected);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(
+            outcome.warnings[0].contains("!r5:example.org"),
+            "{:?}",
+            outcome.warnings
+        );
     }
 
     #[test]

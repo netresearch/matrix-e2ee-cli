@@ -93,12 +93,18 @@ pub fn python_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Resul
 
 /// `value` as Python's `json.dumps(value)` prints it: one line, `", "`
 /// between items, `": "` after keys, and ensure_ascii as in [`python_json`].
+///
+/// `value` must be a structured value (a struct, a map, a
+/// `serde_json::Value`, ...), never a `serde_json::value::RawValue`: serde
+/// writes a RawValue verbatim, with its own line breaks and without the
+/// ASCII escaping.
 pub fn python_json_line<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<String> {
     let mut out = Vec::new();
     let mut serializer = serde_json::Serializer::with_formatter(&mut out, AsciiLine);
     value.serialize(&mut serializer)?;
     // Only ASCII is written.
-    Ok(String::from_utf8(out).expect("python_json_line writes ASCII only"))
+    Ok(String::from_utf8(out)
+        .expect("python_json_line writes ASCII only (its input is no RawValue)"))
 }
 
 /// Python's default separators on one line, with its ensure_ascii escaping.

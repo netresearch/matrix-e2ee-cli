@@ -5,7 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -29,12 +29,23 @@ struct Route {
     path: String,
     status: u16,
     body: String,
+    /// How long the answer waits; a request of a delayed route counts as
+    /// in flight meanwhile.
+    delay: Duration,
+}
+
+/// Delayed requests in flight now, and the most there were at once.
+#[derive(Default)]
+struct InFlight {
+    now: AtomicUsize,
+    most: AtomicUsize,
 }
 
 pub struct MockHomeserver {
     pub url: String,
     routes: Arc<Mutex<Vec<Route>>>,
     received: Arc<Mutex<Vec<Recorded>>>,
+    in_flight: Arc<InFlight>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -65,6 +76,7 @@ fn base_routes() -> Vec<Route> {
         path: path.into(),
         status: 200,
         body: body.into(),
+        delay: Duration::ZERO,
     })
     .collect()
 }
@@ -76,13 +88,26 @@ impl MockHomeserver {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let routes = Arc::new(Mutex::new(Vec::new()));
         let received = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(InFlight::default());
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (routes, received, stop) = (routes.clone(), received.clone(), stop.clone());
+            let (routes, received, in_flight, stop) = (
+                routes.clone(),
+                received.clone(),
+                in_flight.clone(),
+                stop.clone(),
+            );
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match listener.accept() {
-                        Ok((stream, _)) => serve(stream, &routes, &received),
+                        // One thread per connection, so delayed answers overlap.
+                        Ok((stream, _)) => {
+                            let (routes, received, in_flight) =
+                                (routes.clone(), received.clone(), in_flight.clone());
+                            std::thread::spawn(move || {
+                                serve(stream, &routes, &received, &in_flight)
+                            });
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5));
                         }
@@ -95,6 +120,7 @@ impl MockHomeserver {
             url,
             routes,
             received,
+            in_flight,
             stop,
             thread: Some(thread),
         }
@@ -103,13 +129,31 @@ impl MockHomeserver {
     /// Answer METHOD requests whose decoded path starts with PATH. Routes
     /// added first win; the base routes come after all added ones.
     pub fn route(&self, method: &str, path: &str, status: u16, body: &str) -> &Self {
+        self.route_delayed(method, path, status, body, Duration::ZERO)
+    }
+
+    /// [`Self::route`], answered after DELAY.
+    pub fn route_delayed(
+        &self,
+        method: &str,
+        path: &str,
+        status: u16,
+        body: &str,
+        delay: Duration,
+    ) -> &Self {
         self.routes.lock().unwrap().push(Route {
             method: method.into(),
             path: path.into(),
             status,
             body: body.into(),
+            delay,
         });
         self
+    }
+
+    /// The most requests of delayed routes that were in flight at once.
+    pub fn most_in_flight(&self) -> usize {
+        self.in_flight.most.load(Ordering::SeqCst)
     }
 
     /// Every request received so far, in order.
@@ -168,7 +212,12 @@ impl Drop for MockHomeserver {
     }
 }
 
-fn serve(mut stream: TcpStream, routes: &Mutex<Vec<Route>>, received: &Mutex<Vec<Recorded>>) {
+fn serve(
+    mut stream: TcpStream,
+    routes: &Mutex<Vec<Route>>,
+    received: &Mutex<Vec<Recorded>>,
+    in_flight: &InFlight,
+) {
     stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -209,14 +258,21 @@ fn serve(mut stream: TcpStream, routes: &Mutex<Vec<Route>>, received: &Mutex<Vec
     });
     let mut table = routes.lock().unwrap().clone();
     table.extend(base_routes());
-    let (status, body) = table
+    let (status, body, delay) = table
         .iter()
         .find(|r| r.method == method && path.starts_with(&r.path))
-        .map(|r| (r.status, r.body.clone()))
+        .map(|r| (r.status, r.body.clone(), r.delay))
         .unwrap_or((
             404,
             r#"{"errcode": "M_UNRECOGNIZED", "error": "Unrecognized request"}"#.into(),
+            Duration::ZERO,
         ));
+    if !delay.is_zero() {
+        let now = in_flight.now.fetch_add(1, Ordering::SeqCst) + 1;
+        in_flight.most.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(delay);
+        in_flight.now.fetch_sub(1, Ordering::SeqCst);
+    }
     let _ = write!(
         stream,
         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
