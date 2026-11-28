@@ -3250,7 +3250,14 @@ pub mod unix {
                 );
                 let answer = daemon.clone().dispatch(read_request(&args)).await;
                 assert_eq!(answer["ok"], true, "{argv:?}: {answer}");
-                let outcome: ReadOutcome = serde_json::from_value(answer).unwrap();
+                // The rest of the daemon's path: the answer onto the socket
+                // as handle_connection writes it, decoded by the client.
+                let fake = crate::daemon_test_support::FakeDaemon::start(Some(answer));
+                let outcome: ReadOutcome =
+                    crate::commands::via_daemon_at(&fake.path, read_request(&args), "read")
+                        .await
+                        .unwrap()
+                        .unwrap();
                 let via_daemon = (
                     render(&outcome.lines(), args.json).unwrap(),
                     outcome.warnings.clone(),
