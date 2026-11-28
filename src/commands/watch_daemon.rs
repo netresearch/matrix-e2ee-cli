@@ -1301,6 +1301,13 @@ pub mod unix {
                     })
                     .await
                 }
+                // Unencrypted on purpose (send --plaintext): no room key.
+                send::PLAINTEXT_OP => {
+                    self.run_op(false, |c| async move {
+                        to_answer(send::execute(&c, &request).await?)
+                    })
+                    .await
+                }
                 "edit" => {
                     let trust = send::request_trusts_unverified(&request);
                     self.run_op(trust, |c| async move {
@@ -3196,6 +3203,49 @@ pub mod unix {
                 started: Instant::now(),
                 last_sync: AtomicI64::new(0),
             })
+        }
+
+        #[tokio::test]
+        async fn plaintext_is_sent_unencrypted_by_the_daemon_and_send_stays_encrypted() {
+            use crate::commands::send::tests::{
+                plaintext_args, rich_args, rich_python_content, room_server, sends,
+            };
+            use crate::commands::send::{PLAINTEXT_OP, PLAINTEXT_WARNING, send_request};
+            let dir = short_tempdir();
+            let paths = Paths {
+                data_dir: dir.path().to_owned(),
+            };
+            let plaintext = send_request(&plaintext_args(), Some("🤖")).unwrap();
+            assert_eq!(plaintext["op"], PLAINTEXT_OP);
+            let server = room_server(true);
+            let client = server.client("@me:example.org").await;
+            crate::commands::sync_once(&client).await.unwrap();
+            let daemon = daemon_with(client, &paths);
+            assert_eq!(
+                daemon.clone().dispatch(plaintext).await,
+                json!({"ok": true, "event_id": "$sent:example.org", "room_id": "!r:example.org",
+                    "encrypted": false, "warnings": [PLAINTEXT_WARNING]})
+            );
+            assert_eq!(
+                sends(&server),
+                [("m.room.message".to_owned(), rich_python_content())]
+            );
+            assert!(
+                !server
+                    .received()
+                    .iter()
+                    .any(|r| r.path.contains("m.room.encrypted")),
+                "{:?}",
+                server.received()
+            );
+            // The same room, the same daemon, without --plaintext: encrypted.
+            let encrypted = send_request(&rich_args(), Some("🤖")).unwrap();
+            let answer = daemon.clone().dispatch(encrypted).await;
+            assert_eq!(answer["ok"], true, "{answer}");
+            assert_eq!(answer["encrypted"], true, "{answer}");
+            let sent = sends(&server);
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            assert_eq!(sent[1].0, "m.room.encrypted");
         }
 
         #[tokio::test]

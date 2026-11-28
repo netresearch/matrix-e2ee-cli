@@ -193,6 +193,11 @@ pub struct SendArgs {
     /// Share this message's room key with unverified devices too (this message only).
     #[arg(long)]
     pub trust_unverified_devices: bool,
+    /// Send this message unencrypted, also in an encrypted room, where the homeserver and
+    /// everyone who joins later can read it. Meant for bots that cannot decrypt, such as a
+    /// matrix-hookshot bridge without encryption (`!hookshot webhook <name>`).
+    #[arg(long, conflicts_with = "trust_unverified_devices")]
+    pub plaintext: bool,
     /// Print the result as JSON.
     #[arg(long)]
     pub json: bool,
