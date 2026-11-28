@@ -63,7 +63,7 @@ pub mod unix {
 
     use crate::WatchDaemonArgs;
     use crate::commands::{
-        create_room, edit, invite, power_level, react, redact, resolve, rooms, send,
+        create_room, edit, invite, power_level, react, read, redact, resolve, rooms, send,
     };
     use crate::config::{Config, config_path, load_config, load_watch_rooms};
     use crate::daemon_client::{REQUEST_TIMEOUT, Reply, request_async, running_daemon_pid};
@@ -630,6 +630,13 @@ pub mod unix {
     /// How long the shutdown waits for the operation in flight. The SDK
     /// retries a send on 5xx and 429 for up to 15 minutes.
     const OP_WAIT: Duration = Duration::from_secs(30);
+
+    /// `read --request-keys` in the daemon: the wait between the reads, as
+    /// on the direct path; none in the tests, which count the rounds.
+    #[cfg(not(test))]
+    const READ_KEY_WAIT_INTERVAL: Duration = read::KEY_WAIT_INTERVAL;
+    #[cfg(test)]
+    const READ_KEY_WAIT_INTERVAL: Duration = Duration::ZERO;
 
     /// End serving without dropping an answer: stop accepting, let the
     /// operation in flight finish (later ones see `stopping` and refuse) for
@@ -1298,6 +1305,13 @@ pub mod unix {
                     let trust = send::request_trusts_unverified(&request);
                     self.run_op(trust, |c| async move {
                         to_answer(send::execute(&c, &request).await?)
+                    })
+                    .await
+                }
+                // Reading shares no room key.
+                "read" => {
+                    self.run_op(false, |c| async move {
+                        to_answer(read::daemon_execute(&c, &request, READ_KEY_WAIT_INTERVAL).await?)
                     })
                     .await
                 }
@@ -3203,6 +3217,85 @@ pub mod unix {
                 started: Instant::now(),
                 last_sync: AtomicI64::new(0),
             })
+        }
+
+        /// `read` with each option, through the daemon and directly, against
+        /// the same server state: the same stdout, the same warnings, the
+        /// same /messages requests.
+        #[tokio::test]
+        async fn read_through_the_daemon_prints_what_the_direct_path_prints() {
+            use crate::commands::read::tests::{
+                direct_read, messages_queries, read_args, read_server,
+            };
+            use crate::commands::read::{ReadOutcome, read_request, render};
+            let cases: [(bool, &[&str]); 6] = [
+                (false, &["!r:example.org"]),
+                (false, &["!r:example.org", "--json"]),
+                (false, &["!r:example.org", "-l", "2"]),
+                (true, &["!r:example.org"]),
+                (true, &["!r:example.org", "--request-keys"]),
+                (true, &["!r:example.org", "-k", "--json", "-l", "4"]),
+            ];
+            for (encrypted, argv) in cases {
+                let args = read_args(argv);
+                let server = read_server(encrypted);
+                let client = server.client("@me:example.org").await;
+                crate::commands::sync_once(&client).await.unwrap();
+                let dir = short_tempdir();
+                let daemon = daemon_with(
+                    client,
+                    &Paths {
+                        data_dir: dir.path().to_owned(),
+                    },
+                );
+                let answer = daemon.clone().dispatch(read_request(&args)).await;
+                assert_eq!(answer["ok"], true, "{argv:?}: {answer}");
+                let outcome: ReadOutcome = serde_json::from_value(answer).unwrap();
+                let via_daemon = (
+                    render(&outcome.lines(), args.json).unwrap(),
+                    outcome.warnings.clone(),
+                    messages_queries(&server),
+                );
+                let direct = direct_read(encrypted, argv).await;
+                assert_eq!(via_daemon, direct, "{argv:?}");
+                // Each option took effect.
+                let queries = &via_daemon.2;
+                // ruma leaves the default limit (10) out of the query.
+                let limit = format!("limit={}", args.limit);
+                assert!(
+                    queries.iter().all(|q| if args.limit == 10 {
+                        !q.contains("limit=")
+                    } else {
+                        q.contains(&limit)
+                    }),
+                    "{argv:?}: {queries:?}"
+                );
+                let undecryptable = outcome.lines().iter().any(|l| l.is_undecryptable());
+                assert_eq!(undecryptable, encrypted, "{argv:?}");
+                let reads = if args.request_keys && undecryptable {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(queries.len(), reads, "{argv:?}: {queries:?}");
+                assert_eq!(
+                    !via_daemon.1.is_empty(),
+                    reads == 2,
+                    "{argv:?}: {:?}",
+                    via_daemon.1
+                );
+                let out = &via_daemon.0;
+                if args.json {
+                    let parsed: Value = serde_json::from_str(out).unwrap();
+                    assert_eq!(parsed.as_array().unwrap().len(), outcome.messages.len());
+                } else {
+                    assert!(out.starts_with('[') && !out.starts_with("[\n"), "{out}");
+                    assert_eq!(
+                        out.lines().filter(|l| l.starts_with('[')).count(),
+                        outcome.messages.len()
+                    );
+                }
+            }
         }
 
         #[tokio::test]

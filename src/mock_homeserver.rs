@@ -20,6 +20,8 @@ pub struct Recorded {
     pub method: String,
     /// Percent-decoded, without the query.
     pub path: String,
+    /// The query, as sent (without "?").
+    pub query: String,
     pub body: String,
 }
 
@@ -250,10 +252,16 @@ fn serve(
     let method = parts.next().unwrap_or_default().to_owned();
     let target = parts.next().unwrap_or_default();
     let path = percent_decode(target.split('?').next().unwrap_or_default());
+    let query = target
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or_default()
+        .to_owned();
     let body = String::from_utf8_lossy(&data[head_end..]).into_owned();
     received.lock().unwrap().push(Recorded {
         method: method.clone(),
         path: path.clone(),
+        query,
         body,
     });
     let mut table = routes.lock().unwrap().clone();
