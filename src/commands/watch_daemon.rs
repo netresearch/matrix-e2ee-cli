@@ -2,7 +2,8 @@
 //! directory (and with it the store), syncs, appends every event of the
 //! rooms in config.json's `watch_rooms` to `<data_dir>/rooms/<stem>.jsonl`
 //! (the file names and the record format are in `roomlog.rs`) and serves
-//! send, react, redact and edit on `<data_dir>/daemon.sock`. Started as a
+//! send, react, redact, edit, rooms, resolve, create-room, invite and
+//! power-level on `<data_dir>/daemon.sock`. Started as a
 //! port of the matrix-skill's `matrix-watchd.py` (see
 //! docs/specs/2026-08-13-live-room-awareness.md in that repository); the
 //! logs it writes are no longer readable by that skill's `matrix-watch.py`.
@@ -61,7 +62,9 @@ pub mod unix {
     use tokio::task::{JoinHandle, JoinSet};
 
     use crate::WatchDaemonArgs;
-    use crate::commands::{edit, react, redact, send};
+    use crate::commands::{
+        create_room, edit, invite, power_level, react, redact, resolve, rooms, send,
+    };
     use crate::config::{Config, config_path, load_config, load_watch_rooms};
     use crate::daemon_client::{REQUEST_TIMEOUT, Reply, request_async, running_daemon_pid};
     use crate::roomlog::{
@@ -1315,6 +1318,37 @@ pub mod unix {
                 "redact" => {
                     self.run_op(false, |c| async move {
                         to_answer(redact::execute(&c, &request).await?)
+                    })
+                    .await
+                }
+                // Nothing of these is encrypted: no room key is shared.
+                "rooms" => {
+                    self.run_op(false, |c| async move {
+                        to_answer(rooms::execute(&c, &request).await?)
+                    })
+                    .await
+                }
+                "resolve" => {
+                    self.run_op(false, |c| async move {
+                        to_answer(resolve::execute(&c, &request).await?)
+                    })
+                    .await
+                }
+                "create_room" => {
+                    self.run_op(false, |c| async move {
+                        to_answer(create_room::execute(&c, &request).await?)
+                    })
+                    .await
+                }
+                "invite" => {
+                    self.run_op(false, |c| async move {
+                        to_answer(invite::execute(&c, &request).await?)
+                    })
+                    .await
+                }
+                "power_levels" => {
+                    self.run_op(false, |c| async move {
+                        to_answer(power_level::execute(&c, &request).await?)
                     })
                     .await
                 }
@@ -3135,6 +3169,141 @@ pub mod unix {
             assert!(
                 daemon.pending.lock().unwrap().due(now, 10).is_empty(),
                 "no retry round ran in the sync loop"
+            );
+        }
+
+        /// A daemon around `client`, as `foreground` builds one.
+        fn daemon_with(client: Client, paths: &Paths) -> Arc<Daemon> {
+            let recorder = Arc::new(Recorder::new(
+                paths.rooms_dir(),
+                "@me:example.org".into(),
+                None,
+                None,
+            ));
+            Arc::new(Daemon {
+                paths: paths.clone(),
+                config: Config {
+                    homeserver: "http://127.0.0.1:9".into(),
+                    user_id: "@me:example.org".into(),
+                },
+                slot: RwLock::new(Some(client)),
+                ops: Mutex::new(()),
+                stopping: AtomicBool::new(false),
+                recorder: recorder.clone(),
+                writer: LogWriter::start(recorder).unwrap(),
+                pending: std::sync::Mutex::new(PendingUtds::default()),
+                rooms: Vec::new(),
+                started: Instant::now(),
+                last_sync: AtomicI64::new(0),
+            })
+        }
+
+        #[tokio::test]
+        async fn the_room_commands_are_carried_out_with_the_daemon_s_client() {
+            use crate::mock_homeserver::MockHomeserver;
+            let server = MockHomeserver::start();
+            crate::commands::invite::tests::serve_room(&server);
+            server.route(
+                "GET",
+                "/_matrix/client/v3/rooms/!r:example.org/members",
+                200,
+                r#"{"chunk": []}"#,
+            );
+            server.route(
+                "POST",
+                "/_matrix/client/v3/createRoom",
+                200,
+                r#"{"room_id": "!new:example.org"}"#,
+            );
+            server.route(
+                "POST",
+                "/_matrix/client/v3/rooms/!r:example.org/invite",
+                200,
+                "{}",
+            );
+            let levels = "/_matrix/client/v3/rooms/!r:example.org/state/m.room.power_levels";
+            server.route(
+                "GET",
+                levels,
+                200,
+                r#"{"users": {"@bob:example.org": 50}, "users_default": 0}"#,
+            );
+            server.route("PUT", levels, 200, r#"{"event_id": "$pl"}"#);
+            server.route(
+                "GET",
+                "/_matrix/client/v3/directory/room/#ops:example.org",
+                200,
+                r#"{"room_id": "!r:example.org", "servers": ["example.org"]}"#,
+            );
+            let client = server.client("@me:example.org").await;
+            crate::commands::sync_once(&client).await.unwrap();
+            let dir = short_tempdir();
+            let daemon = daemon_with(
+                client,
+                &Paths {
+                    data_dir: dir.path().to_owned(),
+                },
+            );
+            let cases = [
+                (
+                    json!({"op": "rooms"}),
+                    json!({"ok": true, "rooms": [{"room_id": "!r:example.org", "name": "Empty Room", "alias": null, "members": []}]}),
+                ),
+                (
+                    json!({"op": "resolve", "alias": "#ops:example.org"}),
+                    json!({"ok": true, "room_id": "!r:example.org", "alias": "#ops:example.org"}),
+                ),
+                (
+                    json!({"op": "create_room", "name": "N", "preset": "private_chat", "alias": "n"}),
+                    json!({"ok": true, "room_id": "!new:example.org", "alias": "#n:example.org"}),
+                ),
+                (
+                    json!({"op": "invite", "room": "!r:example.org", "user_id": "@jane:example.org"}),
+                    json!({"ok": true, "room_id": "!r:example.org", "user_id": "@jane:example.org"}),
+                ),
+                (
+                    json!({"op": "power_levels", "room": "!r:example.org", "action": "set", "user_id": "@bob:example.org", "level": 100}),
+                    json!({"ok": true, "room_id": "!r:example.org", "previous": 50, "level": 100}),
+                ),
+            ];
+            for (request, answer) in cases {
+                assert_eq!(
+                    daemon.clone().dispatch(request.clone()).await,
+                    answer,
+                    "{request}"
+                );
+            }
+            let writes: Vec<_> = server
+                .received_api()
+                .into_iter()
+                .filter(|r| r.method != "GET")
+                .map(|r| {
+                    (
+                        r.method,
+                        r.path,
+                        serde_json::from_str::<Value>(&r.body).unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                writes,
+                [
+                    (
+                        "POST".into(),
+                        "/_matrix/client/v3/createRoom".into(),
+                        json!({"name": "N", "preset": "private_chat", "room_alias_name": "n"})
+                    ),
+                    (
+                        "POST".into(),
+                        "/_matrix/client/v3/rooms/!r:example.org/invite".into(),
+                        json!({"user_id": "@jane:example.org"})
+                    ),
+                    (
+                        "PUT".into(),
+                        format!("{levels}/"),
+                        json!({"users": {"@bob:example.org": 100}, "users_default": 0})
+                    ),
+                ]
             );
         }
 

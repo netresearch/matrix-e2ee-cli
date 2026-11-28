@@ -1,0 +1,1183 @@
+{
+ "me": "@me:example.org",
+ "rooms_corpus": [
+  {
+   "room_id": "!a:example.org",
+   "name": "Agent Work",
+   "alias": "#agent-work:example.org"
+  },
+  {
+   "room_id": "!b:example.org",
+   "name": "agent work archive"
+  },
+  {
+   "room_id": "!c:example.org",
+   "alias": "#ops:example.org"
+  },
+  {
+   "room_id": "!d:example.org",
+   "members": [
+    {
+     "state_key": "@me:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Me"
+     }
+    },
+    {
+     "state_key": "@jane:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Jane Doe"
+     }
+    },
+    {
+     "state_key": "@gone:example.org",
+     "content": {
+      "membership": "leave",
+      "displayname": "Gone"
+     }
+    },
+    {
+     "state_key": "@banned:example.org",
+     "content": {
+      "membership": "ban",
+      "displayname": "Banned"
+     }
+    }
+   ]
+  },
+  {
+   "room_id": "!e:example.org",
+   "members": [
+    {
+     "state_key": "@me:example.org",
+     "content": {
+      "membership": "join"
+     }
+    },
+    {
+     "state_key": "@max:example.org",
+     "content": {
+      "membership": "invite"
+     }
+    },
+    {
+     "state_key": "@anna:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Anna"
+     }
+    }
+   ]
+  },
+  {
+   "room_id": "!f:example.org",
+   "members": [
+    {
+     "state_key": "@me:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Bob"
+     }
+    },
+    {
+     "state_key": "@bob1:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Bob"
+     }
+    },
+    {
+     "state_key": "@bob2:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Bob"
+     }
+    },
+    {
+     "state_key": "@carl:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "carl"
+     }
+    },
+    {
+     "state_key": "@dora:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Dora"
+     }
+    },
+    {
+     "state_key": "@emil:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Émil"
+     }
+    },
+    {
+     "state_key": "@finn:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Finn"
+     }
+    },
+    {
+     "state_key": "@gus:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "gus"
+     }
+    }
+   ]
+  },
+  {
+   "room_id": "!g:example.org",
+   "members": null
+  },
+  {
+   "room_id": "!h:example.org",
+   "members": [
+    {
+     "state_key": "@me:example.org",
+     "content": {
+      "membership": "join",
+      "displayname": "Me"
+     }
+    }
+   ]
+  },
+  {
+   "room_id": "!i:example.org",
+   "name": "Ünïcode Räum with a name longer than thirty-eight characters",
+   "alias": "#a-very-long-alias-name-over-33-characters:example.org"
+  },
+  {
+   "room_id": "!j:example.org",
+   "name": "",
+   "alias": "#empty-name:example.org"
+  },
+  {
+   "room_id": "!k:example.org",
+   "name": "Deploy"
+  },
+  {
+   "room_id": "!l:example.org",
+   "name": "Deploy Bot"
+  },
+  {
+   "room_id": "!m:example.org",
+   "members": [
+    {
+     "state_key": "@me:example.org",
+     "content": {
+      "membership": "join"
+     }
+    },
+    {
+     "state_key": "@solo:example.org",
+     "content": {
+      "membership": "invite",
+      "displayname": "Solo"
+     }
+    }
+   ]
+  }
+ ],
+ "power_contents": {
+  "power": {
+   "users": {
+    "@me:example.org": 100,
+    "@bob:example.org": 50,
+    "@old:example.org": "50"
+   },
+   "users_default": 0,
+   "events": {
+    "m.room.name": 50,
+    "m.room.power_levels": 100
+   },
+   "events_default": 0,
+   "state_default": 50,
+   "ban": 50,
+   "kick": 50,
+   "redact": 50,
+   "invite": 0,
+   "notifications": {
+    "room": 50
+   },
+   "x.unknown": [
+    "Grüße 🙂",
+    null,
+    true,
+    1.5
+   ]
+  },
+  "bare": {
+   "events_default": 0,
+   "state_default": 50
+  },
+  "default": {
+   "users": {
+    "@me:example.org": 100
+   },
+   "users_default": 10
+  }
+ },
+ "rooms": [
+  {
+   "argv": [],
+   "stdout": "Room Name                                Alias                               Room ID\n------------------------------------------------------------------------------------------------------------------------\n!g:example.org                                                               !g:example.org\n#empty-name:example.org                  #empty-name:example.org             !j:example.org\n#ops:example.org                         #ops:example.org                    !c:example.org\n@max:example.org and Anna                                                    !e:example.org\nAgent Work                               #agent-work:example.org             !a:example.org\nagent work archive                                                           !b:example.org\nBob (@bob1:example.org), Bob (@bob2:ex                                       !f:example.org\nDeploy                                                                       !k:example.org\nDeploy Bot                                                                   !l:example.org\nEmpty Room                                                                   !h:example.org\nJane Doe                                                                     !d:example.org\nSolo                                                                         !m:example.org\nÜnïcode Räum with a name longer than t   #a-very-long-alias-name-over-33-c   !i:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--json"
+   ],
+   "stdout": "[\n  {\n    \"room_id\": \"!g:example.org\",\n    \"name\": \"!g:example.org\",\n    \"alias\": null\n  },\n  {\n    \"room_id\": \"!j:example.org\",\n    \"name\": \"#empty-name:example.org\",\n    \"alias\": \"#empty-name:example.org\"\n  },\n  {\n    \"room_id\": \"!c:example.org\",\n    \"name\": \"#ops:example.org\",\n    \"alias\": \"#ops:example.org\"\n  },\n  {\n    \"room_id\": \"!e:example.org\",\n    \"name\": \"@max:example.org and Anna\",\n    \"alias\": null,\n    \"members\": [\n      \"@anna:example.org\",\n      \"@max:example.org\"\n    ]\n  },\n  {\n    \"room_id\": \"!a:example.org\",\n    \"name\": \"Agent Work\",\n    \"alias\": \"#agent-work:example.org\"\n  },\n  {\n    \"room_id\": \"!b:example.org\",\n    \"name\": \"agent work archive\",\n    \"alias\": null\n  },\n  {\n    \"room_id\": \"!f:example.org\",\n    \"name\": \"Bob (@bob1:example.org), Bob (@bob2:example.org), carl, Dora, Finn and 2 others\",\n    \"alias\": null,\n    \"members\": [\n      \"@bob1:example.org\",\n      \"@bob2:example.org\",\n      \"@carl:example.org\",\n      \"@dora:example.org\",\n      \"@emil:example.org\",\n      \"@finn:example.org\",\n      \"@gus:example.org\"\n    ]\n  },\n  {\n    \"room_id\": \"!k:example.org\",\n    \"name\": \"Deploy\",\n    \"alias\": null\n  },\n  {\n    \"room_id\": \"!l:example.org\",\n    \"name\": \"Deploy Bot\",\n    \"alias\": null\n  },\n  {\n    \"room_id\": \"!h:example.org\",\n    \"name\": \"Empty Room\",\n    \"alias\": null,\n    \"members\": []\n  },\n  {\n    \"room_id\": \"!d:example.org\",\n    \"name\": \"Jane Doe\",\n    \"alias\": null,\n    \"members\": [\n      \"@jane:example.org\"\n    ]\n  },\n  {\n    \"room_id\": \"!m:example.org\",\n    \"name\": \"Solo\",\n    \"alias\": null,\n    \"members\": [\n      \"@solo:example.org\"\n    ]\n  },\n  {\n    \"room_id\": \"!i:example.org\",\n    \"name\": \"\\u00dcn\\u00efcode R\\u00e4um with a name longer than thirty-eight characters\",\n    \"alias\": \"#a-very-long-alias-name-over-33-characters:example.org\"\n  }\n]\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--search",
+    "agent"
+   ],
+   "stdout": "Room Name                                Alias                               Room ID\n------------------------------------------------------------------------------------------------------------------------\nAgent Work                               #agent-work:example.org             !a:example.org\nagent work archive                                                           !b:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "-s",
+    "@jane:example.org"
+   ],
+   "stdout": "Room Name                                Alias                               Room ID\n------------------------------------------------------------------------------------------------------------------------\nJane Doe                                                                     !d:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--search",
+    "AGENT",
+    "--json"
+   ],
+   "stdout": "[\n  {\n    \"room_id\": \"!a:example.org\",\n    \"name\": \"Agent Work\",\n    \"alias\": \"#agent-work:example.org\"\n  },\n  {\n    \"room_id\": \"!b:example.org\",\n    \"name\": \"agent work archive\",\n    \"alias\": null\n  }\n]\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--search",
+    "zzz"
+   ],
+   "stdout": "No rooms found\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--search",
+    "zzz",
+    "--json"
+   ],
+   "stdout": "[]\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--search",
+    ""
+   ],
+   "stdout": "Room Name                                Alias                               Room ID\n------------------------------------------------------------------------------------------------------------------------\n!g:example.org                                                               !g:example.org\n#empty-name:example.org                  #empty-name:example.org             !j:example.org\n#ops:example.org                         #ops:example.org                    !c:example.org\n@max:example.org and Anna                                                    !e:example.org\nAgent Work                               #agent-work:example.org             !a:example.org\nagent work archive                                                           !b:example.org\nBob (@bob1:example.org), Bob (@bob2:ex                                       !f:example.org\nDeploy                                                                       !k:example.org\nDeploy Bot                                                                   !l:example.org\nEmpty Room                                                                   !h:example.org\nJane Doe                                                                     !d:example.org\nSolo                                                                         !m:example.org\nÜnïcode Räum with a name longer than t   #a-very-long-alias-name-over-33-c   !i:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "agent-work"
+   ],
+   "stdout": "!a:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "#ops:example.org"
+   ],
+   "stdout": "!c:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "OPS"
+   ],
+   "stdout": "!c:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "Jane Doe"
+   ],
+   "stdout": "!d:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "@jane:example.org"
+   ],
+   "stdout": "!d:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "-l",
+    "agent work",
+    "--json"
+   ],
+   "stdout": "{\n  \"room_id\": \"!a:example.org\",\n  \"name\": \"Agent Work\",\n  \"alias\": \"#agent-work:example.org\"\n}\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "agent"
+   ],
+   "stdout": "",
+   "stderr": "Error: Ambiguous match for 'agent'. Found 2 rooms:\n  - Agent Work (#agent-work:example.org): !a:example.org\n  - agent work archive: !b:example.org\n",
+   "exit": 1,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "archive"
+   ],
+   "stdout": "!b:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "archive",
+    "--json"
+   ],
+   "stdout": "{\n  \"room_id\": \"!b:example.org\",\n  \"name\": \"agent work archive\",\n  \"alias\": null\n}\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "nothing"
+   ],
+   "stdout": "",
+   "stderr": "Error: No room found matching 'nothing'\n",
+   "exit": 1,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "deploy"
+   ],
+   "stdout": "",
+   "stderr": "Error: Ambiguous match for 'deploy'. Found 2 rooms:\n  - Deploy: !k:example.org\n  - Deploy Bot: !l:example.org\n",
+   "exit": 1,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "Solo"
+   ],
+   "stdout": "!m:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "bob"
+   ],
+   "stdout": "!f:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "agent-work",
+    "--search",
+    "zzz"
+   ],
+   "stdout": "!a:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    ""
+   ],
+   "stdout": "Room Name                                Alias                               Room ID\n------------------------------------------------------------------------------------------------------------------------\n!g:example.org                                                               !g:example.org\n#empty-name:example.org                  #empty-name:example.org             !j:example.org\n#ops:example.org                         #ops:example.org                    !c:example.org\n@max:example.org and Anna                                                    !e:example.org\nAgent Work                               #agent-work:example.org             !a:example.org\nagent work archive                                                           !b:example.org\nBob (@bob1:example.org), Bob (@bob2:ex                                       !f:example.org\nDeploy                                                                       !k:example.org\nDeploy Bot                                                                   !l:example.org\nEmpty Room                                                                   !h:example.org\nJane Doe                                                                     !d:example.org\nSolo                                                                         !m:example.org\nÜnïcode Räum with a name longer than t   #a-very-long-alias-name-over-33-c   !i:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "Empty Room"
+   ],
+   "stdout": "!h:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "!g:example.org"
+   ],
+   "stdout": "!g:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "corpus"
+  },
+  {
+   "argv": [],
+   "stdout": "No rooms found\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "none"
+  },
+  {
+   "argv": [
+    "--json"
+   ],
+   "stdout": "[]\n",
+   "stderr": "",
+   "exit": 0,
+   "rooms": "none"
+  },
+  {
+   "argv": [
+    "--lookup",
+    "x"
+   ],
+   "stdout": "",
+   "stderr": "Error: No room found matching 'x'\n",
+   "exit": 1,
+   "rooms": "none"
+  }
+ ],
+ "power_level": [
+  {
+   "argv": [
+    "!r:example.org",
+    "--show"
+   ],
+   "stdout": "{\n  \"users\": {\n    \"@me:example.org\": 100,\n    \"@bob:example.org\": 50,\n    \"@old:example.org\": \"50\"\n  },\n  \"users_default\": 0,\n  \"events\": {\n    \"m.room.name\": 50,\n    \"m.room.power_levels\": 100\n  },\n  \"events_default\": 0,\n  \"state_default\": 50,\n  \"ban\": 50,\n  \"kick\": 50,\n  \"redact\": 50,\n  \"invite\": 0,\n  \"notifications\": {\n    \"room\": 50\n  },\n  \"x.unknown\": [\n    \"Gr\\u00fc\\u00dfe \\ud83d\\ude42\",\n    null,\n    true,\n    1.5\n  ]\n}\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--show",
+    "-q"
+   ],
+   "stdout": "{\"users\": {\"@me:example.org\": 100, \"@bob:example.org\": 50, \"@old:example.org\": \"50\"}, \"users_default\": 0, \"events\": {\"m.room.name\": 50, \"m.room.power_levels\": 100}, \"events_default\": 0, \"state_default\": 50, \"ban\": 50, \"kick\": 50, \"redact\": 50, \"invite\": 0, \"notifications\": {\"room\": 50}, \"x.unknown\": [\"Gr\\u00fc\\u00dfe \\ud83d\\ude42\", null, true, 1.5]}\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--show",
+    "--json"
+   ],
+   "stdout": "{\n  \"users\": {\n    \"@me:example.org\": 100,\n    \"@bob:example.org\": 50,\n    \"@old:example.org\": \"50\"\n  },\n  \"users_default\": 0,\n  \"events\": {\n    \"m.room.name\": 50,\n    \"m.room.power_levels\": 100\n  },\n  \"events_default\": 0,\n  \"state_default\": 50,\n  \"ban\": 50,\n  \"kick\": 50,\n  \"redact\": 50,\n  \"invite\": 0,\n  \"notifications\": {\n    \"room\": 50\n  },\n  \"x.unknown\": [\n    \"Gr\\u00fc\\u00dfe \\ud83d\\ude42\",\n    null,\n    true,\n    1.5\n  ]\n}\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--show",
+    "--json",
+    "--quiet"
+   ],
+   "stdout": "{\"users\": {\"@me:example.org\": 100, \"@bob:example.org\": 50, \"@old:example.org\": \"50\"}, \"users_default\": 0, \"events\": {\"m.room.name\": 50, \"m.room.power_levels\": 100}, \"events_default\": 0, \"state_default\": 50, \"ban\": 50, \"kick\": 50, \"redact\": 50, \"invite\": 0, \"notifications\": {\"room\": 50}, \"x.unknown\": [\"Gr\\u00fc\\u00dfe \\ud83d\\ude42\", null, true, 1.5]}\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--get",
+    "@bob:example.org"
+   ],
+   "stdout": "@bob:example.org in !r:example.org: 50\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--get",
+    "@nobody:example.org"
+   ],
+   "stdout": "@nobody:example.org in !r:example.org: 0\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--get",
+    "@old:example.org"
+   ],
+   "stdout": "@old:example.org in !r:example.org: 50\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--get",
+    "@bob:example.org",
+    "-q"
+   ],
+   "stdout": "50\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--get",
+    "@old:example.org",
+    "--json"
+   ],
+   "stdout": "{\"room_id\": \"!r:example.org\", \"user_id\": \"@old:example.org\", \"level\": \"50\"}\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--get",
+    "@bob:example.org",
+    "--json",
+    "-q"
+   ],
+   "stdout": "{\"room_id\": \"!r:example.org\", \"user_id\": \"@bob:example.org\", \"level\": 50}\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@bob:example.org",
+    "100"
+   ],
+   "stdout": "@bob:example.org in !r:example.org: 50 -> 100\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": [
+    "{\"users\": {\"@me:example.org\": 100, \"@bob:example.org\": 100, \"@old:example.org\": \"50\"}, \"users_default\": 0, \"events\": {\"m.room.name\": 50, \"m.room.power_levels\": 100}, \"events_default\": 0, \"state_default\": 50, \"ban\": 50, \"kick\": 50, \"redact\": 50, \"invite\": 0, \"notifications\": {\"room\": 50}, \"x.unknown\": [\"Gr\\u00fc\\u00dfe \\ud83d\\ude42\", null, true, 1.5]}"
+   ]
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@new:example.org",
+    "50"
+   ],
+   "stdout": "@new:example.org in !r:example.org: 0 -> 50\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": [
+    "{\"users\": {\"@me:example.org\": 100, \"@bob:example.org\": 50, \"@old:example.org\": \"50\", \"@new:example.org\": 50}, \"users_default\": 0, \"events\": {\"m.room.name\": 50, \"m.room.power_levels\": 100}, \"events_default\": 0, \"state_default\": 50, \"ban\": 50, \"kick\": 50, \"redact\": 50, \"invite\": 0, \"notifications\": {\"room\": 50}, \"x.unknown\": [\"Gr\\u00fc\\u00dfe \\ud83d\\ude42\", null, true, 1.5]}"
+   ]
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@bob:example.org",
+    " -5 "
+   ],
+   "stdout": "@bob:example.org in !r:example.org: 50 -> -5\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": [
+    "{\"users\": {\"@me:example.org\": 100, \"@bob:example.org\": -5, \"@old:example.org\": \"50\"}, \"users_default\": 0, \"events\": {\"m.room.name\": 50, \"m.room.power_levels\": 100}, \"events_default\": 0, \"state_default\": 50, \"ban\": 50, \"kick\": 50, \"redact\": 50, \"invite\": 0, \"notifications\": {\"room\": 50}, \"x.unknown\": [\"Gr\\u00fc\\u00dfe \\ud83d\\ude42\", null, true, 1.5]}"
+   ]
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@bob:example.org",
+    "+7",
+    "-q"
+   ],
+   "stdout": "7\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": [
+    "{\"users\": {\"@me:example.org\": 100, \"@bob:example.org\": 7, \"@old:example.org\": \"50\"}, \"users_default\": 0, \"events\": {\"m.room.name\": 50, \"m.room.power_levels\": 100}, \"events_default\": 0, \"state_default\": 50, \"ban\": 50, \"kick\": 50, \"redact\": 50, \"invite\": 0, \"notifications\": {\"room\": 50}, \"x.unknown\": [\"Gr\\u00fc\\u00dfe \\ud83d\\ude42\", null, true, 1.5]}"
+   ]
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@bob:example.org",
+    "25",
+    "--json"
+   ],
+   "stdout": "{\"room_id\": \"!r:example.org\", \"user_id\": \"@bob:example.org\", \"previous\": 50, \"level\": 25}\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "power",
+   "put": [
+    "{\"users\": {\"@me:example.org\": 100, \"@bob:example.org\": 25, \"@old:example.org\": \"50\"}, \"users_default\": 0, \"events\": {\"m.room.name\": 50, \"m.room.power_levels\": 100}, \"events_default\": 0, \"state_default\": 50, \"ban\": 50, \"kick\": 50, \"redact\": 50, \"invite\": 0, \"notifications\": {\"room\": 50}, \"x.unknown\": [\"Gr\\u00fc\\u00dfe \\ud83d\\ude42\", null, true, 1.5]}"
+   ]
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@bob:example.org",
+    "abc"
+   ],
+   "stdout": "",
+   "stderr": "Error: LEVEL must be an integer, got 'abc'\n",
+   "exit": 1,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@bob:example.org",
+    "1.5"
+   ],
+   "stdout": "",
+   "stderr": "Error: LEVEL must be an integer, got '1.5'\n",
+   "exit": 1,
+   "content": "power",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--get",
+    "@bob:example.org"
+   ],
+   "stdout": "@bob:example.org in !r:example.org: 0\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "bare",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@bob:example.org",
+    "50"
+   ],
+   "stdout": "@bob:example.org in !r:example.org: 0 -> 50\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "bare",
+   "put": [
+    "{\"events_default\": 0, \"state_default\": 50, \"users\": {\"@bob:example.org\": 50}}"
+   ]
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--show",
+    "-q"
+   ],
+   "stdout": "{\"events_default\": 0, \"state_default\": 50}\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "bare",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--get",
+    "@nobody:example.org"
+   ],
+   "stdout": "@nobody:example.org in !r:example.org: 10\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "default",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@nobody:example.org",
+    "20"
+   ],
+   "stdout": "@nobody:example.org in !r:example.org: 10 -> 20\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "default",
+   "put": [
+    "{\"users\": {\"@me:example.org\": 100, \"@nobody:example.org\": 20}, \"users_default\": 10}"
+   ]
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--show",
+    "-q"
+   ],
+   "stdout": "{\"users\": {\"@me:example.org\": 100}, \"users_default\": 10}\n",
+   "stderr": "",
+   "exit": 0,
+   "content": "default",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--show"
+   ],
+   "stdout": "",
+   "stderr": "Error: You don't have permission\n",
+   "exit": 1,
+   "content": "error",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--get",
+    "@bob:example.org"
+   ],
+   "stdout": "",
+   "stderr": "Error: You don't have permission\n",
+   "exit": 1,
+   "content": "error",
+   "put": []
+  },
+  {
+   "argv": [
+    "!r:example.org",
+    "--set",
+    "@bob:example.org",
+    "50"
+   ],
+   "stdout": "",
+   "stderr": "Error: You don't have permission\n",
+   "exit": 1,
+   "content": "error",
+   "put": []
+  }
+ ],
+ "create_room": [
+  {
+   "argv": [
+    "LSB Project"
+   ],
+   "stdout": "Room created: !new:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/createRoom",
+     "body": {
+      "name": "LSB Project",
+      "preset": "private_chat"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "LSB Project",
+    "--alias",
+    "lsb",
+    "--invite",
+    "@a:example.org",
+    "--invite",
+    "@b:example.org",
+    "--topic",
+    "Landessportbund onboarding",
+    "--preset",
+    "public_chat"
+   ],
+   "stdout": "Room created: !new:example.org\nAlias: #lsb:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/createRoom",
+     "body": {
+      "name": "LSB Project",
+      "preset": "public_chat",
+      "room_alias_name": "lsb",
+      "topic": "Landessportbund onboarding",
+      "invite": [
+       "@a:example.org",
+       "@b:example.org"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "LSB Project",
+    "--alias",
+    "lsb",
+    "-q"
+   ],
+   "stdout": "!new:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/createRoom",
+     "body": {
+      "name": "LSB Project",
+      "preset": "private_chat",
+      "room_alias_name": "lsb"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "LSB Project",
+    "--alias",
+    "lsb",
+    "--json"
+   ],
+   "stdout": "{\"room_id\": \"!new:example.org\"}\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/createRoom",
+     "body": {
+      "name": "LSB Project",
+      "preset": "private_chat",
+      "room_alias_name": "lsb"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "LSB Project",
+    "--alias",
+    "lsb",
+    "--json",
+    "--quiet"
+   ],
+   "stdout": "{\"room_id\": \"!new:example.org\"}\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/createRoom",
+     "body": {
+      "name": "LSB Project",
+      "preset": "private_chat",
+      "room_alias_name": "lsb"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "LSB Project",
+    "--alias",
+    "",
+    "--topic",
+    ""
+   ],
+   "stdout": "Room created: !new:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/createRoom",
+     "body": {
+      "name": "LSB Project",
+      "preset": "private_chat"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "Grüße 🙂",
+    "--preset",
+    "trusted_private_chat"
+   ],
+   "stdout": "Room created: !new:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/createRoom",
+     "body": {
+      "name": "Grüße 🙂",
+      "preset": "trusted_private_chat"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "taken",
+    "--alias",
+    "taken"
+   ],
+   "stdout": "",
+   "stderr": "Error: Room alias already taken\n",
+   "exit": 1,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/createRoom",
+     "body": {
+      "name": "taken",
+      "preset": "private_chat",
+      "room_alias_name": "taken"
+     }
+    }
+   ]
+  }
+ ],
+ "invite": [
+  {
+   "argv": [
+    "LSB Project",
+    "@jane:example.org"
+   ],
+   "stdout": "Invited @jane:example.org to !r:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/rooms/%21r%3Aexample.org/invite",
+     "body": {
+      "user_id": "@jane:example.org"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "LSB Project",
+    "@jane:example.org",
+    "-q"
+   ],
+   "stdout": "!r:example.org\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/rooms/%21r%3Aexample.org/invite",
+     "body": {
+      "user_id": "@jane:example.org"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "LSB Project",
+    "@jane:example.org",
+    "--json"
+   ],
+   "stdout": "{\"room_id\": \"!r:example.org\", \"user_id\": \"@jane:example.org\"}\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/rooms/%21r%3Aexample.org/invite",
+     "body": {
+      "user_id": "@jane:example.org"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "LSB Project",
+    "@jane:example.org",
+    "--json",
+    "--quiet"
+   ],
+   "stdout": "{\"room_id\": \"!r:example.org\", \"user_id\": \"@jane:example.org\"}\n",
+   "stderr": "",
+   "exit": 0,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/rooms/%21r%3Aexample.org/invite",
+     "body": {
+      "user_id": "@jane:example.org"
+     }
+    }
+   ]
+  },
+  {
+   "argv": [
+    "LSB Project",
+    "@jane:example.org"
+   ],
+   "stdout": "",
+   "stderr": "Error: @jane:example.org is already in the room.\n",
+   "exit": 1,
+   "requests": [
+    {
+     "method": "POST",
+     "endpoint": "/rooms/%21r%3Aexample.org/invite",
+     "body": {
+      "user_id": "@jane:example.org"
+     }
+    }
+   ]
+  }
+ ],
+ "resolve": [
+  {
+   "argv": [
+    "#ops:example.org"
+   ],
+   "stdout": "Alias: #ops:example.org\nRoom ID: !c:example.org\n",
+   "stderr": "",
+   "exit": 0
+  },
+  {
+   "argv": [
+    "#ops:example.org",
+    "--json"
+   ],
+   "stdout": "{\n  \"room_id\": \"!c:example.org\",\n  \"alias\": \"#ops:example.org\"\n}\n",
+   "stderr": "",
+   "exit": 0
+  },
+  {
+   "argv": [
+    "ops"
+   ],
+   "stdout": "",
+   "stderr": "Error: Alias must start with #\n",
+   "exit": 1
+  },
+  {
+   "argv": [
+    "ops",
+    "--json"
+   ],
+   "stdout": "",
+   "stderr": "Error: Alias must start with #\n",
+   "exit": 1
+  },
+  {
+   "argv": [
+    "#missing:example.org"
+   ],
+   "stdout": "",
+   "stderr": "Error: Could not resolve room alias: Room alias #missing:example.org not found\n",
+   "exit": 1
+  },
+  {
+   "argv": [
+    "#missing:example.org",
+    "--json"
+   ],
+   "stdout": "{\"error\": \"Could not resolve room alias: Room alias #missing:example.org not found\"}\n",
+   "stderr": "",
+   "exit": 1
+  }
+ ]
+}
