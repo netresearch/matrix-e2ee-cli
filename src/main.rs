@@ -219,7 +219,7 @@ pub struct ReadArgs {
     /// For undecryptable messages: wait and sync 6 times (5 s each, plus up
     /// to 5 s per sync) so the key requests reach your other devices and
     /// their keys arrive, then read again. Through the watch daemon: wait
-    /// 6 times 5 s while the daemon's own sync loop syncs.
+    /// until two of the daemon's own syncs have completed (at most 30 s).
     /// matrix-sdk asks only when one of your other devices is verified.
     /// A session already asked for is not asked again.
     #[arg(short = 'k', long)]

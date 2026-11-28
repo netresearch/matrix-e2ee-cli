@@ -34,6 +34,10 @@ struct Route {
     /// How long the answer waits; a request of a delayed route counts as
     /// in flight meanwhile.
     delay: Duration,
+    /// Answers only once a request whose path starts with this has been
+    /// received before, and then only once.
+    after: Option<String>,
+    used: Arc<AtomicBool>,
 }
 
 /// Delayed requests in flight now, and the most there were at once.
@@ -79,6 +83,8 @@ fn base_routes() -> Vec<Route> {
         status: 200,
         body: body.into(),
         delay: Duration::ZERO,
+        after: None,
+        used: Arc::default(),
     })
     .collect()
 }
@@ -149,7 +155,45 @@ impl MockHomeserver {
             status,
             body: body.into(),
             delay,
+            after: None,
+            used: Arc::default(),
         });
+        self
+    }
+
+    /// Answer the first METHOD request to PATH that arrives after a request
+    /// whose path starts with AFTER, before every other route and after
+    /// DELAY; later ones fall through to the other routes.
+    pub fn route_once_after(
+        &self,
+        method: &str,
+        path: &str,
+        after: &str,
+        body: &str,
+        delay: Duration,
+    ) -> &Self {
+        self.routes.lock().unwrap().insert(
+            0,
+            Route {
+                method: method.into(),
+                path: path.into(),
+                status: 200,
+                body: body.into(),
+                delay,
+                after: Some(after.into()),
+                used: Arc::default(),
+            },
+        );
+        self
+    }
+
+    /// Answer the routes added so far for METHOD and PATH after DELAY.
+    pub fn set_delay(&self, method: &str, path: &str, delay: Duration) -> &Self {
+        for route in self.routes.lock().unwrap().iter_mut() {
+            if route.method == method && route.path == path {
+                route.delay = delay;
+            }
+        }
         self
     }
 
@@ -258,6 +302,12 @@ fn serve(
         .unwrap_or_default()
         .to_owned();
     let body = String::from_utf8_lossy(&data[head_end..]).into_owned();
+    let seen: Vec<String> = received
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.path.clone())
+        .collect();
     received.lock().unwrap().push(Recorded {
         method: method.clone(),
         path: path.clone(),
@@ -268,7 +318,14 @@ fn serve(
     table.extend(base_routes());
     let (status, body, delay) = table
         .iter()
-        .find(|r| r.method == method && path.starts_with(&r.path))
+        .find(|r| {
+            r.method == method
+                && path.starts_with(&r.path)
+                && r.after.as_ref().is_none_or(|after| {
+                    seen.iter().any(|p| p.starts_with(after.as_str()))
+                        && !r.used.swap(true, Ordering::SeqCst)
+                })
+        })
         .map(|r| (r.status, r.body.clone(), r.delay))
         .unwrap_or((
             404,

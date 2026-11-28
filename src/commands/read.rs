@@ -147,14 +147,13 @@ pub async fn run(args: ReadArgs) -> Result<()> {
             let restored = restore(&config, &paths, KeySharing::VerifiedOnly).await?;
             let client = restored.client;
             sync_once(&client).await?;
-            execute(
-                &client,
-                &request,
+            let key_wait = key_wait_rounds(
+                KEY_WAIT_ROUNDS,
                 KEY_WAIT_INTERVAL,
-                |line| eprintln!("{line}"),
                 || sync_with_timeout(&client, KEY_WAIT_SYNC_TIMEOUT),
-            )
-            .await?
+                |line| eprintln!("{line}"),
+            );
+            execute(&client, &request, |line| eprintln!("{line}"), key_wait).await?
         }
     };
     // Rendered here on both paths, so the output (and the local time of
@@ -177,19 +176,17 @@ pub fn read_request(args: &ReadArgs) -> Value {
 /// Carry out a "read" request with `client`: the messages, newest first.
 ///
 /// Warning lines (whole, with "warning: ") go to `warn`. With
-/// `request_keys` and an undecryptable message, [`KEY_WAIT_ROUNDS`] rounds
-/// of (wait `interval`, `sync`) run before the second read.
-pub async fn execute<W, S, F>(
+/// `request_keys` and an undecryptable message, `key_wait` runs (it is
+/// polled first then, after the first read) before the second read: on the
+/// direct path [`key_wait_rounds`], in the daemon a wait for its syncs.
+pub async fn execute<W>(
     client: &Client,
     request: &Value,
-    interval: Duration,
     mut warn: W,
-    sync: S,
+    key_wait: impl Future<Output = ()>,
 ) -> Result<Vec<Line>>
 where
     W: FnMut(String),
-    S: FnMut() -> F,
-    F: Future<Output = Result<()>>,
 {
     let room_arg = request
         .get("room")
@@ -218,30 +215,23 @@ where
         if let Some(line) = without_verified_device_warning(client).await {
             warn(line);
         }
-        key_wait_rounds(KEY_WAIT_ROUNDS, interval, sync, &mut warn).await;
+        key_wait.await;
         lines = fetch_lines(&room, limit, room_encrypted).await?;
     }
     Ok(lines)
 }
 
-/// [`execute`] in the watch daemon: the warnings go into the answer, and
-/// the key wait does not sync, since the daemon's own sync loop syncs
-/// meanwhile (a second sync on the same client would race it).
+/// [`execute`] in the watch daemon: the warnings go into the answer.
+/// `key_wait` must not sync: the daemon's own sync loop syncs (a second
+/// sync on the same client would race it), so it waits for that loop.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub async fn daemon_execute(
     client: &Client,
     request: &Value,
-    interval: Duration,
+    key_wait: impl Future<Output = ()>,
 ) -> Result<ReadOutcome> {
     let mut warnings = Vec::new();
-    let lines = execute(
-        client,
-        request,
-        interval,
-        |line| warnings.push(line),
-        || async { Ok(()) },
-    )
-    .await?;
+    let lines = execute(client, request, |line| warnings.push(line), key_wait).await?;
     Ok(ReadOutcome {
         messages: lines.iter().map(WireLine::from).collect(),
         warnings,
@@ -820,19 +810,24 @@ pub(crate) mod tests {
         let server = read_server(encrypted);
         let client = server.client("@me:example.org").await;
         sync_once(&client).await.unwrap();
-        let mut warnings = Vec::new();
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let key_wait = key_wait_rounds(
+            KEY_WAIT_ROUNDS,
+            Duration::ZERO,
+            || sync_with_timeout(&client, Duration::ZERO),
+            |line| warnings.borrow_mut().push(line),
+        );
         let lines = execute(
             &client,
             &read_request(&args),
-            Duration::ZERO,
-            |line| warnings.push(line),
-            || sync_with_timeout(&client, Duration::ZERO),
+            |line| warnings.borrow_mut().push(line),
+            key_wait,
         )
         .await
         .unwrap();
         (
             render(&lines, args.json).unwrap(),
-            warnings,
+            warnings.into_inner(),
             messages_queries(&server),
         )
     }
